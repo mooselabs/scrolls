@@ -111,3 +111,8 @@ already be present in the source repository's verified cache.
 
 See the [command reference](docs/commands.md), [migration report](docs/migration-report.md),
 and [design baseline and implementation boundary](docs/design.md).
+
+The [configurable ontology and priming direction](docs/configurable-ontology.md)
+describes the next architecture: user-defined schemas and retrieval profiles,
+with the current knowledge model as the bundled default. This configurability
+is planned; the current CLI still uses fixed kinds and selection rules.

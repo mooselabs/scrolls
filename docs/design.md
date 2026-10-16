@@ -2,6 +2,17 @@
 
 Status: design baseline with local v1 implementation · Created: 2026-10-16 · Owner: Patrick McEvoy
 
+## Product direction: configurable ontology and priming
+
+Scrolls targets user-defined information architectures. The knowledge ontology
+below becomes a bundled default; kinds, fields, lifecycles, relationships,
+policies, and priming/context profiles belong in versioned configuration.
+The initial retrieval language must cover our current needs and simple custom
+uses. See [Configurable ontology and priming](configurable-ontology.md) for the
+configuration boundaries, coverage inventory, and acceptance criteria. This is
+the target direction; the implementation boundary below still governs shipped
+behavior. References below to extending the ontology describe that target.
+
 ## Implementation boundary (2026-10-16)
 
 The local Rust implementation is described in [commands.md](commands.md) and
