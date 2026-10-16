@@ -22,11 +22,11 @@ explicit references.
 flowchart LR
     evidence["Capture evidence"] --> proposal["Propose knowledge or a decision"]
     proposal --> review["Human review"]
-    review --> graph["Versioned knowledge graph"]
-    graph --> context["Retrieve context and doctrine"]
+    review --> knowledge_store["Versioned knowledge graph"]
+    knowledge_store --> context["Retrieve context and doctrine"]
     context --> evidence
-    graph --> markdown["Render Markdown"]
-    graph <-->|"Explicit work references"| beads["Beads"]
+    knowledge_store --> markdown["Render Markdown"]
+    knowledge_store <-->|"Explicit work references"| beads["Beads"]
 ```
 
 ## Quick start
