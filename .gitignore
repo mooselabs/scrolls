@@ -1,0 +1,7 @@
+/target/
+/.tools/
+/.scrolls/
+/.verification/
+
+__pycache__/
+*.pyc

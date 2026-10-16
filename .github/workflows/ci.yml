@@ -1,0 +1,24 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  rust-and-dolt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/install-dolt.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release --all-targets
+      - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrolls-linux-amd64
+          path: |
+            target/release/scrolls
+            scripts/install-dolt.sh
+            README.md

@@ -1,0 +1,29 @@
+[package]
+name = "scrolls"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local, versioned knowledge graphs backed by Dolt"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+globset = "0.4"
+hex = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+shell-words = "1"
+tar = "0.4"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+strip = true
