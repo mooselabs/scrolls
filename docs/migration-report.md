@@ -153,4 +153,6 @@ Corpus qualification uses orchestrator commit
 Reproduce with the verification commands in the README, passing the commit above
 to `verify-corpus.py`. The corpus itself and local integration state remain
 untracked. Schema-1 upgrades, rejected proposal history, migration replay,
-native work-link rendering, and Liskov export rejection have real-Dolt tests.
+native work-link rendering, and the initial Liskov export rejection were tested.
+The correctness update now preserves those work references in Liskov supplemental
+records and the graph; native backlink navigation follows the stable render manifest.

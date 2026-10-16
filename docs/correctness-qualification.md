@@ -1,15 +1,21 @@
 # Scrolls correctness qualification
 
 Qualified on 2026-10-16. Tested implementation commit:
-`01e79849e3fa58184e2ef67bf3c96976c6e52a34` (tree `30f47002ac61f60c4084a6abe53306ae72e4aa42`).
+`f23b0f251ce933ed0626076329b18d3f3915062b` (tree `db2b81fd79e43fd29ba7bb6bc60554afdf75592f`).
 The worktree was clean throughout the committed corpus qualification, and the
 runner checked that the release binary did not change during the run.
 
-Release binary SHA-256: `582a966eb2d91a4712df49f6317d706424fea21f872ac418acf2fe6f1e37ae84`.
-This is a local correctness and export qualification. Liskov's documentation
-authority, live work ledger and shared checkout were not changed. The existing
-untracked `docs/what-is-scrolls.md` and the separate Beads integration worktree
-were left untouched.
+Release binary SHA-256: `cda5f4e9cecf26fc731c2474186182264f57d5cd11ae696259e22c9f1058156a`.
+This is a local correctness and export qualification. This work did not change
+Liskov's documentation authority, the live work ledger or tracked files in the
+shared checkout. The previously observed empty untracked `docs/what-is-scrolls.md`
+was restored after it was found missing during concurrent work; no existing file was overwritten.
+The separate Beads integration worktree was not edited.
+
+The tested tree merges concurrent main commit `6d132e6` (Beads integration).
+Both implementations are retained: Beads native navigation follows the stable
+render manifest, and Liskov supplemental records and graph retain work references.
+All integrated checks use disposable local Beads databases, never the live ledger.
 
 ## Behavior and regression coverage
 
@@ -43,14 +49,12 @@ were left untouched.
 | --- | --- |
 | `cargo fmt --check` | Pass |
 | `cargo clippy --locked --all-targets -- -D warnings` | Pass |
-| `cargo test --locked --all-targets` | 11 unit and 9 real-Dolt tests pass |
+| `cargo test --locked --all-targets` | 13 unit and 11 real-Dolt tests pass |
 | `cargo build --locked --release --all-targets` | Pass |
 | Standalone demonstration | Pass |
 | Imported-store demonstration | Pass |
-
-GitHub CI passed for the tested implementation on both the
-[push run](https://github.com/mooselabs/scrolls/actions/runs/38929576088) and
-[pull-request run](https://github.com/mooselabs/scrolls/actions/runs/38929613185).
+| Beads boundary fixture | 1 test passes |
+| Pinned Beads 1.3.0 disposable-store qualification | Pass |
 
 Dolt 2.2.0 is the privately installed pinned binary. Cargo was invoked directly
 with the kache compiler wrapper and test runner disabled because their target
@@ -101,9 +105,9 @@ Run the [README verification commands](../README.md#verification). Local artifac
 are retained under the ignored `.verification/` directory of the isolated
 `agent/correctness-1-6` worktree:
 
-- `committed-checks/report.json`, plus format, Clippy, test and release logs.
-- `committed-corpus/report.json`, four validator logs and source/rendered/edited/native fixtures.
-- `committed-demo/transcript.json` and `committed-corpus/demo/transcript.json`.
+- `integrated-checks/report.json`, plus format, Clippy, test and release logs.
+- `integrated-corpus/report.json`, four validator logs and source/rendered/edited/native fixtures.
+- `integrated-demo/transcript.json` and `integrated-corpus/demo/transcript.json`.
 
 Private corpus bytes, databases and transcripts are not committed or uploaded
 to CI. Existing proposals are not rewritten. Remote synchronization, approval
