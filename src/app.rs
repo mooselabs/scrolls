@@ -75,6 +75,8 @@ fn set_fields(r: &mut Record, fields: &[String]) -> Result<()> {
             "doc_type",
             "source_documents",
             "related_repos",
+            "metadata",
+            "number",
         ]
         .contains(&k)
         {
@@ -338,7 +340,6 @@ pub fn run(cli: &Cli) -> Result<Value> {
             for about in &n.about {
                 let to = graph.resolve(about)?;
                 graph.add_edge(&id, "about", &to, "", who);
-                affected.insert(to);
             }
             for evidence in &n.supports {
                 let from = graph.resolve(evidence)?;
@@ -413,10 +414,17 @@ pub fn run(cli: &Cli) -> Result<Value> {
             };
             graph.records[&from].check_edit(*expect)?;
             if let Some(target) = graph.records.get(&to) {
-                target.check_edit(
-                    expect_to.context("relationships affecting two records require --expect-to")?,
-                )?;
-                affected.insert(to.clone());
+                if policy::reference_relation(rel) {
+                    if let Some(expected) = expect_to {
+                        target.check_revision(*expected)?;
+                    }
+                } else {
+                    target
+                        .check_edit(expect_to.context(
+                            "relationships affecting two records require --expect-to",
+                        )?)?;
+                    affected.insert(to.clone());
+                }
             }
             if matches!(cli.command, Cmd::Unlink { .. }) {
                 let key = Edge {
@@ -504,8 +512,8 @@ pub fn run(cli: &Cli) -> Result<Value> {
             for a in about {
                 let target = graph.resolve(a)?;
                 graph.add_edge(&id, "asks_about", &target, "", who);
-                affected.insert(target);
             }
+            policy::extract_links(&mut graph, &id, who);
             affected.insert(id.clone());
             result = json!({"id":id});
         }
@@ -527,6 +535,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             let id = r.id.clone();
             graph.records.insert(id.clone(), r);
             graph.add_edge(&id, "answers", &q, "", who);
+            policy::extract_links(&mut graph, &id, who);
             affected.extend([id.clone(), q]);
             result = json!({"id":id});
         }
@@ -570,7 +579,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         for (key, e) in &graph.edges {
             if before.edges.get(key) != Some(e) {
                 affected.insert(e.from.clone());
-                if graph.records.contains_key(&e.to) {
+                if !policy::reference_relation(&e.rel) && graph.records.contains_key(&e.to) {
                     affected.insert(e.to.clone());
                 }
             }
@@ -578,7 +587,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         for (key, e) in &before.edges {
             if !graph.edges.contains_key(key) {
                 affected.insert(e.from.clone());
-                if graph.records.contains_key(&e.to) {
+                if !policy::reference_relation(&e.rel) && graph.records.contains_key(&e.to) {
                     affected.insert(e.to.clone());
                 }
             }
@@ -604,6 +613,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             bail!("Beads references require scrolls migrate");
         }
         policy::validate_change(&before, &graph, &debt)?;
+        for entry in crate::triggers::routing_entries(&routing)? {
+            if entry["id"].as_str().is_some_and(|id| affected.contains(id)) {
+                crate::triggers::imported(entry)?;
+            }
+        }
         let protected = affected
             .iter()
             .any(|id| graph.records[id].protected(cli.role.name()));
@@ -739,28 +753,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         }
         Cmd::Doctrine { paths } => query::doctrine(&graph, &routing, paths)?,
         Cmd::Prime { paths, budget } => {
-            let doctrine = query::doctrine(&graph, &routing, paths)?;
-            let mut ids: Vec<_> = doctrine["matched"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v["id"].as_str().map(str::to_string))
-                .collect();
-            ids.extend(
-                graph
-                    .records
-                    .values()
-                    .filter(|r| {
-                        (r.kind == "primer" && r.status == "current")
-                            || (r.kind == "question"
-                                && !r.frozen
-                                && ((r.owner == who && r.status == "open")
-                                    || (r.fields["asked_by"] == who && r.status == "answered")))
-                    })
-                    .map(|r| r.id.clone()),
-            );
-            let mut packet = query::packet(&graph, ids, vec![], *budget)?;
-            packet["undecided_doctrine"] = doctrine["undecided"].clone();
+            let packet = query::prime(&graph, &routing, paths, who, *budget)?;
             consumed = packet["items"]
                 .as_array()
                 .unwrap()
@@ -791,7 +784,8 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
         }
         Cmd::Lint => {
-            let lint = policy::lint(&graph);
+            let mut lint = policy::lint(&graph);
+            lint.extend(policy::lint_routing(&routing));
             let debt = info
                 .as_ref()
                 .map(|i| i.lint_debt.clone())
@@ -963,6 +957,14 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             .map(|i| i.lint_debt)
             .unwrap_or_default();
         policy::validate_change(main_graph, &merged, &debt)?;
+        let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
+        let errors = policy::lint_routing(&routing);
+        if !errors.is_empty() {
+            bail!(
+                "invalid routing triggers: {}",
+                errors.into_iter().collect::<Vec<_>>().join("; ")
+            );
+        }
         if cli.dry_run {
             return Ok(json!({"dry_run":true,"validated":true,"proposal":name,"base":base}));
         }

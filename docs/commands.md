@@ -19,16 +19,16 @@ read by the retry; `data` is the original operation result.
 | `init` | Initialize the private database and default registry; existing stores are checked. |
 | `doctor` | Check the version pin, schema, clean working state, branches, and import provenance. |
 | `import markdown DIR --rev REV` | Resolve a Git commit and import only committed documentation files, manifest repository entities, and AGENTS.md doctrine routes. |
-| `render --out NEW_DIR [--format native\|liskov]` | Export a complete fresh tree. Default native includes normalized `scrolls/graph.json` and new records under `scrolls/`. Liskov rejects native additions and unrepresentable graph changes. |
+| `render --out NEW_DIR [--format native\|liskov]` | Export a complete fresh tree. Both formats include normalized `scrolls/graph.json`, an ID-to-path manifest, and views for every native kind. Liskov rejects incompatible edits to imported legacy documents. |
 | `list [--kind KIND] [--status STATE] [--about ENTITY]` | List matching records in stable ID order. |
 | `show ID` | Record, revision, and incident graph edges. IDs, unique legacy IDs, and source paths resolve. |
 | `search TERMS [--limit N]` | Case-insensitive AND search over title/body, stable ID order, excluding notes. |
 | `walk ID [--rel REL] [--depth N]` | Deterministic breadth-first graph neighborhood, traversing incoming and outgoing edges. |
 | `context ID [--budget BYTES]` | The design's fixed graph traversal, with supporting evidence and neighboring entities as titles only. |
-| `prime [--for PATH]... [--budget BYTES]` | Matched doctrine, current primers, owned open questions and answered questions asked by this actor. |
-| `new KIND --title TITLE [BODY] [--owner NAME] [--about ENTITY]... [--supports EVIDENCE]... [--field KEY=VALUE]...` | Create a record; protected kinds and changes touching protected records land on proposals. |
+| `prime [--for PATH]... [--budget BYTES]` | All matched doctrine, then optional current primers, owned open questions, and answered questions with their accepted answers. |
+| `new KIND --title TITLE [BODY] [--owner NAME] [--about ENTITY]... [--supports EVIDENCE]... [--field KEY=VALUE]...` | Create a record; protected kinds and changes to protected assertions land on proposals. Referencing a protected target through `about`, `asks_about` or `related` stays direct. |
 | `edit ID --expect REV [BODY] [--title TITLE] [--owner NAME] [--field KEY=VALUE]...` | Optimistic edit. Reserved fields use dedicated options or graph commands. |
-| `link FROM REL TO --expect REV [--expect-to REV] [--why TEXT]` | Add an attributed edge. Both existing endpoints require revisions. |
+| `link FROM REL TO --expect REV [--expect-to REV] [--why TEXT]` | Add an attributed edge. `about`, `asks_about` and `related` revise only FROM; their `--expect-to` is an optional read check. Other relations with a Scrolls target require both revisions. |
 | `unlink FROM REL TO --expect REV [--expect-to REV]` | Remove an edge, subject to the same endpoint policy. |
 | `status ID STATE --expect REV` | Apply an allowed lifecycle transition. Answer acceptance has its own command. |
 | `supersede OLD --with NEW --why TEXT --expect REV --expect-to REV` | Mark a decision superseded, or retire replaced knowledge/doctrine/entities, and attach the replacement edge. |
@@ -49,9 +49,41 @@ read by the retry; `data` is the original operation result.
 `BODY` means `--body TEXT`, `--body-file PATH` (or `-`), piped stdin, or
 `--editor`. `new` also accepts `--confidence high|medium|low` and
 `--review-every DAYS`; `edit` accepts these plus `--last-reviewed YYYY-MM-DD`.
-A changed native review cadence on an imported record requires native export. The budget bounds the compact JSON `items` array in **bytes**, not
-estimated model tokens. The packet reports the accounting and omitted IDs;
-its metadata envelope and omission list are outside that bound.
+A changed native review cadence on an imported record requires native export.
+
+The default context budget is 16,000 bytes of compact JSON `items`, including
+brackets and separators. `used_bytes` reports the actual size; the envelope
+and omission list are excluded. Context projections omit `original` snapshots;
+`show` and the graph export retain them. `context` enforces a hard budget.
+`prime` includes every matched doctrine body once, in stable ID order, without
+truncation. Its `mandatory_bytes` is the size of the mandatory-only array
+(zero when there are no matches). Mandatory doctrine consumes the budget first
+and may exceed it; `over_budget_bytes` reports that overrun in JSON and human
+output. No optional records fit after an overrun. Unresolved scope clauses
+remain explicit in `undecided_doctrine`.
+
+An answered local question and its unique accepted answer form one optional
+budget group: both are included in full, adjacent, or both are omitted. The
+question exposes `accepted_answer_id`, the answer exposes `question_id`, and
+both IDs enter the consumption audit when delivered. Attribution and revision
+are retained. Offered and declined alternatives are excluded. Missing or
+multiple accepted answers fail explicitly. Imported frozen questions remain
+excluded.
+
+Doctrine `--field glob=VALUE` accepts a nonempty string or an array of nonempty
+strings; `[]` means no glob triggers. `--field scope_clause=TEXT` requires a
+nonempty string. Globs compile before creation, edits, activation and acceptance
+commit, including imported routes and `applies_to glob:…` assertions. Invalid
+active triggers fail routing explicitly, and `lint` reports invalid triggers.
+Scope-only doctrine and valid unmatched globs are valid.
+
+The source owns `about`, `asks_about` and `related`, including `new --about`,
+`ask --about` and extracted body links. Only the source revision and attribution
+change. A supplied `--expect-to` checks the target revision without editing it;
+a frozen target is allowed. Frozen sources remain immutable, protected sources
+still require proposals, and other relations retain their endpoint safeguards.
+Old proposals are not rewritten; reject and recreate one if its unnecessary
+endpoint edits conflict.
 
 Default kinds: decision, knowledge, primer, evidence, question, answer,
 doctrine, entity, collection, note. Default relations: supports, derived_from,
@@ -83,12 +115,39 @@ Dolt commits and protected by the same process lock.
 
 Rendering stages a complete tree beside the destination, then reserves and
 renames into a fresh directory. Source paths, existing outputs, symlinked
-parents, unsafe archived paths, unsupported Liskov additions, and frozen
-changes are rejected before publication. `RENDERED` and
+parents, unsafe archived paths, collisions, incompatible imported edits, and
+frozen changes are rejected before publication. `RENDERED` and
 `SCROLLS-MANIFEST.json` carry versions without changing legacy frontmatter.
-Six directory indexes are refreshed after representable edits. Unchanged
-exports are byte-for-byte copies, with index content checked independently.
+The manifest's `records` maps every stable ID to its rendered path. Both export
+formats include `scrolls/graph.json` with complete native fields, exact
+lifecycles, attribution and edges.
 
+| Native kind | Rendered location |
+| --- | --- |
+| Evidence | `raw/YYYY-MM-DD-sc-….md` |
+| Knowledge and primer | `knowledge/sc-….md` |
+| Note | `work-notes/sessions/YYYY-MM-DD/YYYY-MM-DD-sc-….md` |
+| Decision, doctrine, entity, collection, question, answer | `scrolls/<kind>/sc-….md` |
+
+Dates come from creation time, so filenames stay stable across edits. Every
+local view appears in `scrolls/README.md`, with human-readable relationships
+and accepted-answer links on its page. Imported manifest entities also receive
+supplemental views. Compatibility frontmatter uses `raw`, `knowledge`,
+`work_note`, `index` or `meta`; each page visibly retains its actual Scrolls kind
+and lifecycle. Only imported manifest repository entities enter `related_repos`.
+Stable ID body links resolve to relative exported paths with anchors preserved;
+stored bodies stay unchanged. Affected legacy directory indexes refresh for
+additions as well as edits. Unchanged imported files, including frozen history,
+remain byte-for-byte copies.
+
+Imported numbered ADRs carry `metadata.number`, such as `"0236"`, and retain
+legacy lookup aliases. Older stores derive missing numbers during reads without
+writing or revising records. New decisions never receive sequential numbers
+and are discoverable through the supplemental index. Local questions and
+answers never become legacy `Q-…` files or ledger records. Liskov's ADR-specific
+readers require a later migration before native decisions can be authoritative
+catalogue entries. An imported ADR cannot be marked superseded by a native
+unnumbered decision in Liskov output; that requires a numbered legacy successor.
 
 ## Beads references
 
@@ -125,8 +184,9 @@ only qualified references participate in this integration.
 `show` includes related work with cached resolution information. It also accepts
 `scrolls://STORE-UUID/RECORD-ID` and checks that `--store` selects the matching
 store. This URI is a portable CLI reference; no browser protocol handler is installed.
-Native exports add related-work navigation and per-bead backlink pages. Liskov
-exports refuse new work relationships that their format cannot represent.
+Native exports add related-work navigation and per-bead backlink pages. Both
+formats retain work relationships in the normalized graph; Liskov supplemental
+records show those references without changing the legacy work ledger.
 
 Context prioritizes open questions, accepted decisions, current knowledge, active
 doctrine, then accepted answers. Other linked states and evidence are summaries

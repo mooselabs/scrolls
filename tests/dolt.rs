@@ -22,7 +22,10 @@ impl Fixture {
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_scrolls"));
-        c.args(["--json", "--actor", "alice"]);
+        c.arg("--json");
+        if !args.contains(&"--actor") {
+            c.args(["--actor", "alice"]);
+        }
         if !args.contains(&"--role") {
             c.args(["--role", "human"]);
         }
@@ -378,6 +381,45 @@ fn committed_import_render_and_frozen_history() {
             .iter()
             .any(|e| e["rel"] == "supersedes")
     );
+    assert_eq!(
+        f.ok(&["show", "ADR-0002"])["record"]["metadata"]["number"],
+        "0002"
+    );
+    // Simulate a pre-metadata store; read normalization must not persist a write.
+    let root = f.dir.path().join("store");
+    let old_revision;
+    let old_payload;
+    let adr_id;
+    {
+        let store = Store::open(&root, &dolt(), false).unwrap();
+        store.checkout("main").unwrap();
+        let graph = store.graph().unwrap();
+        adr_id = graph.resolve("ADR-0002").unwrap();
+        let mut old = serde_json::to_value(&graph.records[&adr_id]).unwrap();
+        old.as_object_mut().unwrap().remove("metadata");
+        old["original"].as_object_mut().unwrap().remove("metadata");
+        store
+            .transaction(
+                &put("records", &adr_id, &old).unwrap(),
+                "old store fixture",
+                "test",
+            )
+            .unwrap();
+        old_revision = store.revision().unwrap();
+        old_payload = old;
+    }
+    assert_eq!(
+        f.ok(&["show", "ADR-0002"])["record"]["metadata"]["number"],
+        "0002"
+    );
+    {
+        let store = Store::open(&root, &dolt(), false).unwrap();
+        assert_eq!(store.revision().unwrap(), old_revision);
+        assert_eq!(
+            store.one::<Value>("records", &adr_id).unwrap().unwrap(),
+            old_payload
+        );
+    }
     let q = f.ok(&["show", "Q-20261016-abcd"]);
     let q = q["record"]["id"].as_str().unwrap();
     f.fail(&["answer", q, "invented", "--expect", "1"], "immutable");
@@ -404,17 +446,27 @@ fn committed_import_render_and_frozen_history() {
     let link = f.dir.path().join("link");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     f.fail(&["render", "--out", link.to_str().unwrap()], "fresh");
+    let history_reference = f.ok(&[
+        "--role",
+        "agent",
+        "new",
+        "evidence",
+        "--title",
+        "Historical citation",
+        "--body",
+        &format!("[history]({q})"),
+    ]);
+    assert_eq!(history_reference["branch"], "main");
+    assert_eq!(history_reference["records"].as_object().unwrap().len(), 1);
+    assert_eq!(f.ok(&["show", q])["record"]["revision"], 1);
     f.ok(&["new", "note", "--title", "Native", "--body", "local"]);
-    f.fail(
-        &[
-            "render",
-            "--format",
-            "liskov",
-            "--out",
-            f.dir.path().join("unsupported").to_str().unwrap(),
-        ],
-        "native addition",
-    );
+    f.ok(&[
+        "render",
+        "--format",
+        "liskov",
+        "--out",
+        f.dir.path().join("with-native").to_str().unwrap(),
+    ]);
     std::fs::write(repo.join("docs/raw/a.md"), "changed source").unwrap();
     assert!(
         Command::new("git")
@@ -440,6 +492,335 @@ fn committed_import_render_and_frozen_history() {
     f.fail(
         &["import", "markdown", docs, "--rev", "HEAD"],
         "changed-source",
+    );
+}
+
+#[test]
+fn reference_ownership_concurrency_proposals_and_retries() {
+    let f = Fixture::new();
+    let entity = f.ok(&["new", "entity", "--title", "Shared", "--body", "entity"]);
+    let entity_id = entity["id"].as_str().unwrap();
+    f.ok(&["review", "accept", entity["branch"].as_str().unwrap()]);
+    let baseline = f.ok(&["show", entity_id])["record"].clone();
+    let mut children = vec![];
+    for actor in ["agent-one", "agent-two"] {
+        children.push(
+            f.command(&[
+                "--actor", actor, "--role", "agent", "new", "evidence", "--title", actor, "--body",
+                "facts", "--about", entity_id,
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        );
+    }
+    let mut evidence = vec![];
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["data"]["branch"], "main");
+        assert_eq!(result["data"]["records"].as_object().unwrap().len(), 1);
+        evidence.push(result["data"]["id"].as_str().unwrap().to_string());
+    }
+    let mut branches = vec![];
+    for (n, e) in evidence.iter().enumerate() {
+        let result = f.ok(&[
+            "--role",
+            "agent",
+            "new",
+            "knowledge",
+            "--title",
+            &format!("independent {n}"),
+            "--body",
+            "supported",
+            "--supports",
+            e,
+            "--about",
+            entity_id,
+        ]);
+        assert!(result["records"].get(entity_id).is_none());
+        branches.push(result["branch"].as_str().unwrap().to_string());
+    }
+    for b in &branches {
+        f.ok(&["review", "accept", b]);
+    }
+    assert_eq!(f.ok(&["show", entity_id])["record"], baseline);
+    let q = f.ok(&["--role", "agent", "ask", "Direct?", "--about", entity_id]);
+    assert_eq!(q["branch"], "main");
+    assert_eq!(q["records"].as_object().unwrap().len(), 1);
+    let e = f.ok(&[
+        "--role",
+        "agent",
+        "new",
+        "evidence",
+        "--title",
+        "Body ref",
+        "--body",
+        &format!("[entity]({entity_id}#anchor)"),
+    ]);
+    let id = e["id"].as_str().unwrap();
+    assert_eq!(e["branch"], "main");
+    assert_eq!(e["records"].as_object().unwrap().len(), 1);
+    let unlink = [
+        "--op-id",
+        "unlink-reference",
+        "unlink",
+        id,
+        "related",
+        entity_id,
+        "--expect",
+        "1",
+        "--expect-to",
+        "1",
+    ];
+    let removed = f.ok(&unlink);
+    assert_eq!(removed, f.ok(&unlink));
+    assert_eq!(removed["records"], json!({id:2}));
+    f.fail(
+        &["link", id, "related", entity_id, "--expect", "1"],
+        "stale",
+    );
+    f.fail(
+        &[
+            "link",
+            id,
+            "related",
+            entity_id,
+            "--expect",
+            "2",
+            "--expect-to",
+            "999",
+        ],
+        "stale",
+    );
+    let link = [
+        "--op-id",
+        "link-reference",
+        "link",
+        id,
+        "related",
+        entity_id,
+        "--expect",
+        "2",
+    ];
+    let added = f.ok(&link);
+    assert_eq!(added, f.ok(&link));
+    assert_eq!(added["records"], json!({id:3}));
+    assert_eq!(f.ok(&["show", entity_id])["record"], baseline);
+    let protected = f.ok(&[
+        "--role",
+        "agent",
+        "edit",
+        entity_id,
+        "--expect",
+        "1",
+        "--body",
+        "protected",
+    ]);
+    assert_ne!(protected["branch"], "main");
+    let protected_link = f.ok(&["link", entity_id, "related", id, "--expect", "1"]);
+    assert_ne!(protected_link["branch"], "main");
+    f.fail(
+        &["link", &evidence[0], "supports", entity_id, "--expect", "2"],
+        "expect-to",
+    );
+    // A frozen target can be referenced, but never changed or made an assertion owner.
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let mut frozen = s.graph().unwrap().records[entity_id].clone();
+        frozen.frozen = true;
+        s.transaction(
+            &put("records", entity_id, &frozen).unwrap(),
+            "fixture frozen history",
+            "test",
+        )
+        .unwrap();
+    }
+    let frozen = f.ok(&["show", entity_id])["record"].clone();
+    f.ok(&[
+        "unlink",
+        id,
+        "related",
+        entity_id,
+        "--expect",
+        "3",
+        "--expect-to",
+        "1",
+    ]);
+    f.ok(&[
+        "link",
+        id,
+        "related",
+        entity_id,
+        "--expect",
+        "4",
+        "--expect-to",
+        "1",
+    ]);
+    f.ok(&["ask", "History?", "--about", entity_id]);
+    f.fail(
+        &["link", entity_id, "related", id, "--expect", "1"],
+        "immutable",
+    );
+    f.fail(
+        &["edit", entity_id, "--expect", "1", "--body", "illegal"],
+        "immutable",
+    );
+    assert_eq!(f.ok(&["show", entity_id])["record"], frozen);
+}
+
+#[test]
+fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
+    let f = Fixture::new();
+    for field in [
+        "glob=[",
+        "glob=1",
+        "glob=[false]",
+        "glob=\"\"",
+        "scope_clause=\"\"",
+        "scope_clause=null",
+    ] {
+        f.fail(
+            &[
+                "new", "doctrine", "--title", "Invalid", "--body", "rule", "--field", field,
+            ],
+            if field.starts_with("glob") {
+                "glob"
+            } else {
+                "scope_clause"
+            },
+        );
+    }
+    let p = f.ok(&[
+        "new",
+        "doctrine",
+        "--title",
+        "Rule",
+        "--body",
+        &"mandatory ".repeat(3000),
+        "--field",
+        "glob=**/*.rs",
+    ]);
+    let id = p["id"].as_str().unwrap();
+    let branch = p["branch"].as_str().unwrap();
+    f.fail(
+        &[
+            "--proposal",
+            branch,
+            "edit",
+            id,
+            "--expect",
+            "1",
+            "--field",
+            "glob=[",
+        ],
+        "glob",
+    );
+    f.ok(&[
+        "--proposal",
+        branch,
+        "status",
+        id,
+        "active",
+        "--expect",
+        "1",
+    ]);
+    f.fail(
+        &[
+            "--proposal",
+            branch,
+            "link",
+            id,
+            "applies_to",
+            "glob:[",
+            "--expect",
+            "2",
+        ],
+        "applies_to",
+    );
+    f.ok(&["review", "accept", branch]);
+    let packet = f.ok(&["prime", "--for", "src/main.rs"]);
+    assert_eq!(packet["items"].as_array().unwrap().len(), 1);
+    assert!(packet["over_budget_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        packet["used_bytes"],
+        serde_json::to_vec(&packet["items"]).unwrap().len()
+    );
+    let invalid = f.ok(&["edit", id, "--expect", "2", "--body", "changed"]);
+    let bad_branch = invalid["branch"].as_str().unwrap();
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout(bad_branch).unwrap();
+        let mut r = s.graph().unwrap().records[id].clone();
+        r.fields = json!({"glob":false});
+        s.transaction(
+            &put("records", id, &r).unwrap(),
+            "old invalid proposal",
+            "test",
+        )
+        .unwrap();
+    }
+    f.fail(&["review", "accept", bad_branch], "glob");
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let mut r = s.graph().unwrap().records[id].clone();
+        r.fields = json!({"glob":"["});
+        s.transaction(
+            &put("records", id, &r).unwrap(),
+            "old invalid active rule",
+            "test",
+        )
+        .unwrap();
+    }
+    f.fail(&["prime"], "glob");
+    f.fail(&["doctrine"], "glob");
+    assert!(
+        f.call(&["lint"]).1["data"]["errors"]
+            .to_string()
+            .contains("glob")
+    );
+    f.fail(&["status", id, "active", "--expect", "2"], "glob");
+}
+
+#[test]
+fn prime_delivers_answer_attribution_and_audits_both_ids() {
+    let f = Fixture::new();
+    let q = f.ok(&["ask", "Accepted answer?"]);
+    let q = q["id"].as_str().unwrap();
+    let a = f.ok(&[
+        "--actor",
+        "bob",
+        "answer",
+        q,
+        "accepted text",
+        "--expect",
+        "1",
+    ]);
+    let a = a["id"].as_str().unwrap();
+    let other = f.ok(&["answer", q, "alternative", "--expect", "2"]);
+    let other = other["id"].as_str().unwrap();
+    f.ok(&["accept", a, "--expect", "1", "--expect-question", "3"]);
+    let accepted = f.ok(&["show", a])["record"].clone();
+    let p = f.ok(&["--session", "paired", "prime"]);
+    assert_eq!(p["items"].as_array().unwrap().len(), 2);
+    assert_eq!(p["items"][0]["accepted_answer_id"], a);
+    assert_eq!(p["items"][1]["actor"], accepted["actor"]);
+    assert_eq!(p["items"][1]["revision"], accepted["revision"]);
+    assert!(!p["items"].to_string().contains(other));
+    let audit = f.ok(&["consumed", "--for-session", "paired"]);
+    assert!(audit.to_string().contains(q));
+    assert!(audit.to_string().contains(a));
+    let size = serde_json::to_vec(&p["items"]).unwrap().len();
+    assert_eq!(
+        f.ok(&["prime", "--budget", &(size - 1).to_string()])["omitted"],
+        json!([q, a])
     );
 }
 
@@ -521,24 +902,44 @@ fn work_references_obey_review_retry_and_render_contracts() {
     );
     let out = f.dir.path().join("native");
     f.ok(&["render", "--out", out.to_str().unwrap()]);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(out.join("SCROLLS-MANIFEST.json")).unwrap()).unwrap();
+    let rendered_path = manifest["records"][id].as_str().unwrap();
     assert!(
-        std::fs::read_to_string(out.join(format!("scrolls/{id}.md")))
+        std::fs::read_to_string(out.join(rendered_path))
             .unwrap()
             .contains("## Related work")
     );
+    let bead_page = std::fs::read_to_string(
+        out.join("scrolls/beads/00000000-0000-4000-8000-000000000001/bd-a.md"),
+    )
+    .unwrap();
+    assert!(bead_page.contains(rendered_path));
     assert!(
         out.join("scrolls/beads/00000000-0000-4000-8000-000000000001/bd-a.md")
             .exists()
     );
-    f.fail(
-        &[
-            "render",
-            "--format",
-            "liskov",
-            "--out",
-            f.dir.path().join("legacy").to_str().unwrap(),
-        ],
-        "not representable",
+    let legacy = f.dir.path().join("legacy");
+    f.ok(&[
+        "render",
+        "--format",
+        "liskov",
+        "--out",
+        legacy.to_str().unwrap(),
+    ]);
+    let normalized: Value =
+        serde_json::from_slice(&std::fs::read(legacy.join("scrolls/graph.json")).unwrap()).unwrap();
+    assert!(
+        normalized["edges"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|edge| edge["to"] == target)
+    );
+    assert!(
+        std::fs::read_to_string(legacy.join(rendered_path))
+            .unwrap()
+            .contains(target)
     );
     let before = f.ok(&["show", id]);
     f.ok(&[

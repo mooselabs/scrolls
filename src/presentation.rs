@@ -73,6 +73,9 @@ pub fn human(envelope: &Value) -> String {
             "Context: {} / {} bytes; omitted: {}\n",
             data["used_bytes"], data["budget_bytes"], data["omitted"]
         ));
+        if data["over_budget_bytes"].as_u64().unwrap_or(0) > 0 {
+            out.push_str(&format!("Mandatory doctrine: {} bytes; budget exceeded by {} bytes. All mandatory bodies included.\n", data["mandatory_bytes"], data["over_budget_bytes"]));
+        }
         if let Some(clauses) = data.get("undecided_doctrine") {
             out.push_str(&format!(
                 "Undecided doctrine: {}\n",

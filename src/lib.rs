@@ -8,4 +8,5 @@ pub mod presentation;
 pub mod query;
 pub mod render;
 pub mod storage;
+pub mod triggers;
 pub mod work_ref;

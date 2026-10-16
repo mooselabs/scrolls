@@ -250,7 +250,10 @@ impl Store {
             records: self
                 .rows::<Record>("records")?
                 .into_iter()
-                .map(|r| (r.id.clone(), r))
+                .map(|mut r| {
+                    r.normalize_metadata();
+                    (r.id.clone(), r)
+                })
                 .collect(),
             edges: self
                 .rows::<Edge>("edges")?
