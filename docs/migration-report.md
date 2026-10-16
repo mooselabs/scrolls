@@ -1,5 +1,8 @@
 # Scrolls v1 migration qualification
 
+This records the initial v1 baseline. The later [correctness qualification](correctness-qualification.md)
+covers mandatory doctrine, reference ownership, answer pairs and exports with native records.
+
 Date: 2026-10-16. This is local tool qualification, not a documentation authority
 cutover. No orchestrator file, Beads record, live operating rule, shared Dolt
 binary, or shared Dolt configuration was changed.
@@ -117,6 +120,7 @@ of SQL and preserved source data; it is not a streaming or remote sync engine.
 
 Registry editing, arbitrary SQL, remote synchronization, embeddings, model
 calls, executable doctrine checks, hooks, and web/Slack/MCP interfaces remain
-deferred. Imported frozen history cannot be changed. Liskov export refuses
-native additions and unsupported graph/metadata changes; native export carries
-the complete normalized graph alongside original paths.
+deferred. Imported frozen history cannot be changed. The initial Liskov adapter refused
+native additions; the [correctness update](correctness-qualification.md) now exports
+all native kinds and supplemental relationships in both formats, preserving
+original bytes and refusing incompatible edits to imported legacy documents.
