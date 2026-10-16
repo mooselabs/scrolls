@@ -12,7 +12,7 @@ pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
         return Ok(());
     }
     if e.rel == "applies_to" && a.kind == "doctrine" && e.to.starts_with("glob:") {
-        globset::Glob::new(&e.to[5..])?;
+        crate::triggers::glob(&a.id, "applies_to", &e.to[5..])?;
         return Ok(());
     }
     let b = b.ok_or_else(|| anyhow::anyhow!("missing target {}", e.to))?;
@@ -64,6 +64,11 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
         .collect();
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     for r in g.records.values() {
+        if r.kind == "doctrine" {
+            if let Err(err) = crate::triggers::parse(&r.id, &r.fields, "glob") {
+                out.insert(format!("{err:#}"));
+            }
+        }
         if !lifecycle(&r.kind).is_ok_and(|l| l.contains(&r.status.as_str())) {
             out.insert(format!("{}:invalid-status", r.id));
         }
@@ -148,6 +153,18 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
     out
 }
 pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) -> Result<()> {
+    for (id, r) in &after.records {
+        if r.kind == "doctrine" && before.records.get(id) != Some(r) {
+            crate::triggers::parse(id, &r.fields, "glob")?;
+            for edge in after
+                .edges
+                .values()
+                .filter(|e| e.from == *id && e.rel == "applies_to")
+            {
+                edge_valid(after, edge)?;
+            }
+        }
+    }
     let errors = lint(after);
     let baseline = lint(before);
     let new: Vec<_> = errors.difference(&baseline).cloned().collect();
@@ -170,4 +187,24 @@ pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
             g.add_edge(id, "related", target, "body link", actor);
         }
     }
+}
+
+pub fn reference_relation(rel: &str) -> bool {
+    matches!(rel, "about" | "asks_about" | "related")
+}
+pub fn lint_routing(routing: &serde_json::Value) -> BTreeSet<String> {
+    let mut errors = BTreeSet::new();
+    match crate::triggers::routing_entries(routing) {
+        Err(err) => {
+            errors.insert(err.to_string());
+        }
+        Ok(entries) => {
+            for entry in entries {
+                if let Err(err) = crate::triggers::imported(entry) {
+                    errors.insert(format!("{err:#}"));
+                }
+            }
+        }
+    }
+    errors
 }

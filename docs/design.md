@@ -688,7 +688,15 @@ anything else is built.
 - **Bodies: Markdown.** Common fields and arbitrary kind-specific JSON fields
   accompany the body. Runtime registry editing remains deferred.
 - **Retrieval: deterministic local graph and text.** Embeddings and model calls
-  are deferred. Context budgets explicitly count serialized item bytes.
+  are deferred. Context budgets count compact item-array bytes. `prime` delivers
+  mandatory doctrine in full beyond the budget when necessary; accepted local
+  question/answer pairs are optional indivisible groups. `context` remains bounded.
+- **Reference ownership:** `about`, `asks_about` and `related` belong to their
+  source only. Referenced records retain their revision and attribution.
+- **Exports:** all native kinds receive stable ID-based views plus a lossless
+  graph sidecar in both formats. Imported ADR numbers are optional compatibility
+  metadata; native decisions receive no number. See [commands](commands.md) for
+  layouts, compatibility mapping and frozen-history preservation.
 - **Answers: separate records.** Local questions admit multiple offered answers;
   their human owner accepts one. Imported questions remain immutable history.
 - **Authority: unchanged.** Qualification proves a local import, workflow, and

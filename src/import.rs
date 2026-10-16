@@ -276,8 +276,15 @@ pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
             || dtype.is_empty();
         r.aliases.push(full);
         let name = Path::new(&path).file_stem().unwrap().to_string_lossy();
-        if dtype == "adr" && name.len() >= 4 {
+        if dtype == "adr"
+            && name
+                .get(..4)
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        {
             r.aliases.push(format!("ADR-{}", &name[..4]));
+            r.metadata = Some(RecordMetadata {
+                number: name[..4].into(),
+            });
         }
         if let Some(m) = re.find(&name) {
             r.aliases.push(m.as_str().into());
@@ -404,13 +411,25 @@ pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
             .captures_iter(clause)
             .map(|c| c[1].to_string())
             .collect();
-        for p in &globs {
-            globset::Glob::new(p)?;
-        }
         let scope = clause
             .find("scope:")
             .map(|n| clause[n + 6..].trim().to_string());
-        triggers.push(json!({"id":id,"globs":globs,"scope_clause":scope}));
+        let mut trigger = json!({"id":id,"globs":globs});
+        if let Some(scope) = scope {
+            trigger["scope_clause"] = json!(scope);
+        }
+        crate::triggers::imported(&trigger)?;
+        triggers.push(trigger);
+    }
+    for record in graph.records.values().filter(|r| r.kind == "doctrine") {
+        crate::triggers::parse(&record.id, &record.fields, "glob")?;
+    }
+    for edge in graph
+        .edges
+        .values()
+        .filter(|e| e.rel == "applies_to" && e.to.starts_with("glob:"))
+    {
+        crate::triggers::glob(&edge.from, "applies_to", &edge.to[5..])?;
     }
     let info = ImportInfo {
         repository: root.to_string_lossy().into_owned(),

@@ -49,6 +49,8 @@ The export destination must be new. Bodies accept `--body`, `--body-file PATH`,
 `--body-file -`, or piped stdin. `edit` opens `$VISUAL` / `$EDITOR` on a terminal;
 `--editor` explicitly selects that behavior. `show` returns each record's
 numeric `revision`, which is required by `edit`, `status`, and graph mutations.
+Reference relations (`about`, `asks_about`, `related`) change only their source;
+referencing a protected target does not require review.
 
 For a pinned import:
 
@@ -65,6 +67,11 @@ scrolls render --format liskov --out ./liskov-docs-export
 Import requires an empty store. It reads Git objects, excludes untracked and
 uncommitted bytes, and preserves original metadata and assets. Repeating the
 same source commit is safe; changed-source reimport requires a new store.
+Exports include every native kind, a complete graph, stable ID-based filenames,
+and an ID-to-path manifest. Native decisions and local questions have separate
+views; they do not become numbered ADRs or legacy ledger records. `prime` always
+delivers matched doctrine in full, even beyond its default 16,000-byte budget.
+
 Imported backlog, epic, milestone, question, and untyped archive records are
 immutable. Newly authored local questions are independent of the legacy inbox.
 

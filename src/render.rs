@@ -19,9 +19,16 @@ fn changed(r: &Record) -> Result<bool> {
         return Ok(true);
     };
     let mut new = r.clone();
+    new.normalize_metadata();
     new.original = None;
     new.revision = old.revision;
     new.actor = old.actor.clone();
+    if old.metadata.is_none() {
+        let mut legacy = r.clone();
+        legacy.metadata = None;
+        legacy.normalize_metadata();
+        old.metadata = legacy.metadata;
+    }
     old.original = None;
     Ok(old != new)
 }
@@ -42,10 +49,8 @@ fn legacy_status(r: &Record, old: &Record) -> Result<String> {
     Ok(match r.kind.as_str() {
         "knowledge" | "primer" => match r.status.as_str() {
             "current" => "canonical",
-            "draft" => "draft",
-            "stale" => "stale",
-            "retired" => "deprecated",
-            _ => bail!("unrepresentable knowledge status"),
+            "draft" => "working",
+            _ => bail!("record {}: knowledge lifecycle {} is not representable in the legacy status vocabulary", r.id, r.status),
         },
         "decision" => match r.status.as_str() {
             "proposed" => "proposed",
@@ -111,10 +116,27 @@ pub fn render(
             bail!("render must not write inside the source documentation tree");
         }
     }
-    let mut output: BTreeMap<String, Vec<u8>> = files
-        .iter()
-        .map(|f| Ok((f.path.clone(), STANDARD.decode(&f.bytes)?)))
-        .collect::<Result<_>>()?;
+    let mut output = BTreeMap::new();
+    for f in files {
+        safe_path(&f.path)?;
+        insert_new(&mut output, f.path.clone(), STANDARD.decode(&f.bytes)?)?;
+    }
+    let mut locations = BTreeMap::new();
+    let mut occupied = std::collections::BTreeSet::new();
+    for r in g.records.values() {
+        let path = match &r.path {
+            Some(path) => path.clone(),
+            None => native_path(r)?,
+        };
+        safe_path(&path)?;
+        if !occupied.insert(path.clone()) {
+            bail!("render collision: multiple records at {path}");
+        }
+        if r.path.is_none() && output.contains_key(&path) {
+            bail!("render collision with imported file: {path}");
+        }
+        locations.insert(r.id.clone(), path);
+    }
     let mut metadata = BTreeMap::new();
     let mut graph_only = vec![];
     for r in g.records.values() {
@@ -128,7 +150,7 @@ pub fn render(
                     && (r.review_every != old.review_every
                         || r.fields
                             .as_object()
-                            .unwrap()
+                            .context("record fields must be an object")?
                             .keys()
                             .any(|key| old.fields.get(key).is_none()))
                 {
@@ -153,19 +175,13 @@ pub fn render(
                     r.id
                 );
             }
-        } else if format == Format::Liskov {
-            bail!(
-                "native addition {} ({}) is not representable in liskov format; use native",
-                r.id,
-                r.kind
-            );
         }
     }
     let base: BTreeMap<_, _> = baseline.iter().map(|e| (e.key(), e)).collect();
     for (edge, add) in g
         .edges
         .iter()
-        .filter(|(k, _)| !base.contains_key(*k))
+        .filter(|(k, e)| base.get(*k).is_none_or(|old| *old != *e))
         .map(|(_, e)| (e, true))
         .chain(
             base.iter()
@@ -176,42 +192,46 @@ pub fn render(
         if format == Format::Native {
             continue;
         }
+        let source = &g.records[&edge.from];
+        if edge.rel == "supersedes" && source.kind == "decision" && source.path.is_none() {
+            let target = &g.records[&edge.to];
+            if target.path.is_some()
+                && target.status == "superseded"
+                && original(target)?.is_some_and(|old| old.status != target.status)
+            {
+                bail!(
+                    "imported decision {} cannot be superseded by native decision {} in liskov output: the legacy catalogue requires a numbered ADR successor",
+                    target.id,
+                    source.id
+                );
+            }
+        }
+        if source.frozen {
+            bail!("graph change affects frozen {}", source.id);
+        }
         let (record, target, key) = match edge.rel.as_str() {
             "supports" => (&edge.to, &edge.from, "source_documents"),
             "derived_from" => (&edge.from, &edge.to, "source_documents"),
-            "about" => (&edge.from, &edge.to, "related_repos"),
-            "supersedes" if g.records[&edge.from].kind == "decision" => {
-                (&edge.from, &edge.to, "supersedes")
+            "about" if repository_entity(&g.records[&edge.to]) => {
+                (&edge.from, &edge.to, "related_repos")
             }
-            _ => bail!(
-                "graph change {} is not representable in liskov output",
-                edge.rel
-            ),
+            "supersedes" if source.kind == "decision" => (&edge.from, &edge.to, "supersedes"),
+            _ => continue, // Native assertions remain lossless in the graph and supplemental views.
         };
         let r = &g.records[record];
+        let Some(path) = &r.path else {
+            continue;
+        };
         if r.frozen {
-            bail!("graph change affects frozen {}", r.id)
+            bail!("graph change affects frozen {}", r.id);
         }
-        let path = r
-            .path
-            .as_ref()
-            .context("graph-only entity has no legacy document")?;
         let t = &g.records[target];
         let value = if key == "related_repos" {
             t.title.clone()
         } else if key == "supersedes" {
-            t.aliases
-                .iter()
-                .find(|a| a.starts_with("ADR-"))
-                .context("legacy supersedes requires an ADR alias")?
-                .clone()
+            t.aliases.iter().find(|a| a.starts_with("ADR-")).context("imported decision supersedes requires a numbered legacy ADR target; native decisions are supplemental")?.clone()
         } else {
-            relative(
-                path,
-                t.path
-                    .as_ref()
-                    .context("provenance target has no legacy path")?,
-            )
+            relative(path, &locations[target])
         };
         let fm = metadata
             .entry(record.clone())
@@ -219,43 +239,88 @@ pub fn render(
         let mut values = strings(&fm[key]);
         if add {
             if !values.contains(&value) {
-                values.push(value)
+                values.push(value);
             }
         } else {
-            values.retain(|v| v != &value)
+            values.retain(|v| v != &value);
         }
         fm[key] = json!(values);
     }
     for (id, fm) in metadata {
         let r = &g.records[&id];
-        let path = r.path.as_ref().unwrap();
-        let text = format!("---\n{}---\n{}", serde_yaml::to_string(&fm)?, r.body);
-        output.insert(path.clone(), text.into_bytes());
-    }
-    // Native records are a complete normalized graph, including entities and edges.
-    if format == Format::Native {
-        for r in g.records.values() {
-            if r.path.is_none() {
-                output.insert(format!("scrolls/{}.md",r.id),format!("---\n{}---\n{}",serde_yaml::to_string(&json!({"id":r.id,"kind":r.kind,"title":r.title,"status":r.status,"owner":r.owner}))?,r.body).into_bytes());
-            }
-        }
+        let path = &locations[&id];
+        let body = rendered_links(&r.body, path, &locations)?;
         output.insert(
-            "scrolls/graph.json".into(),
-            serde_json::to_vec_pretty(&json!({"records":g.records,"edges":g.edges}))?,
+            path.clone(),
+            format!("---\n{}---\n{}", serde_yaml::to_string(&fm)?, body).into_bytes(),
         );
     }
-    // Do not normalize a pristine export; verify its indexes separately. On edits
-    // refresh only directory indexes, never frozen work views.
-    if files
+    for r in g.records.values().filter(|r| r.path.is_none()) {
+        let path = &locations[&r.id];
+        insert_new(
+            &mut output,
+            path.clone(),
+            supplemental(r, g, path, &locations)?.into_bytes(),
+        )?;
+    }
+    let normalized: BTreeMap<_, _> = g
+        .records
         .iter()
-        .any(|f| output.get(&f.path).is_some_and(|b| digest(b) != f.sha256))
-    {
-        refresh_indexes(&mut output)?;
+        .map(|(id, r)| {
+            let mut r = r.clone();
+            r.normalize_metadata();
+            (id, r)
+        })
+        .collect();
+    insert_new(
+        &mut output,
+        "scrolls/graph.json".into(),
+        serde_json::to_vec_pretty(&json!({"records":normalized,"edges":g.edges}))?,
+    )?;
+    insert_new(
+        &mut output,
+        "scrolls/README.md".into(),
+        supplemental_index(g, &locations)?.into_bytes(),
+    )?;
+    // Refresh only affected legacy directory indexes, never frozen work views.
+    let changed_paths: Vec<_> = output
+        .iter()
+        .filter(|(p, b)| {
+            !p.starts_with("scrolls/")
+                && files
+                    .iter()
+                    .find(|f| f.path == **p)
+                    .is_none_or(|f| digest(b) != f.sha256)
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    if !changed_paths.is_empty() {
+        let mut refreshed = output.clone();
+        refresh_indexes(&mut refreshed)?;
+        for (index, prefix) in [
+            ("raw/README.md", "raw/"),
+            ("work-notes/README.md", "work-notes/sessions/"),
+            ("questions/README.md", "questions/"),
+            ("knowledge/README.md", "knowledge/"),
+            ("decisions/README.md", "decisions/adr/"),
+            ("business/README.md", "business/"),
+        ] {
+            if changed_paths.iter().any(|p| p.starts_with(prefix)) {
+                if let Some(bytes) = refreshed.get(index) {
+                    output.insert(index.into(), bytes.clone());
+                }
+            }
+        }
     }
     let hashes: BTreeMap<_, _> = output.iter().map(|(p, b)| (p.clone(), digest(b))).collect();
-    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"graph_only_imported_entities":graph_only});
+    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only});
     for path in output.keys() {
         safe_path(path)?;
+        for ancestor in Path::new(path).ancestors().skip(1) {
+            if output.contains_key(&ancestor.to_string_lossy().into_owned()) {
+                bail!("render file/directory collision: {path}");
+            }
+        }
         if path == "RENDERED" || path == "SCROLLS-MANIFEST.json" {
             bail!("reserved render path {path}");
         }
@@ -288,6 +353,165 @@ pub fn render(
         return Err(e.into());
     }
     Ok(json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only}))
+}
+fn insert_new(output: &mut BTreeMap<String, Vec<u8>>, path: String, bytes: Vec<u8>) -> Result<()> {
+    if output.contains_key(&path) {
+        bail!("render collision: {path}");
+    }
+    output.insert(path, bytes);
+    Ok(())
+}
+fn native_path(r: &Record) -> Result<String> {
+    anyhow::ensure!(
+        r.id.starts_with("sc-") && r.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "unsafe native record id {}",
+        r.id
+    );
+    lifecycle(&r.kind)?;
+    let date = r
+        .created
+        .get(..10)
+        .context("record creation date must be YYYY-MM-DD")?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").context("invalid record creation date")?;
+    Ok(match r.kind.as_str() {
+        "evidence" => format!("raw/{date}-{}.md", r.id),
+        "knowledge" | "primer" => format!("knowledge/{}.md", r.id),
+        "note" => format!("work-notes/sessions/{date}/{date}-{}.md", r.id),
+        _ => format!("scrolls/{}/{}.md", r.kind, r.id),
+    })
+}
+fn repository_entity(r: &Record) -> bool {
+    r.kind == "entity"
+        && r.original.as_ref().is_some_and(|o| {
+            o["fields"]["type"] == "repo"
+                && o["fields"]["manifest"]["name"].as_str() == Some(r.title.as_str())
+        })
+}
+fn rendered_links(body: &str, path: &str, locations: &BTreeMap<String, String>) -> Result<String> {
+    let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(#[^)]*)?\)")?;
+    for cap in re.captures_iter(body) {
+        anyhow::ensure!(
+            locations.contains_key(&cap[1]),
+            "{path}: unresolved Scrolls body link {}",
+            &cap[1]
+        );
+    }
+    Ok(re
+        .replace_all(body, |cap: &regex::Captures<'_>| {
+            format!(
+                "]({}{})",
+                relative(path, &locations[&cap[1]]),
+                cap.get(2).map_or("", |m| m.as_str())
+            )
+        })
+        .into_owned())
+}
+fn compatibility(r: &Record) -> (&str, &str) {
+    match r.kind.as_str() {
+        "evidence" => ("raw", "raw"),
+        "knowledge" | "primer" => (
+            "knowledge",
+            match r.status.as_str() {
+                "current" => "canonical",
+                _ => "working",
+            },
+        ),
+        "note" => ("work_note", "working"),
+        "collection" => ("index", "canonical"),
+        _ => ("meta", "canonical"),
+    }
+}
+fn supplemental(
+    r: &Record,
+    g: &Graph,
+    path: &str,
+    locations: &BTreeMap<String, String>,
+) -> Result<String> {
+    let (doc_type, status) = compatibility(r);
+    let related_repos: Vec<_> = g
+        .edges
+        .values()
+        .filter(|e| e.from == r.id && e.rel == "about")
+        .filter_map(|e| g.records.get(&e.to))
+        .filter(|r| repository_entity(r))
+        .map(|r| &r.title)
+        .collect();
+    let sources: Vec<_> = g
+        .edges
+        .values()
+        .filter_map(|e| {
+            if e.rel == "supports" && e.to == r.id {
+                Some(&e.from)
+            } else if e.rel == "derived_from" && e.from == r.id {
+                Some(&e.to)
+            } else {
+                None
+            }
+        })
+        .filter_map(|id| locations.get(id))
+        .map(|to| relative(path, to))
+        .collect();
+    let fm = json!({"title":r.title,"doc_type":doc_type,"status":status,"owner":r.owner,
+        "created":&r.created[..10],"last_reviewed":r.last_reviewed.get(..10).unwrap_or(&r.last_reviewed),
+        "confidence":r.confidence,"source_documents":sources,"related_repos":related_repos});
+    let mut text = format!(
+        "---\n{}---\n\n# {}\n\nScrolls ID: `{}` · Kind: `{}` · Lifecycle: `{}` · Revision: {} · Actor: {}\n\n{}\n",
+        serde_yaml::to_string(&fm)?,
+        r.title,
+        r.id,
+        r.kind,
+        r.status,
+        r.revision,
+        r.actor,
+        rendered_links(&r.body, path, locations)?
+    );
+    text.push_str("\n## Relationships\n\n");
+    for e in g.edges.values().filter(|e| e.from == r.id || e.to == r.id) {
+        let other = if e.from == r.id { &e.to } else { &e.from };
+        let label = if let Some(to) = locations.get(other) {
+            format!("[{}]({})", other, relative(path, to))
+        } else {
+            format!("`{other}`")
+        };
+        let direction = if e.from == r.id {
+            "outgoing"
+        } else {
+            "incoming"
+        };
+        let accepted = if e.rel == "answers"
+            && g.records
+                .get(&e.from)
+                .is_some_and(|a| a.status == "accepted")
+        {
+            " (accepted answer)"
+        } else {
+            ""
+        };
+        text.push_str(&format!(
+            "- {direction} `{}`{accepted}: {label} — {}\n",
+            e.rel, e.why
+        ));
+    }
+    Ok(text)
+}
+fn supplemental_index(g: &Graph, locations: &BTreeMap<String, String>) -> Result<String> {
+    let fm = json!({"title":"Scrolls supplemental records","doc_type":"index","status":"canonical","owner":"scrolls",
+        "created":"2026-10-16","last_reviewed":"2026-10-16","confidence":"high","source_documents":[],"related_repos":[]});
+    let mut text = format!(
+        "---\n{}---\n\n# Scrolls supplemental records\n\nNative decisions use stable IDs; they are not numbered legacy ADRs. Local questions and answers are independent of the legacy work ledger.\n\n",
+        serde_yaml::to_string(&fm)?
+    );
+    for r in g.records.values().filter(|r| r.path.is_none()) {
+        text.push_str(&format!(
+            "- [{}]({}) — `{}` / `{}` — {}\n",
+            r.id,
+            relative("scrolls/README.md", &locations[&r.id]),
+            r.kind,
+            r.status,
+            r.title.replace('\n', " ")
+        ));
+    }
+    Ok(text)
 }
 fn escape(v: &Value) -> String {
     v.as_str()

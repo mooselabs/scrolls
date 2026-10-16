@@ -34,6 +34,12 @@ pub struct Record {
     pub frozen: bool,
     pub original: Option<Value>,
     pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<RecordMetadata>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordMetadata {
+    pub number: String,
 }
 impl Record {
     pub fn new(kind: &str, title: &str, body: &str, actor: &str) -> Result<Self> {
@@ -58,7 +64,25 @@ impl Record {
             frozen: false,
             original: None,
             aliases: vec![],
+            metadata: None,
         })
+    }
+    /// Backward-compatible read normalization; it never changes revision or attribution.
+    pub fn normalize_metadata(&mut self) {
+        if self.metadata.is_none() && self.kind == "decision" && self.original.is_some() {
+            let number = self
+                .aliases
+                .iter()
+                .find_map(|a| a.strip_prefix("ADR-"))
+                .or_else(|| self.path.as_deref()?.rsplit('/').next()?.split('-').next());
+            if let Some(number) =
+                number.filter(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit()))
+            {
+                self.metadata = Some(RecordMetadata {
+                    number: number.into(),
+                });
+            }
+        }
     }
     pub fn protected(&self, role: &str) -> bool {
         matches!(
@@ -70,6 +94,9 @@ impl Record {
         if self.frozen {
             bail!("{} is immutable imported compatibility history", self.id);
         }
+        self.check_revision(expected)
+    }
+    pub fn check_revision(&self, expected: u64) -> Result<()> {
         if self.revision != expected {
             bail!(
                 "stale edit: expected revision {expected}, current {}; read show and retry with a fresh --op-id",

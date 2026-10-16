@@ -55,7 +55,11 @@ e = call(
     "Rollback measurement",
     "--body",
     "A killed transaction left zero partial rows.",
+    "--about",
+    entity["id"],
 )
+assert e["branch"] == "main"
+assert call("show", entity["id"])["record"]["revision"] == 1
 k = call(
     "new",
     "knowledge",
@@ -76,6 +80,8 @@ assert any(r["id"] == k["id"] for r in packet["items"])
 q = call(
     "ask",
     "Should we keep the transaction boundary?",
+    "--about",
+    entity["id"],
     "--owner",
     "alice",
     "--context",
@@ -94,8 +100,18 @@ answer = call(
 )
 call("accept", answer["id"], "--expect", "1", "--expect-question", "2")
 call("history", k["id"])
-call("prime")
-call("render", "--out", str(a.out / "rendered"))
+packet = call("prime")
+question = next(r for r in packet["items"] if r["id"] == q["id"])
+assert question["accepted_answer_id"] == answer["id"]
+assert any(r["id"] == answer["id"] for r in packet["items"])
+doctrine = call("new", "doctrine", "--title", "Mandatory demo rule", "--body", "Read the complete rule.\n" * 1000, "--field", "glob=demo/**")
+call("--proposal", doctrine["branch"], "status", doctrine["id"], "active", "--expect", "1")
+call("review", "accept", doctrine["branch"])
+packet = call("prime", "--for", "demo/file.rs")
+assert packet["over_budget_bytes"] > 0
+assert any(r["id"] == doctrine["id"] for r in packet["items"])
+assert packet["used_bytes"] == len(json.dumps(packet["items"], ensure_ascii=False, separators=(",", ":")).encode())
+call("render", "--format", "liskov", "--out", str(a.out / "rendered"))
 (a.out / "transcript.json").write_text(json.dumps(transcript, indent=2) + "\n")
 print(
     f"Demonstrated evidence, proposal, review, context, local question, history and render: {a.out}"

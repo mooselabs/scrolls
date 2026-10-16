@@ -81,14 +81,43 @@ pub fn context(g: &Graph, id: &str, budget: usize) -> Result<Value> {
         budget,
     )
 }
-pub fn packet(g: &Graph, full: Vec<String>, titles: Vec<String>, budget: usize) -> Result<Value> {
+/// Context projections intentionally omit the duplicate import snapshot.
+pub fn projection(r: &Record) -> Result<Value> {
+    let mut value = serde_json::to_value(r)?;
+    value.as_object_mut().unwrap().remove("original");
+    Ok(value)
+}
+fn budget_packet(mandatory: Vec<Value>, groups: Vec<Vec<Value>>, budget: usize) -> Result<Value> {
     anyhow::ensure!(
         budget >= 2,
         "--budget must be at least 2 bytes for a JSON array"
     );
-    let mut items = vec![];
+    let mandatory_bytes = if mandatory.is_empty() {
+        0
+    } else {
+        serde_json::to_vec(&mandatory)?.len()
+    };
+    let mut items = mandatory;
+    let mut used = serde_json::to_vec(&items)?.len();
     let mut omitted = vec![];
-    let mut used = 2;
+    for group in groups {
+        let size = serde_json::to_vec(&group)?.len() - 2 + usize::from(!items.is_empty());
+        if used + size <= budget {
+            used += size;
+            items.extend(group);
+        } else {
+            omitted.extend(group.iter().map(|v| v["id"].clone()));
+        }
+    }
+    Ok(
+        json!({"items":items,"omitted":omitted,"budget_bytes":budget,"used_bytes":used,
+        "mandatory_bytes":mandatory_bytes,"over_budget_bytes":used.saturating_sub(budget),
+        "budget_scope":"compact JSON items array; envelope and omission IDs excluded"}),
+    )
+}
+pub fn packet(g: &Graph, full: Vec<String>, titles: Vec<String>, budget: usize) -> Result<Value> {
+    let mut groups = vec![];
+    let mut seen = BTreeSet::new();
     for (id, summary) in full
         .into_iter()
         .map(|id| (id, false))
@@ -97,55 +126,89 @@ pub fn packet(g: &Graph, full: Vec<String>, titles: Vec<String>, budget: usize) 
         let Some(r) = g.records.get(&id) else {
             continue;
         };
-        if r.kind == "note" {
+        if r.kind == "note" || !seen.insert(id.clone()) {
             continue;
         }
-        let v = if summary {
+        groups.push(vec![if summary {
             json!({"id":id,"title":r.title,"kind":r.kind,"summary_only":true})
         } else {
-            serde_json::to_value(r)?
-        };
-        let size = serde_json::to_vec(&v)?.len() + usize::from(!items.is_empty());
-        if used + size <= budget {
-            used += size;
-            items.push(v)
-        } else {
-            omitted.push(id)
-        }
+            projection(r)?
+        }]);
     }
-    Ok(
-        json!({"items":items,"omitted":omitted,"budget_bytes":budget,"used_bytes":used,"budget_scope":"compact JSON items array; envelope and omission IDs excluded"}),
-    )
+    budget_packet(vec![], groups, budget)
+}
+pub fn prime(
+    g: &Graph,
+    routing: &Value,
+    paths: &[String],
+    who: &str,
+    budget: usize,
+) -> Result<Value> {
+    let doctrine = doctrine(g, routing, paths)?;
+    let mandatory = doctrine["matched"].as_array().unwrap().clone();
+    let mut groups = vec![];
+    for r in g.records.values().filter(|r| {
+        (r.kind == "primer" && r.status == "current")
+            || (r.kind == "question"
+                && !r.frozen
+                && ((r.owner == who && r.status == "open")
+                    || (r.fields["asked_by"] == who && r.status == "answered")))
+    }) {
+        let mut question = projection(r)?;
+        let mut group = vec![];
+        if r.kind == "question" && r.status == "answered" {
+            let answers: Vec<_> = g
+                .edges
+                .values()
+                .filter(|e| e.rel == "answers" && e.to == r.id)
+                .filter_map(|e| g.records.get(&e.from))
+                .filter(|a| a.kind == "answer" && a.status == "accepted")
+                .collect();
+            anyhow::ensure!(
+                answers.len() == 1,
+                "{}: answered local question requires exactly one accepted answer; found {}",
+                r.id,
+                answers.len()
+            );
+            question["accepted_answer_id"] = json!(answers[0].id);
+            let mut answer = projection(answers[0])?;
+            answer["question_id"] = json!(r.id);
+            group.push(question);
+            group.push(answer);
+        } else {
+            group.push(question);
+        }
+        groups.push(group);
+    }
+    let mut packet = budget_packet(mandatory, groups, budget)?;
+    packet["undecided_doctrine"] = doctrine["undecided"].clone();
+    Ok(packet)
 }
 pub fn doctrine(g: &Graph, routing: &Value, paths: &[String]) -> Result<Value> {
     let mut matched = BTreeSet::new();
-    let mut undecided = vec![];
-    for t in routing["triggers"].as_array().into_iter().flatten() {
-        let id = t["id"].as_str().unwrap_or("");
+    let mut undecided = BTreeSet::new();
+    for t in crate::triggers::routing_entries(routing)? {
+        let id = t["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("routing trigger requires record id"))?;
         if !g.records.get(id).is_some_and(|r| r.status == "active") {
             continue;
         }
-        if crate::import::strings(&t["globs"]).iter().any(|pattern| {
-            globset::Glob::new(pattern).is_ok_and(|glob| {
-                paths
-                    .iter()
-                    .any(|path| glob.compile_matcher().is_match(path))
-            })
-        }) {
+        let parsed = crate::triggers::imported(t)?;
+        if parsed.matches(paths) {
             matched.insert(id.to_string());
         }
-        if let Some(scope) = t["scope_clause"].as_str() {
-            undecided.push(json!({"id":id,"scope_clause":scope,"reason":"scope clauses need human judgement; no model is called"}));
+        if let Some(scope) = parsed.scope {
+            undecided.insert((id.to_string(), scope));
         }
     }
     for e in g.edges.values().filter(|e| e.rel == "applies_to") {
         if let Some(pattern) = e.to.strip_prefix("glob:") {
-            if g.records.get(&e.from).is_some_and(|r| r.status == "active")
-                && paths.iter().any(|p| {
-                    globset::Glob::new(pattern).is_ok_and(|g| g.compile_matcher().is_match(p))
-                })
-            {
-                matched.insert(e.from.clone());
+            if g.records.get(&e.from).is_some_and(|r| r.status == "active") {
+                let glob = crate::triggers::glob(&e.from, "applies_to", pattern)?;
+                if paths.iter().any(|p| glob.is_match(p)) {
+                    matched.insert(e.from.clone());
+                }
             }
         }
     }
@@ -154,19 +217,18 @@ pub fn doctrine(g: &Graph, routing: &Value, paths: &[String]) -> Result<Value> {
         .values()
         .filter(|r| r.kind == "doctrine" && r.status == "active")
     {
-        for pattern in crate::import::strings(&r.fields["glob"]) {
-            if paths.iter().any(|p| {
-                globset::Glob::new(&pattern).is_ok_and(|g| g.compile_matcher().is_match(p))
-            }) {
-                matched.insert(r.id.clone());
-            }
+        let parsed = crate::triggers::parse(&r.id, &r.fields, "glob")?;
+        if parsed.matches(paths) {
+            matched.insert(r.id.clone());
         }
-        if let Some(scope) = r.fields["scope_clause"].as_str() {
-            undecided
-                .push(json!({"id":r.id,"scope_clause":scope,"reason":"requires human judgement"}));
+        if let Some(scope) = parsed.scope {
+            undecided.insert((r.id.clone(), scope));
         }
     }
-    Ok(
-        json!({"matched":matched.into_iter().filter_map(|id|g.records.get(&id)).collect::<Vec<_>>(),"undecided":undecided}),
-    )
+    let matched = matched
+        .into_iter()
+        .map(|id| projection(&g.records[&id]))
+        .collect::<Result<Vec<_>>>()?;
+    let undecided: Vec<_> = undecided.into_iter().map(|(id, scope)| json!({"id":id,"scope_clause":scope,"reason":"scope clauses need human judgement; no model is called"})).collect();
+    Ok(json!({"matched":matched,"undecided":undecided}))
 }
