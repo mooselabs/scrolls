@@ -11,7 +11,7 @@ fn main() {
             {
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":1,"ok":false,"error":{"message":e.to_string()}})
+                    serde_json::json!({"schema_version":2,"ok":false,"error":{"message":e.to_string()}})
                 );
                 std::process::exit(2)
             }
@@ -29,7 +29,12 @@ fn main() {
                 v["error"] =
                     serde_json::json!({"message":"structural lint errors; inspect data.errors"});
             }
-            if cli.json {
+            if let scrolls::cli::Cmd::Schema {
+                command: scrolls::cli::SchemaCommand::Export,
+            } = cli.command
+            {
+                print!("{}", v["data"]["yaml"].as_str().unwrap());
+            } else if cli.json {
                 println!("{}", serde_json::to_string(&v).unwrap());
             } else {
                 print!("{}", scrolls::presentation::human(&v));
@@ -42,7 +47,7 @@ fn main() {
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":1,"ok":false,"error":{"message":format!("{e:#}")}})
+                    serde_json::json!({"schema_version":2,"ok":false,"error":{"message":format!("{e:#}")}})
                 );
             } else {
                 eprintln!("scrolls: {e:#}");

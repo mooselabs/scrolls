@@ -1,265 +1,123 @@
-# Scrolls v1 command reference
+# Scrolls 0.2 command reference
 
-Every command accepts `--json`, `--store PATH`, `--dolt PATH`, `--actor NAME`,
-`--role agent|human`, `--session NAME`, and `--proposal BRANCH`. Main is the
-default read branch. Proposal selection is explicit. Each successful response
-has `schema_version: 1`, `ok: true`, `revision` (Dolt commit), `branch`, and
-`data`. Errors have `ok: false` and `error.message`; they exit nonzero. Human
-output renders bodies and review changes as readable text; other structured
-results use pretty JSON. Every read prints its Dolt revision.
+Global flags: `--store DIR`, `--dolt FILE`, `--json`, `--actor NAME`,
+`--role human|agent`, `--proposal BRANCH`, `--op-id ID`, `--dry-run`, `--session ID`.
+Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
+`revision`, `branch`, and `data` (or `error`). Beads backlink payloads remain v1.
 
-Writes accept `--op-id ID` and `--dry-run`. Replaying the same operation with
-identical effective body, command, role, actor, source commit, and proposal
-returns the stored result. A changed input fails. Receipts on pending and
-rejected branches remain discoverable. The envelope identifies the revision
-read by the retry; `data` is the original operation result.
+| Command | Contract |
+|---|---|
+| `init [--schema FILE]` | Create a format 3 store using a supplied or bundled ontology. |
+| `schema show` | Active typed configuration and schema revision. |
+| `schema export` | YAML on stdout, suitable for editing (also with `--json`). |
+| `schema validate FILE` | Check format and compatibility against the selected graph. |
+| `schema apply FILE --expect REV` | Propose configuration; always requires human review. |
+| `new KIND --title TEXT [--body TEXT] [--owner NAME] [--field KEY=JSON]` | Create using configured defaults and policy. |
+| `edit ID --expect N` | Edit title, body, owner, fields or optional domain metadata. |
+| `status ID STATE --expect N` | Configured transition; cardinality and guards apply. |
+| `link FROM REL TO --expect N [--expect-to N] [--why TEXT]` | Add an assertion. Both-endpoint relations require both existing revisions. |
+| `unlink FROM REL TO --expect N [--expect-to N]` | Remove an assertion under the same ownership rules. |
+| `batch FILE` | Atomic ordered YAML/JSON generic mutations. |
+| `proposals` | List pending, accepted and rejected proposals. |
+| `review BRANCH` | Record, edge and configuration differences. |
+| `review accept BRANCH --review-token TOKEN` | Human review, merged-data revalidation and guarded acceptance. |
+| `review reject BRANCH --reason TEXT` | Human rejection with reason. |
+| `prime [--budget N]` | Complete schema guide/instructions/pins under a soft byte budget. |
+| `show ID` | Full record and immediate references. |
+| `context ID [--budget N]` | Document first, immediate references, hard byte budget. |
+| `context --bead REF [--budget N]` | Cached Beads metadata and direct document references. |
+| `list [--kind K] [--status S] [--owner NAME] [--field KEY=JSON]` | Deterministic filtered records; `--owner me` binds the actor. |
+| `search TERMS [filters] [--limit N]` | Same filters; case-insensitive AND over title/body. Includes notes. |
+| `query --file FILE [--path PATH] [--at RFC3339]` | Structured selection with explicit bindings. |
+| `walk ID [--rel R] [--direction incoming\|outgoing\|both] [--depth N] [--full]` | References and traversed edges; default depth 2, maximum 100. |
+| `history [ID]` | Dolt history. |
+| `lint` | Structural errors and retained imported debt; nonzero on new errors. |
+| `consumed [--for-session ID]` | Audited deliveries and record revisions. |
+| `doctor` / `migrate` | Inspect / explicitly upgrade a store. |
+| `import markdown DIR --rev COMMIT` | Pinned Git Liskov adapter; requires bundled knowledge ontology. |
+| `render --out DIR [--format native\|liskov]` | Fresh destination export with complete graph and configuration. |
 
-| Command | Behavior |
-| --- | --- |
-| `init` | Initialize the private database and default registry; existing stores are checked. |
-| `doctor` | Check the version pin, schema, clean working state, branches, and import provenance. |
-| `import markdown DIR --rev REV` | Resolve a Git commit and import only committed documentation files, manifest repository entities, and AGENTS.md doctrine routes. |
-| `render --out NEW_DIR [--format native\|liskov]` | Export a complete fresh tree. Both formats include normalized `scrolls/graph.json`, an ID-to-path manifest, and views for every native kind. Liskov rejects incompatible edits to imported legacy documents. |
-| `list [--kind KIND] [--status STATE] [--about ENTITY]` | List matching records in stable ID order. |
-| `show ID` | Record, revision, and incident graph edges. IDs, unique legacy IDs, and source paths resolve. |
-| `search TERMS [--limit N]` | Case-insensitive AND search over title/body, stable ID order, excluding notes. |
-| `walk ID [--rel REL] [--depth N]` | Deterministic breadth-first graph neighborhood, traversing incoming and outgoing edges. |
-| `context ID [--budget BYTES]` | The design's fixed graph traversal, with supporting evidence and neighboring entities as titles only. |
-| `prime [--for PATH]... [--budget BYTES]` | All matched doctrine, then optional current primers, owned open questions, and answered questions with their accepted answers. |
-| `new KIND --title TITLE [BODY] [--owner NAME] [--about ENTITY]... [--supports EVIDENCE]... [--field KEY=VALUE]...` | Create a record; protected kinds and changes to protected assertions land on proposals. Referencing a protected target through `about`, `asks_about` or `related` stays direct. |
-| `edit ID --expect REV [BODY] [--title TITLE] [--owner NAME] [--field KEY=VALUE]...` | Optimistic edit. Reserved fields use dedicated options or graph commands. |
-| `link FROM REL TO --expect REV [--expect-to REV] [--why TEXT]` | Add an attributed edge. `about`, `asks_about` and `related` revise only FROM; their `--expect-to` is an optional read check. Other relations with a Scrolls target require both revisions. |
-| `unlink FROM REL TO --expect REV [--expect-to REV]` | Remove an edge, subject to the same endpoint policy. |
-| `status ID STATE --expect REV` | Apply an allowed lifecycle transition. Answer acceptance has its own command. |
-| `supersede OLD --with NEW --why TEXT --expect REV --expect-to REV` | Mark a decision superseded, or retire replaced knowledge/doctrine/entities, and attach the replacement edge. |
-| `ask TITLE [--owner NAME] [--about ENTITY]... [--context TEXT] [--if-yes TEXT] [--if-no TEXT]` | New local question. Owner defaults to the first entity's owner, then the actor. |
-| `answer QUESTION [TEXT] [BODY] --expect REV` | Offer an answer. Human answers are direct; agent answers are proposals. |
-| `accept ANSWER --expect REV --expect-question REV` | Human question owner accepts an offered answer and marks its open question answered. |
-| `inbox [--owner NAME\|me]` | Open local questions; imported frozen questions are excluded. |
-| `proposals` | Pending, accepted, and rejected proposals with attribution and reasons. |
-| `review BRANCH` | Body and metadata before/after plus graph changes, `main_revision`, `proposal_revision`, and `review_token`. |
-| `review accept BRANCH --review-token TOKEN [--reason TEXT]` | Human-only temporary merge, structural validation, and guarded main advance. Does not automatically change record lifecycle status. |
-| `review reject BRANCH --reason TEXT` | Human-only rejection retained on the original proposal branch; history remains. |
-| `history [ID]` | Dolt commits, or historical record snapshots with commit attribution. |
-| `lint` | Structural errors, imported debt, and missing-about warnings. Mutations reject newly introduced structural errors. |
-| `stale` | Records whose review cadence has elapsed. |
-| `doctrine [--for PATH]...` | Active rules matching globs; scope clauses are reported as undecided with a reason. No model calls or executable checks. |
-| `consumed [--for-session NAME]` | Separate local JSONL audit of show/search/context/prime results and exact revisions. |
+Bodies accept `--body`, `--body-file FILE` (`-` for stdin), or `--editor`.
+Optional domain metadata uses `--confidence`, `--review-every`, and on edit,
+`--last-reviewed YYYY-MM-DD`. Custom schemas can omit its validation/defaults.
+Expected revisions always refer to records, not the enclosing Dolt revision.
+Retries use the same `--op-id`, actor, role, arguments and file contents.
 
-`BODY` means `--body TEXT`, `--body-file PATH` (or `-`), piped stdin, or
-`--editor`. `new` also accepts `--confidence high|medium|low` and
-`--review-every DAYS`; `edit` accepts these plus `--last-reviewed YYYY-MM-DD`.
-A changed native review cadence on an imported record requires native export.
+## Batch format
 
-The default context budget is 16,000 bytes of compact JSON `items`, including
-brackets and separators. `used_bytes` reports the actual size; the envelope
-and omission list are excluded. Context projections omit `original` snapshots;
-`show` and the graph export retain them. `context` enforces a hard budget.
-`prime` includes every matched doctrine body once, in stable ID order, without
-truncation. Its `mandatory_bytes` is the size of the mandatory-only array
-(zero when there are no matches). Mandatory doctrine consumes the budget first
-and may exceed it; `over_budget_bytes` reports that overrun in JSON and human
-output. No optional records fit after an overrun. Unresolved scope clauses
-remain explicit in `undecided_doctrine`.
+A top-level ordered list; unknown operation keys fail. New handles omit expected
+revisions. Every affected existing assertion owner supplies its initial revision.
+Source-only references do not require target revisions; an explicit one is checked.
 
-An answered local question and its unique accepted answer form one optional
-budget group: both are included in full, adjacent, or both are omitted. The
-question exposes `accepted_answer_id`, the answer exposes `question_id`, and
-both IDs enter the consumption audit when delivered. Attribution and revision
-are retained. Offered and declined alternatives are excluded. Missing or
-multiple accepted answers fail explicitly. Imported frozen questions remain
-excluded.
+```yaml
+- op: new
+  handle: response
+  kind: answer
+  title: Proposed answer
+  body: Yes, based on the measurement.
+- op: link
+  from: $response
+  rel: answers
+  to: QUESTION_ID
+  expect_to: 1
+```
 
-Doctrine `--field glob=VALUE` accepts a nonempty string or an array of nonempty
-strings; `[]` means no glob triggers. `--field scope_clause=TEXT` requires a
-nonempty string. Globs compile before creation, edits, activation and acceptance
-commit, including imported routes and `applies_to glob:…` assertions. Invalid
-active triggers fail routing explicitly, and `lint` reports invalid triggers.
-Scope-only doctrine and valid unmatched globs are valid.
+Accept existing records together (by the question owner, or propose as an agent):
 
-The source owns `about`, `asks_about` and `related`, including `new --about`,
-`ask --about` and extracted body links. Only the source revision and attribution
-change. A supplied `--expect-to` checks the target revision without editing it;
-a frozen target is allowed. Frozen sources remain immutable, protected sources
-still require proposals, and other relations retain their endpoint safeguards.
-Old proposals are not rewritten; reject and recreate one if its unnecessary
-endpoint edits conflict.
+```yaml
+- {op: status, id: ANSWER_ID, state: accepted, expect: 1}
+- {op: status, id: QUESTION_ID, state: answered, expect: 2}
+```
 
-Default kinds: decision, knowledge, primer, evidence, question, answer,
-doctrine, entity, collection, note. Default relations: supports, derived_from,
-supersedes, contradicts, about, applies_to, asks_about, answers, promoted_to,
-depends_on, blocks, related. `blocks` can target an external work ID;
-`applies_to` can target `glob:PATTERN`. `supersedes`, `contradicts`, and
-`depends_on` require a reason. Body links to stable Scrolls IDs get a fallback
-`related` edge when no stronger edge exists. Lifecycle and edge policies are
-implemented in the library; registry editing is deferred.
+For supersession, batch the old document's configured terminal transition with
+`link NEW supersedes OLD`, providing both existing revisions and `why`.
+A batch cannot authorize itself by transferring ownership or relinking. An agent
+can propose a guarded change; the human reviewer must satisfy the original guard.
 
-## Revision-bound proposal acceptance
+## Schema format
 
-Inspect the completed proposal and preserve its `review_token`. Acceptance,
-including `--dry-run`, requires that token and the human role. The token binds
-the branch and both full Dolt commit hashes: **any main advance**, even an
-unrelated write, or any proposal change requires another review. Stale errors
-name the changed revision and leave heads, receipts, and recovery state unchanged.
-Never automatically refresh a token and retry. Inspection and rejection reject
-`--review-token`; rejection otherwise retains its existing policy.
+See the complete [bundled schema](../schemas/knowledge.yaml),
+[handbook](../examples/handbook.yaml), and [research](../examples/research.yaml).
+`format: 1` is required. Each kind defines `initial`, `states`, `transitions`,
+`write: {human: direct|proposal, agent: direct|proposal}`, `fields`,
+`additional_fields`, optional `guards` and `cardinality`.
 
-Successful acceptance returns `review_token`, `proposal_revision`, and
-`validated_base` (the reviewed main revision), also stored in its transactional
-receipt. Dry runs report the same binding without accepting. An identical
-`--op-id` retry returns the original result even after main advances; changing
-the token with that operation ID is an argument mismatch. Historical tokenless
-successful receipts still replay, but new tokenless acceptance is refused.
-Schema-1 and schema-2 stores need no migration: review existing pending proposals
-with the updated CLI to obtain tokens. There is no bypass flag.
+Fields define `type`, `required`, `default`, `values` (enum), `items` (list),
+`minimum` (number), `nonempty` (string), and `glob` (string/list of globs).
+Relations define `from`/`to` kind lists (`'*'` means any), `external`
+(`beads`, `glob`, `url`, `text`), `affects: source|both`, `reason`, `self_link`,
+`cycles`, and `same_kind`. An empty endpoint list permits no local kind.
+Cardinality defines `name`, `relation`, `direction`, `min`, `max`, optional
+`status`/`related_status`, and `skip_frozen`. A guard defines target state `to`,
+`human`, and optionally `relation`/`direction`; absent a relation it uses the
+record owner. Configured `body_links` maps `local`/`beads` to source-only
+relations for automatic Markdown link assertions. Custom schemas may omit it.
+`envelope_fields` optionally constrains confidence, review_every and last_reviewed.
+`instructions` is authored text and `pins` is an ordered list of IDs or aliases,
+resolved and deduplicated on application.
 
-The deterministic token format is `v1.` followed by unpadded URL-safe base64 of
-canonical JSON containing `branch`, `main_revision`, and `proposal_revision`, in
-that order. It has no timestamp or stored review session. Tokens check revisions
-under cooperative roles; they neither authenticate a human nor prove reading.
-Malformed, unsupported-version, wrong-branch, and stale tokens require a fresh
-review. Existing merge-conflict and structural validation still apply.
+## Queries
 
-## Storage and recovery
-
-A filesystem lock serializes all access. Dolt tables contain stable keyed JSON
-rows, so the merge conflict unit is a record or edge, not a Markdown file.
-Original source files live in `source_files`, including hashes, modes, and
-base64 bytes. Import metadata includes the exact commit and lint baseline.
-Beads access is explicit through the integration below. Dolt uses a private
-`dolt-home` configuration with version checks and telemetry disabled; no shared
-Dolt configuration is changed.
-
-Every authoring/import/review mutation writes its receipt in the same explicit
-SQL transaction and Dolt commit as its changes. A killed SQL transaction rolls
-back. A review journal permits recovery of a known temporary review branch;
-main is never reset during recovery. Otherwise a dirty database stops commands
-with an actionable error. Inspect it using the private binary from the
-`.scrolls/dolt` directory before deciding how to recover; Scrolls does not
-silently discard unexplained changes. The consumption audit is independent of
-Dolt commits and protected by the same process lock.
-
-Rendering stages a complete tree beside the destination, then reserves and
-renames into a fresh directory. Source paths, existing outputs, symlinked
-parents, unsafe archived paths, collisions, incompatible imported edits, and
-frozen changes are rejected before publication. `RENDERED` and
-`SCROLLS-MANIFEST.json` carry versions without changing legacy frontmatter.
-The manifest's `records` maps every stable ID to its rendered path. Both export
-formats include `scrolls/graph.json` with complete native fields, exact
-lifecycles, attribution and edges.
-
-| Native kind | Rendered location |
-| --- | --- |
-| Evidence | `raw/YYYY-MM-DD-sc-….md` |
-| Knowledge and primer | `knowledge/sc-….md` |
-| Note | `work-notes/sessions/YYYY-MM-DD/YYYY-MM-DD-sc-….md` |
-| Decision, doctrine, entity, collection, question, answer | `scrolls/<kind>/sc-….md` |
-
-Dates come from creation time, so filenames stay stable across edits. Every
-local view appears in `scrolls/README.md`, with human-readable relationships
-and accepted-answer links on its page. Imported manifest entities also receive
-supplemental views. Compatibility frontmatter uses `raw`, `knowledge`,
-`work_note`, `index` or `meta`; each page visibly retains its actual Scrolls kind
-and lifecycle. Only imported manifest repository entities enter `related_repos`.
-Stable ID body links resolve to relative exported paths with anchors preserved;
-stored bodies stay unchanged. Affected legacy directory indexes refresh for
-additions as well as edits. Unchanged imported files, including frozen history,
-remain byte-for-byte copies.
-
-Imported numbered ADRs carry `metadata.number`, such as `"0236"`, and retain
-legacy lookup aliases. Older stores derive missing numbers during reads without
-writing or revising records. New decisions never receive sequential numbers
-and are discoverable through the supplemental index. Local questions and
-answers never become legacy `Q-…` files or ledger records. Liskov's ADR-specific
-readers require a later migration before native decisions can be authoritative
-catalogue entries. An imported ADR cannot be marked superseded by a native
-unnumbered decision in Liskov output; that requires a numbered legacy successor.
+Files contain one expression. `all`/`any` take `args`, `not` takes `arg`.
+`compare` uses `field`, `cmp: eq|ne|lt|le|gt|ge`, and a typed JSON/YAML `value`.
+`exists` takes `field`. Custom fields use `fields.NAME`. `$actor` and `$now`
+are explicit bound values. `relation` supports `direction`, `min`, `max` and
+an optional `where` expression evaluated on the neighboring record.
+`path_glob` matches a field against supplied `--path` values. `applicability`
+combines configured globs, external glob links and imported routing, preserving
+unresolved scope clauses as diagnostics. `date_plus` adds integer days (or
+`{field: review_every}`) to a date/timestamp, then compares to a date or `$now`.
+Examples replacing removed read commands are in [queries](../examples/queries/).
 
 ## Beads references
 
-Qualified adapter: Beads **1.3.0**, selected with `beads bind --bd`. Binding,
-refresh, and publication verify that version and the workspace's persistent
-`project_id`. Aliases and machine paths remain local. References persisted in
-edges use `beads://PROJECT-UUID/FULL-ISSUE-ID`; commands also accept
-`NAME:FULL-ISSUE-ID` after binding. Bare or abbreviated IDs are not inferred.
+`beads bind NAME --directory DIR [--bd FILE] [--timeout SECONDS]`, `beads list`,
+`beads refs REF`, `beads refresh REF|--all`, `beads publish REF|--all`.
+References are qualified `beads://STORE_UUID/ISSUE_ID` or locally bound `NAME:ID`.
+Ordinary reads never contact Beads. Refresh and publication are explicit;
+publication requires main and preserves unrelated metadata. The external backlink
+payload version is unchanged. Local aliases, caches and publication receipts
+remain separate from document authority. No live ledger is migrated by this release.
 
-| Command | Behavior |
-| --- | --- |
-| `migrate` | Atomically upgrade schema 1 to 2, adding a persistent Scrolls store UUID and relation registry entries. Main only; resolve pending proposals first. Supports actor, dry run, and operation receipts. Historical branches remain readable. |
-| `beads bind NAME --directory PATH [--bd PATH] [--timeout SECONDS]` | Pin project identity and a local executable/workspace binding. Default executable is `bd`; timeout defaults to 30 seconds and allows 1–300. Rebinding may change local paths but cannot change project identity. |
-| `beads list` | Local bindings, cached observations, and publication results; no Beads contact. |
-| `beads refs REF` | Referencing documents with relation, lifecycle, and revision, from the selected Scrolls branch. |
-| `context --bead REF [--budget BYTES]` | Linked documents and their entity context, ordered deterministically; no Beads contact. |
-| `beads refresh REF` or `beads refresh --all` | Explicit read-only Beads lookup. All means all qualified references on the selected branch. |
-| `beads publish REF` or `beads publish --all` | Explicit main-to-Beads backlink reconciliation. Requires actor, rejects proposal selection, supports dry run and operation IDs. |
-
-`link`/`unlink` accept these relations to Beads targets:
-
-- `related_work`: any record.
-- `implemented_by`: decision, knowledge, primer; records intent, not completion.
-- `produced_by`: evidence, knowledge, primer, note.
-- `blocks`: question; records an informational relationship, without scheduler enforcement.
-
-The source revision is required; an external target has no Scrolls revision.
-Protected sources still require a proposal, and frozen imported records remain
-immutable. Canonical Markdown links acquire a fallback `related_work` edge using
-the existing body-link convention. Removing prose does not remove asserted edges;
-use `unlink`. Legacy unqualified `blocks` targets are preserved and lint warns;
-only qualified references participate in this integration.
-
-`show` includes related work with cached resolution information. It also accepts
-`scrolls://STORE-UUID/RECORD-ID` and checks that `--store` selects the matching
-store. This URI is a portable CLI reference; no browser protocol handler is installed.
-Native exports add related-work navigation and per-bead backlink pages. Both
-formats retain work relationships in the normalized graph; Liskov supplemental
-records show those references without changing the legacy work ledger.
-
-Context prioritizes open questions, accepted decisions, current knowledge, active
-doctrine, then accepted answers. Other linked states and evidence are summaries
-with explicit lifecycle; notes remain excluded. Accepted answers to linked
-answered questions are included. Entity expansion follows the existing context
-rules. This is not a complete path-based doctrine evaluation. Budgets bound the
-compact `items` array, as in ordinary context; relationship and bead metadata in
-the envelope are excluded. Consumed records retain exact Scrolls commit attribution.
-
-### Local observations and failure behavior
-
-`.scrolls/beads.json` holds bindings, cached summaries, and publication receipts,
-protected by the store's process lock and atomic file replacement. These are local
-integration state, not reviewed knowledge. Copying a store does not make its
-machine bindings portable. Ordinary show/context/render/refs never invoke Beads.
-
-Refresh records the observed title, status, issue update time, observation time,
-and latest attempt. Cached state is always labelled as such. On lookup failure,
-the previous successful observation remains, with an explicit failure. Missing
-bindings, unavailable executables/stores, malformed output, timeouts, and identity
-mismatches never turn into an invented current status. Bulk commands return
-per-target results, `data.failed`, `ok: false`, and exit 1 on partial failure.
-
-### Published backlinks
-
-Each Beads issue carries one top-level key per Scrolls store:
-`scrolls/STORE_UUID_WITHOUT_HYPHENS`. This spelling satisfies Beads' metadata-key
-query grammar. The value has `schema_version: 1`, `store_id`, `source_commit`, and
-sorted `documents` containing ID, URI, title, kind, lifecycle status, record
-revision, and relation names. Main membership does not imply lifecycle acceptance.
-
-Publication uses atomic metadata merges/unsets and preserves every other top-level
-key, including other Scrolls stores. It never updates issue descriptions, status,
-assignee, dependencies, or `external_ref`. No hooks or remote push are requested
-by Scrolls; the adapter runs with Beads' sandbox flag. Beads' own configured local
-mutation hooks remain Beads behavior.
-
-`publish --all` considers current graph links, previous publication targets, and
-all Beads issues carrying this store's metadata key, including closed issues.
-It can therefore remove obsolete backlinks after receipt loss. Removing the last
-link removes only this store's key. Unchanged document projections are skipped;
-their original `source_commit` remains the version actually published.
-
-The Scrolls lock pins main throughout a publication. Per-target receipts are
-saved before/after external work, and every changed projection is read back.
-There is no distributed transaction. A crash can leave some beads updated;
-rerunning reconciles actual state rather than trusting an old receipt. An explicit
-`--op-id` binds the command, actor, and source Scrolls commit; use a fresh ID if
-main changes. Dry runs read the proposed diff without updating either store or
-local integration state. Publication never runs during review acceptance.
+Acceptance requires the `review_token` returned by `review BRANCH`. It binds both
+main and proposal revisions; any intervening write requires a fresh inspection.

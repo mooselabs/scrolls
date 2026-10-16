@@ -60,20 +60,34 @@ pub struct New {
     pub body: Body,
     #[arg(long)]
     pub owner: Option<String>,
-    #[arg(long, default_value = "medium")]
-    pub confidence: String,
-    #[arg(long, default_value_t = 90)]
-    pub review_every: u32,
     #[arg(long)]
-    pub about: Vec<String>,
+    pub confidence: Option<String>,
     #[arg(long)]
-    pub supports: Vec<String>,
+    pub review_every: Option<u32>,
     #[arg(long)]
     pub field: Vec<String>,
 }
 #[derive(Debug, Serialize, Subcommand)]
 pub enum Cmd {
-    Init,
+    Init {
+        #[arg(long)]
+        schema: Option<PathBuf>,
+    },
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+    Batch {
+        file: PathBuf,
+    },
+    Query {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        path: Vec<String>,
+        #[arg(long)]
+        at: Option<String>,
+    },
     Doctor,
     /// Upgrade store metadata and relation registry explicitly.
     Migrate,
@@ -92,23 +106,25 @@ pub enum Cmd {
         format: Format,
     },
     List {
-        #[arg(long)]
-        kind: Option<String>,
-        #[arg(long)]
-        status: Option<String>,
-        #[arg(long)]
-        about: Option<String>,
+        #[command(flatten)]
+        filters: Filters,
     },
     Show {
         id: String,
     },
     Search {
         terms: String,
+        #[command(flatten)]
+        filters: Filters,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
     Walk {
         id: String,
+        #[arg(long, value_enum, default_value = "both")]
+        direction: crate::schema::Direction,
+        #[arg(long)]
+        full: bool,
         #[arg(long)]
         rel: Option<String>,
         #[arg(long, default_value_t = 2)]
@@ -123,8 +139,6 @@ pub enum Cmd {
         budget: usize,
     },
     Prime {
-        #[arg(long = "for")]
-        paths: Vec<String>,
         #[arg(long, default_value_t = 16000)]
         budget: usize,
     },
@@ -174,6 +188,7 @@ pub enum Cmd {
         #[arg(long)]
         expect: u64,
     },
+    #[command(hide = true)]
     Supersede {
         old: String,
         #[arg(long = "with")]
@@ -185,6 +200,7 @@ pub enum Cmd {
         #[arg(long)]
         expect_to: u64,
     },
+    #[command(hide = true)]
     Ask {
         title: String,
         #[arg(long)]
@@ -198,6 +214,7 @@ pub enum Cmd {
         #[arg(long, default_value = "")]
         if_no: String,
     },
+    #[command(hide = true)]
     Answer {
         question: String,
         text: Option<String>,
@@ -206,6 +223,7 @@ pub enum Cmd {
         #[command(flatten)]
         body: Body,
     },
+    #[command(hide = true)]
     Accept {
         id: String,
         #[arg(long)]
@@ -213,6 +231,7 @@ pub enum Cmd {
         #[arg(long)]
         expect_question: u64,
     },
+    #[command(hide = true)]
     Inbox {
         #[arg(long)]
         owner: Option<String>,
@@ -233,7 +252,9 @@ pub enum Cmd {
         id: Option<String>,
     },
     Lint,
+    #[command(hide = true)]
     Stale,
+    #[command(hide = true)]
     Doctrine {
         #[arg(long = "for")]
         paths: Vec<String>,
@@ -260,7 +281,11 @@ impl Cmd {
     pub fn mutation(&self) -> bool {
         matches!(
             self,
-            Self::Init
+            Self::Init { .. }
+                | Self::Batch { .. }
+                | Self::Schema {
+                    command: SchemaCommand::Apply { .. }
+                }
                 | Self::Migrate
                 | Self::Import { .. }
                 | Self::New(_)
@@ -300,4 +325,29 @@ pub struct Target {
     pub reference: Option<String>,
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Debug, Serialize, Args, Default)]
+pub struct Filters {
+    #[arg(long)]
+    pub kind: Option<String>,
+    #[arg(long)]
+    pub status: Option<String>,
+    #[arg(long)]
+    pub owner: Option<String>,
+    #[arg(long)]
+    pub field: Vec<String>,
+}
+#[derive(Debug, Serialize, Subcommand)]
+pub enum SchemaCommand {
+    Show,
+    Export,
+    Validate {
+        file: PathBuf,
+    },
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        expect: String,
+    },
 }

@@ -78,27 +78,12 @@ impl Store {
             s.run(&["init", "--name", "Scrolls", "--email", "scrolls@localhost"])?;
             s.sql("CREATE TABLE records (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE edges (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE source_files (id VARCHAR(2048) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE operations (id VARCHAR(256) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE registry (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL);")?;
             let mut sql = String::new();
-            for kind in KINDS {
-                sql.push_str(&put("registry",kind,&json!({"kind":kind,"lifecycle":lifecycle(kind)?,"write_policy":if matches!(*kind,"evidence"|"question"|"collection"|"note"){"direct"}else if *kind=="answer"{"human-direct"}else{"proposal"}}))?);
-            }
-            for rel in RELATIONS {
-                sql.push_str(&put("registry",&format!("rel:{rel}"),&json!({"relation":rel,"requires_why":matches!(*rel,"supersedes"|"contradicts"|"depends_on")}))?);
-            }
-            for (field, kind, values) in [
-                ("owner", "string", json!(null)),
-                ("title", "string", json!(null)),
-                ("confidence", "enum", json!(["high", "medium", "low"])),
-                ("review_every", "positive-days", json!(null)),
-                ("sync", "enum", json!(["always", "on-demand", "never"])),
-                ("visibility", "label", json!(null)),
-            ] {
-                sql.push_str(&put(
-                    "registry",
-                    &format!("field:{field}"),
-                    &json!({"name":field,"type":kind,"required":true,"values":values}),
-                )?);
-            }
-            sql.push_str(&put("metadata", "schema", &2)?);
+            sql.push_str(&put(
+                "metadata",
+                "ontology",
+                &crate::schema::Schema::default(),
+            )?);
+            sql.push_str(&put("metadata", "schema", &3)?);
             sql.push_str(&put(
                 "metadata",
                 "store_id",
@@ -111,7 +96,7 @@ impl Store {
         s.recover_review()?;
         s.clean()?;
         let schema: Option<u32> = s.one("metadata", "schema")?;
-        if !matches!(schema, Some(1 | 2)) {
+        if !matches!(schema, Some(1..=3)) {
             bail!("unsupported store schema; doctor before upgrading");
         }
         Ok(s)
@@ -247,6 +232,7 @@ impl Store {
     }
     pub fn graph(&self) -> Result<Graph> {
         Ok(Graph {
+            schema: self.one("metadata", "ontology")?.unwrap_or_default(),
             records: self
                 .rows::<Record>("records")?
                 .into_iter()
@@ -352,7 +338,7 @@ impl Store {
         writeln!(
             f,
             "{}",
-            json!({"session":session,"actor":actor,"revision":revision,"via":via,"ids":ids,"read_at":now()})
+            json!({"session":session,"actor":actor,"revision":revision,"via":via,"ids":ids,"record_revisions": self.graph()?.records.values().filter(|r|ids.contains(&r.id)).map(|r|(&r.id,r.revision)).collect::<std::collections::BTreeMap<_,_>>(),"read_at":now()})
         )?;
         f.sync_data()?;
         Ok(())

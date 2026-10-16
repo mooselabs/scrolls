@@ -1,0 +1,25 @@
+format: 1
+instructions: >-
+  Create pages with new page; use batch to attach chapters atomically.
+  Publish pages with status ID published --expect REV and review the proposal.
+pins: []
+kinds:
+  page:
+    description: A handbook page
+    initial: draft
+    states: [draft, published, archived]
+    transitions: {draft: [published], published: [archived]}
+    write: {human: direct, agent: proposal}
+    fields:
+      audience: {type: enum, values: [staff, public], default: staff, required: true}
+      tags: {type: list, items: {type: string}, default: []}
+      paths: {type: list, items: {type: string}, glob: true}
+      updated: {type: date}
+    guards: [{to: published, human: true}]
+relations:
+  chapter:
+    from: [page]
+    to: [page]
+    affects: source
+    self_link: false
+    cycles: false

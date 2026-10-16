@@ -1,0 +1,6 @@
+op: all
+args:
+  - {op: compare, field: kind, cmp: eq, value: question}
+  - {op: compare, field: status, cmp: eq, value: open}
+  - {op: compare, field: owner, cmp: eq, value: $actor}
+  - {op: compare, field: frozen, cmp: eq, value: false}

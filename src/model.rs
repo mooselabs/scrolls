@@ -43,12 +43,14 @@ pub struct RecordMetadata {
 }
 impl Record {
     pub fn new(kind: &str, title: &str, body: &str, actor: &str) -> Result<Self> {
-        let lifecycle = lifecycle(kind)?;
-        Ok(Self {
+        crate::schema::Schema::default().new_record(kind, title, body, actor)
+    }
+    pub fn blank(kind: &str, title: &str, body: &str, actor: &str) -> Self {
+        Self {
             id: id(),
             kind: kind.into(),
             title: title.into(),
-            status: lifecycle[0].into(),
+            status: String::new(),
             body: body.into(),
             owner: actor.into(),
             confidence: "medium".into(),
@@ -65,7 +67,7 @@ impl Record {
             original: None,
             aliases: vec![],
             metadata: None,
-        })
+        }
     }
     /// Backward-compatible read normalization; it never changes revision or attribution.
     pub fn normalize_metadata(&mut self) {
@@ -84,12 +86,6 @@ impl Record {
             }
         }
     }
-    pub fn protected(&self, role: &str) -> bool {
-        matches!(
-            self.kind.as_str(),
-            "knowledge" | "primer" | "decision" | "doctrine" | "entity"
-        ) || (self.kind == "answer" && role != "human")
-    }
     pub fn check_edit(&self, expected: u64) -> Result<()> {
         if self.frozen {
             bail!("{} is immutable imported compatibility history", self.id);
@@ -106,53 +102,11 @@ impl Record {
         Ok(())
     }
 }
-pub fn lifecycle(kind: &str) -> Result<&'static [&'static str]> {
-    Ok(match kind {
-        "decision" => &["proposed", "accepted", "superseded", "retired"],
-        "knowledge" | "primer" => &["draft", "current", "stale", "retired"],
-        "evidence" => &["captured", "archived"],
-        "question" => &["open", "answered", "withdrawn"],
-        "answer" => &["offered", "accepted", "declined"],
-        "doctrine" => &["proposed", "active", "retired"],
-        "entity" => &["active", "retired"],
-        "collection" => &["current", "stale"],
-        "note" => &["recorded"],
-        _ => bail!("unknown kind {kind}; registry editing is deferred"),
-    })
+pub fn lifecycle(kind: &str) -> Result<Vec<String>> {
+    Ok(crate::schema::Schema::default().kind(kind)?.states.clone())
 }
 pub fn transition(kind: &str, from: &str, to: &str) -> Result<()> {
-    lifecycle(kind)?;
-    let valid = from == to
-        || match kind {
-            "decision" => matches!(
-                (from, to),
-                ("proposed", "accepted")
-                    | ("proposed", "retired")
-                    | ("accepted", "superseded")
-                    | ("accepted", "retired")
-            ),
-            "knowledge" | "primer" => matches!(
-                (from, to),
-                ("draft", "current")
-                    | ("current", "stale")
-                    | ("stale", "current")
-                    | ("draft" | "current" | "stale", "retired")
-            ),
-            "evidence" => (from, to) == ("captured", "archived"),
-            "question" => matches!((from, to), ("open", "answered" | "withdrawn")),
-            "answer" => matches!((from, to), ("offered", "accepted" | "declined")),
-            "doctrine" => matches!(
-                (from, to),
-                ("proposed", "active" | "retired") | ("active", "retired")
-            ),
-            "entity" => (from, to) == ("active", "retired"),
-            "collection" => matches!((from, to), ("current", "stale") | ("stale", "current")),
-            _ => false,
-        };
-    if !valid {
-        bail!("invalid {kind} transition {from} -> {to}");
-    }
-    Ok(())
+    crate::schema::Schema::default().transition(kind, from, to)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Edge {
@@ -196,6 +150,7 @@ pub struct Proposal {
 }
 #[derive(Clone, Default, Debug)]
 pub struct Graph {
+    pub schema: crate::schema::Schema,
     pub records: BTreeMap<String, Record>,
     pub edges: BTreeMap<String, Edge>,
 }
@@ -209,7 +164,7 @@ impl Graph {
             .values()
             .filter(|r| {
                 r.path.as_deref() == Some(name)
-                    || (r.kind == "entity" && r.title.eq_ignore_ascii_case(name))
+                    || r.title.eq_ignore_ascii_case(name)
                     || r.aliases.iter().any(|a| a == name)
             })
             .map(|r| r.id.clone())

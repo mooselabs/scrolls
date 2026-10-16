@@ -57,13 +57,11 @@ set evidence (scrolls --json --op-id evidence-demo new evidence \
     --title 'Rollback readback' \
     --body 'The interrupted transaction left no rows.' | jq -r .data.id)
 
-set proposal (scrolls --json --op-id knowledge-demo new knowledge \
-    --title 'Atomic local writes' \
-    --body 'Writes and their receipts commit together.' --supports $evidence)
-set record (echo $proposal | jq -r .data.id)
+printf '%s\n' '[{"op":"new","handle":"conclusion","kind":"knowledge","title":"Atomic local writes","body":"Writes and receipts commit together."},{"op":"link","from":"'$evidence'","rel":"supports","to":"$conclusion","expect":1},{"op":"status","id":"$conclusion","state":"current"}]' > conclusion.json
+set proposal (scrolls --json --op-id knowledge-demo batch conclusion.json)
+set record (echo $proposal | jq -r .data.handles.conclusion)
 set branch (echo $proposal | jq -r .data.branch)
 
-scrolls --proposal $branch status $record current --expect 1
 set review (scrolls --json review $branch)
 echo $review | jq .data
 set review_token (echo $review | jq -r .data.review_token)
@@ -84,13 +82,17 @@ Tokens check revisions within the cooperative role model; they do not authentica
 a person or prove that someone read the output.
 
 The export destination must be new. Review acceptance merges the proposal; the
-explicit `status` command above is what makes the knowledge `current`.
+`status` operation in the batch above is what makes the knowledge `current`.
 The demo operation IDs identify these exact writes: reuse them for retries,
 and choose new IDs for new work.
 
+Initialize a custom ontology with `scrolls init --schema examples/research.yaml`.
+Use `schema show`, `schema validate FILE`, and reviewed `schema apply FILE --expect REV`
+to inspect and evolve it. See the [migration guide](docs/migration-0.2.md).
+
 ## Features
 
-- **Typed knowledge:** ten record kinds with explicit lifecycles, owners,
+- **Typed knowledge:** a configurable ontology with explicit lifecycles, owners,
   confidence, review cadence, and attributed relationships.
 - **Local history:** Dolt commits retain changes to records and edges. Stable
   `sc-…` IDs survive edits and exports; imported IDs remain lookup aliases.
@@ -98,8 +100,8 @@ and choose new IDs for new work.
   body, metadata, and graph diffs before human acceptance.
 - **Agent context:** deterministic search and graph traversal, versioned JSON
   output, and a session audit of consumed records and revisions.
-- **Rules in context:** path-based doctrine routing; `prime` includes matched
-  rules in full, even when they exceed the requested context budget.
+- **Rules in context:** `prime` delivers the schema guide, instructions and explicit startup pins,
+  reporting when these exceed the context budget.
 - **Reliable authoring:** expected revisions reject stale writes, and operation
   receipts make retries with identical inputs safe.
 - **Markdown interchange:** import committed documentation at a pinned Git
@@ -120,14 +122,14 @@ record's numeric revision and write results to obtain proposal branch names.
 | `scrolls search 'rollback'` | Search titles and bodies; notes are excluded. |
 | `scrolls walk ID --depth 2` | Explore incoming and outgoing graph edges. |
 | `scrolls context ID --budget 16000` | Retrieve context around a record or entity. |
-| `scrolls prime --for src/storage.rs` | Load matched doctrine and optional session context. |
+| `scrolls prime` | Load the schema guide and configured startup pins. |
 | `scrolls edit ID --expect REV --body-file PATH` | Edit against the revision you read. |
-| `scrolls ask 'Which retention policy should we use?'` | Open an owned question. |
-| `scrolls inbox --owner me` | List your open local questions. |
+| `scrolls new question --title 'Which retention policy?'` | Open an owned question. |
+| `scrolls query --file examples/queries/inbox.yaml` | List your open local questions. |
 | `scrolls proposals` / `scrolls review BRANCH` | Find proposals and inspect their changes. |
 | `scrolls --role human review accept BRANCH --review-token TOKEN` | Accept a reviewed proposal. |
 | `scrolls history ID` | Inspect historical record snapshots. |
-| `scrolls stale` / `scrolls lint` / `scrolls doctor` | Check review dates, graph integrity, and store health. |
+| `scrolls lint` / `scrolls doctor` | Check review dates, graph integrity, and store health. |
 | `scrolls render --out NEW_DIR` | Export a fresh Markdown tree and graph. |
 
 Bodies accept `--body`, `--body-file PATH`, `--body-file -`, or piped stdin.
@@ -144,7 +146,7 @@ the store and Dolt paths for your workspace:
 This project uses Scrolls for versioned knowledge.
 
 - Set SCROLLS_ACTOR to your agent identity before writing.
-- Start with `scrolls prime --for <path>` for each path in scope.
+- Start with `scrolls prime` for the configured guide and startup pins.
 - Use `scrolls context <id>` and `scrolls show <id>` to inspect relevant knowledge.
 - Capture observations as evidence and link conclusions to their supporting evidence.
 - Use `--json` for automation, `--expect` for revisions, and stable `--op-id` values for retries.
@@ -160,10 +162,8 @@ requires an actor, through `SCROLLS_ACTOR` or `--actor`. The default role is
 `agent`. Roles provide cooperative local policy and attribution, not authenticated
 identities; filesystem access can bypass them.
 
-`context` has a hard byte budget. `prime` gives mandatory doctrine priority,
-reports any overrun, and fits optional context afterward. Answered questions and
-their accepted answers are delivered together or omitted together. Scope clauses
-that require judgment remain explicitly undecided. No model is called.
+`context` has a hard byte budget. `prime` delivers configured instructions and pins and reports any overrun.
+`context` includes one document and its immediate references. No model is called.
 Use `--session NAME` and `consumed --for-session NAME` to inspect the read audit.
 
 ## Knowledge and review workflow
@@ -193,9 +193,9 @@ can require both endpoint revisions. See [relationship rules](docs/commands.md).
 ## Beads integration
 
 The adapter is qualified against **Beads 1.3.0**. It keeps work references in
-Scrolls and requires explicit commands to contact Beads. Existing schema-1 stores
+Scrolls and requires explicit commands to contact Beads. Existing older stores
 need `scrolls migrate` after pending proposals are accepted or rejected; new
-stores use schema 2.
+stores use format 3.
 
 Bind an existing Beads workspace and link the knowledge record from the quick
 start. Replace `bd-example` with a full issue ID from that workspace:
@@ -270,7 +270,7 @@ set revision (git -C $source rev-parse HEAD)
 scrolls --json import markdown "$source/docs" --rev $revision
 scrolls doctor
 scrolls show ADR-0236
-scrolls doctrine --for repos/liskov-rs/src/example.sql
+scrolls query --file examples/queries/applicable.yaml --path repos/liskov-rs/src/example.sql
 scrolls render --format liskov --out ./liskov-docs-export
 ```
 
