@@ -98,7 +98,12 @@ impl Store {
                     &json!({"name":field,"type":kind,"required":true,"values":values}),
                 )?);
             }
-            sql.push_str(&put("metadata", "schema", &1)?);
+            sql.push_str(&put("metadata", "schema", &2)?);
+            sql.push_str(&put(
+                "metadata",
+                "store_id",
+                &uuid::Uuid::new_v4().to_string(),
+            )?);
             s.transaction(&sql, "initialize Scrolls", "system")?;
         }
         // A killed operation may leave a clean proposal or review branch checked out.
@@ -106,7 +111,7 @@ impl Store {
         s.recover_review()?;
         s.clean()?;
         let schema: Option<u32> = s.one("metadata", "schema")?;
-        if schema != Some(1) {
+        if !matches!(schema, Some(1 | 2)) {
             bail!("unsupported store schema; doctor before upgrading");
         }
         Ok(s)
@@ -302,6 +307,12 @@ impl Store {
         Ok(out)
     }
     pub fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
+        if let Some(r) = crate::beads::Local::load(&self.root)?.operations.get(op) {
+            if r["hash"] != hash {
+                bail!("--op-id {op} was already used with different arguments or attribution");
+            }
+            return Ok(r.get("result").cloned());
+        }
         // Include rejected branches: an operation identity is store-wide forever.
         let queries: Vec<_> = self
             .branches()?

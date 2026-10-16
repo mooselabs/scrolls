@@ -10,11 +10,13 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: scripts/install-dolt.sh
+      - run: scripts/install-beads.sh
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release --all-targets
       - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
+      - run: python3 scripts/verify-beads.py --binary target/release/scrolls
       - uses: actions/upload-artifact@v4
         with:
           name: scrolls-linux-amd64

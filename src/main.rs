@@ -34,7 +34,7 @@ fn main() {
             } else {
                 print!("{}", scrolls::presentation::human(&v));
             }
-            if lint_failed {
+            if lint_failed || v["ok"] == false {
                 std::process::exit(1)
             }
         }

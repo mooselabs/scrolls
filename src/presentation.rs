@@ -29,6 +29,9 @@ pub fn human(envelope: &Value) -> String {
     let data = &envelope["data"];
     let mut text = if data["record"].is_object() {
         let mut out = record(&data["record"]);
+        if let Some(uri) = data["uri"].as_str() {
+            out.push_str(&format!("\nReference: {uri}\n"));
+        }
         if let Some(edges) = data["edges"].as_array() {
             if !edges.is_empty() {
                 out.push_str("\nRelationships:\n");
@@ -43,9 +46,21 @@ pub fn human(envelope: &Value) -> String {
                 ));
             }
         }
+        if let Some(work) = data
+            .get("related_work")
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            out.push_str(&format!(
+                "\nRelated work (cached):\n{}\n",
+                serde_json::to_string_pretty(work).unwrap()
+            ));
+        }
         out
     } else if let Some(items) = data["items"].as_array() {
         let mut out = String::new();
+        if let Some(bead) = data.get("bead") {
+            out.push_str(&format!("Bead (cached): {}\n\n", bead));
+        }
         for item in items {
             out.push_str(&if item["summary_only"] == true {
                 summary(item)

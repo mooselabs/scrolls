@@ -22,13 +22,23 @@ live in `RENDERED` and the root manifest, never in legacy frontmatter. Imported
 work records **including questions** and untyped archives remain immutable;
 no answers are inferred from prose. Backlog, epic, and milestone files are
 preserved as compatibility artifacts rather than discarded. Repository entities
-are graph-only in Liskov exports. Rendered output is always a fresh destination.
+have supplemental views in both formats. Rendered output is always a fresh destination.
 
 Deferred: registry editing, remote synchronization and replication, arbitrary
 SQL and as-of commands, models/embeddings, promotion convenience commands,
 executable doctrine checks, hooks, authenticated identities, and web/Slack/MCP
-surfaces. No read/write authority cutover, live Beads integration, or automatic
-operating-rule change is made by this release.
+surfaces. No documentation-authority cutover or automatic operating-rule change
+is made by this release.
+
+Beads references are now implemented as qualified external edge targets, with
+local aliases, offline context/backlink queries, explicit cached refresh, and
+explicit publication into per-store Beads metadata. Schema 2 adds a Scrolls store
+UUID and the `related_work`, `implemented_by`, and `produced_by` relations. Existing
+`blocks` links remain informational. The [command contract](commands.md#beads-references)
+defines the implemented boundary; scheduler gates and automatic impact workflows
+remain deferred. Separate databases and review/work lifecycles remain independent.
+The adapter is qualified against Beads 1.3.0 through disposable fixtures; it has
+not been connected to the orchestrator's live work ledger.
 
 
 Scrolls is Beads for knowledge. Beads gives coding agents a Dolt-backed,

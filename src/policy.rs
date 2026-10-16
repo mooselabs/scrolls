@@ -8,12 +8,38 @@ pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
         .get(&e.from)
         .ok_or_else(|| anyhow::anyhow!("missing source {}", e.from))?;
     let b = g.records.get(&e.to);
+    if e.to.starts_with("beads://") {
+        let target = crate::work_ref::BeadRef::parse(&e.to)?;
+        if target.uri() != e.to {
+            bail!("non-canonical Beads reference");
+        }
+        let valid = match e.rel.as_str() {
+            "related_work" => true,
+            "implemented_by" => matches!(a.kind.as_str(), "decision" | "knowledge" | "primer"),
+            "produced_by" => matches!(
+                a.kind.as_str(),
+                "evidence" | "knowledge" | "primer" | "note"
+            ),
+            "blocks" => a.kind == "question",
+            _ => false,
+        };
+        if !valid {
+            bail!("invalid Beads relation {} from {}", e.rel, a.kind);
+        }
+        return Ok(());
+    }
     if e.rel == "blocks" && a.kind == "question" && !e.to.is_empty() {
         return Ok(());
     }
     if e.rel == "applies_to" && a.kind == "doctrine" && e.to.starts_with("glob:") {
         crate::triggers::glob(&a.id, "applies_to", &e.to[5..])?;
         return Ok(());
+    }
+    if matches!(
+        e.rel.as_str(),
+        "related_work" | "implemented_by" | "produced_by"
+    ) {
+        bail!("work relation requires a qualified Beads reference");
     }
     let b = b.ok_or_else(|| anyhow::anyhow!("missing target {}", e.to))?;
     let ak = if a.kind == "primer" {
@@ -176,6 +202,16 @@ pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) 
 pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     let body = g.records[id].body.clone();
+    let beads = regex::Regex::new(r"\]\((beads://[^)\s]+)\)").unwrap();
+    for cap in beads.captures_iter(&body) {
+        // Keep malformed links as edges so structural validation reports them.
+        let target = crate::work_ref::BeadRef::parse(&cap[1])
+            .map(|r| r.uri())
+            .unwrap_or_else(|_| cap[1].into());
+        if !g.edges.values().any(|e| e.from == id && e.to == target) {
+            g.add_edge(id, "related_work", &target, "body link", actor);
+        }
+    }
     for cap in re.captures_iter(&body) {
         let target = &cap[1];
         if g.records.contains_key(target)

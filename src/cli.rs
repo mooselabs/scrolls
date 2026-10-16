@@ -75,6 +75,12 @@ pub struct New {
 pub enum Cmd {
     Init,
     Doctor,
+    /// Upgrade store metadata and relation registry explicitly.
+    Migrate,
+    Beads {
+        #[command(subcommand)]
+        command: BeadsCommand,
+    },
     Import {
         #[command(subcommand)]
         command: ImportCommand,
@@ -109,7 +115,10 @@ pub enum Cmd {
         depth: usize,
     },
     Context {
-        id: String,
+        #[arg(required_unless_present = "bead", conflicts_with = "bead")]
+        id: Option<String>,
+        #[arg(long)]
+        bead: Option<String>,
         #[arg(long, default_value_t = 16000)]
         budget: usize,
     },
@@ -248,6 +257,7 @@ impl Cmd {
         matches!(
             self,
             Self::Init
+                | Self::Migrate
                 | Self::Import { .. }
                 | Self::New(_)
                 | Self::Edit { .. }
@@ -260,4 +270,30 @@ impl Cmd {
                 | Self::Accept { .. }
         ) || matches!(self,Self::Review{action,..} if action=="accept"||action=="reject")
     }
+}
+
+#[derive(Debug, Serialize, Subcommand)]
+pub enum BeadsCommand {
+    Bind {
+        name: String,
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long, default_value = "bd")]
+        bd: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    List,
+    Refs {
+        reference: String,
+    },
+    Refresh(Target),
+    Publish(Target),
+}
+#[derive(Debug, Serialize, Args)]
+pub struct Target {
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub reference: Option<String>,
+    #[arg(long)]
+    pub all: bool,
 }

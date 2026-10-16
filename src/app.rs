@@ -150,7 +150,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if let Some(result) = store.receipt(&op, &hash)? {
             return wrap(&store, result, branch);
         }
-        let result = json!({"store":store.root,"dolt_version":storage::DOLT_VERSION,"op_id":op});
+        let result = json!({"store":store.root,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"op_id":op});
         store.transaction(
             &receipt(&op, &hash, actor(cli)?, &cli.command, &result)?,
             "initialize store receipt",
@@ -161,11 +161,75 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":1,"dolt_version":storage::DOLT_VERSION,"clean":true,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative local roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative local roles; not authenticated identity"}),
             branch,
         );
     }
+    // Schema checks are branch-specific: historical proposal branches remain readable.
+    let schema = store
+        .one::<u32>("metadata", "schema")?
+        .context("missing store schema")?;
+    if matches!(cli.command, Cmd::Migrate) {
+        if branch != "main" {
+            bail!("migrate operates on main");
+        }
+        let op = cli
+            .op_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let hash = digest(serde_json::to_vec(
+            &json!({"command":"migrate","actor":cli.actor,"role":cli.role}),
+        )?);
+        if let Some(result) = store.receipt(&op, &hash)? {
+            return wrap(&store, result, branch);
+        }
+        if schema == 2 {
+            return wrap(
+                &store,
+                json!({"schema_version":2,"already_current":true}),
+                branch,
+            );
+        }
+        if store.proposals()?.iter().any(|p| p.status == "pending") {
+            bail!("accept or reject pending proposals before migration");
+        }
+        let store_id = uuid::Uuid::new_v4().to_string();
+        let result = json!({"schema_version":2,"store_id":store_id,"op_id":op});
+        if cli.dry_run {
+            return wrap(&store, json!({"dry_run":true,"result":result}), branch);
+        }
+        let mut sql = put("metadata", "schema", &2)?;
+        sql.push_str(&put("metadata", "store_id", &store_id)?);
+        for rel in ["related_work", "implemented_by", "produced_by"] {
+            sql.push_str(&put(
+                "registry",
+                &format!("rel:{rel}"),
+                &json!({"relation":rel,"requires_why":false}),
+            )?);
+        }
+        sql.push_str(&receipt(&op, &hash, actor(cli)?, &cli.command, &result)?);
+        store.transaction(&sql, "upgrade Scrolls to schema 2", actor(cli)?)?;
+        return wrap(&store, result, branch);
+    }
+    let local = crate::beads::Local::load(&store.root)?;
     let before = store.graph()?;
+    if let Cmd::Beads { command } = &cli.command {
+        if schema != 2 {
+            bail!("Beads integration requires scrolls migrate");
+        }
+        if matches!(command, BeadsCommand::Publish(_)) {
+            actor(cli)?;
+        }
+        let data = crate::beads::run(cli, &store, &before, command)?;
+        let failed = data["failed"].as_u64().unwrap_or(0) > 0;
+        let mut result = wrap(&store, data, branch)?;
+        if failed {
+            result["ok"] = json!(false);
+            result["error"] =
+                json!({"message":"some Beads operations failed; inspect data.results"});
+        }
+        return Ok(result);
+    }
     let mut graph = before.clone();
     let info: Option<ImportInfo> = store.one("metadata", "import")?;
     let routing = store
@@ -339,7 +403,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             expect_to,
         } => {
             let from = graph.resolve(from)?;
-            let to = if rel == "blocks" || to.starts_with("glob:") {
+            let to = if to.starts_with("beads://")
+                || (crate::work_ref::relation(rel) && to.contains(':') && !to.starts_with("glob:"))
+            {
+                local.resolve(to)?.uri()
+            } else if rel == "blocks" || to.starts_with("glob:") {
                 to.clone()
             } else {
                 graph.resolve(to)?
@@ -536,6 +604,14 @@ pub fn run(cli: &Cli) -> Result<Value> {
             .as_ref()
             .map(|i| i.lint_debt.clone())
             .unwrap_or_default();
+        if schema < 2
+            && graph
+                .edges
+                .iter()
+                .any(|(k, e)| e.to.starts_with("beads://") && before.edges.get(k) != Some(e))
+        {
+            bail!("Beads references require scrolls migrate");
+        }
         policy::validate_change(&before, &graph, &debt)?;
         for entry in crate::triggers::routing_entries(&routing)? {
             if entry["id"].as_str().is_some_and(|id| affected.contains(id)) {
@@ -613,9 +689,21 @@ pub fn run(cli: &Cli) -> Result<Value> {
             )
         }
         Cmd::Show { id } => {
-            let id = graph.resolve(id)?;
+            let name = if let Some(rest) = id.strip_prefix("scrolls://") {
+                let (uuid, record) = rest.split_once('/').context("invalid Scrolls URI")?;
+                let current: String = store
+                    .one("metadata", "store_id")?
+                    .context("run scrolls migrate first")?;
+                if uuid != current {
+                    bail!("Scrolls store identity mismatch; select the matching --store");
+                }
+                record
+            } else {
+                id
+            };
+            let id = graph.resolve(name)?;
             consumed.push(id.clone());
-            json!({"record":graph.records[&id],"edges":graph.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>()})
+            json!({"uri":store.one::<String>("metadata","store_id")?.map(|s|crate::work_ref::document_uri(&s,&id)),"record":graph.records[&id],"edges":graph.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::beads::related(&graph,&id,&local)})
         }
         Cmd::Search { terms, limit } => {
             let terms: Vec<_> = terms.split_whitespace().map(str::to_lowercase).collect();
@@ -641,8 +729,20 @@ pub fn run(cli: &Cli) -> Result<Value> {
             rel.as_deref(),
             *depth
         )),
-        Cmd::Context { id, budget } => {
-            let packet = query::context(&graph, &graph.resolve(id)?, *budget)?;
+        Cmd::Context { id, bead, budget } => {
+            let packet = if let Some(reference) = bead {
+                let reference = local.resolve(reference)?.uri();
+                let mut packet = query::bead_context(&graph, &reference, *budget)?;
+                packet["reference"] = json!(reference);
+                packet["bead"] = local.summary(&reference);
+                packet
+            } else {
+                query::context(
+                    &graph,
+                    &graph.resolve(id.as_deref().context("missing context ID")?)?,
+                    *budget,
+                )?
+            };
             consumed = packet["items"]
                 .as_array()
                 .unwrap()
@@ -690,7 +790,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 .as_ref()
                 .map(|i| i.lint_debt.clone())
                 .unwrap_or_default();
-            json!({"errors":lint.difference(&debt).collect::<Vec<_>>(),"historical_debt":lint.intersection(&debt).collect::<Vec<_>>(),"warnings":graph.records.values().filter(|r|r.kind!="entity"&&!graph.edges.values().any(|e|e.from==r.id&&e.rel=="about")).map(|r|format!("{}:no-about",r.id)).collect::<Vec<_>>()})
+            json!({"errors":lint.difference(&debt).collect::<Vec<_>>(),"historical_debt":lint.intersection(&debt).collect::<Vec<_>>(),"warnings":graph.records.values().filter(|r|r.kind!="entity"&&!graph.edges.values().any(|e|e.from==r.id&&e.rel=="about")).map(|r|format!("{}:no-about",r.id)).chain(graph.edges.values().filter(|e| e.rel=="blocks" && !e.to.starts_with("beads://")).map(|e|format!("{}:unqualified-work:{}",e.from,e.to))).collect::<Vec<_>>()})
         }
         Cmd::Stale => json!(
             graph
@@ -733,6 +833,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 out,
                 format: *format,
                 dry_run: cli.dry_run,
+                beads: &local,
             },
         )?,
         _ => bail!("unsupported command"),
