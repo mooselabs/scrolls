@@ -1,0 +1,36 @@
+format: 1
+instructions: >-
+  Capture trials and hypotheses. Use batch to create a hypothesis and attach a
+  corroborates relationship from its trial. Review before relying on results.
+pins: []
+kinds:
+  trial:
+    description: Measured research result
+    initial: captured
+    states: [captured, withdrawn]
+    transitions: {captured: [withdrawn]}
+    write: {human: direct, agent: direct}
+    fields:
+      count: {type: integer, minimum: 0, required: true}
+      score: {type: number}
+      replicated: {type: boolean, default: false}
+      observed: {type: timestamp}
+      data: {type: json}
+  hypothesis:
+    description: Testable claim
+    initial: proposed
+    states: [proposed, supported, rejected]
+    transitions: {proposed: [supported, rejected]}
+    write: {human: proposal, agent: proposal}
+    fields:
+      claim: {type: string, required: true, nonempty: true}
+    cardinality:
+      - {name: corroboration, relation: corroborates, direction: incoming, min: 1}
+relations:
+  corroborates:
+    from: [trial]
+    to: [hypothesis]
+    affects: both
+    reason: true
+    self_link: false
+    cycles: false

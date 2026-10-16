@@ -1,120 +1,90 @@
-# Scrolls
+# Scrolls 0.2.0
 
-A local Rust CLI for versioned knowledge: evidence, knowledge, decisions,
-questions, doctrine, entities, and their relationships. Data lives in a private
-Dolt 2.2.0 database at `.scrolls/dolt`. No daemon, model, or remote is required.
+A local Rust CLI for versioned document graphs with a configurable YAML ontology.
+Use the bundled knowledge model or define your own kinds, fields, relationships,
+lifecycles and review policies. Data lives in private Dolt 2.2.0 at
+`.scrolls/dolt`. No daemon, model or remote is required.
 
-This release does **not** change the orchestrator's documentation authority.
-The original Git documentation remains authoritative.
+## Install and start
 
-## Install
-
-Qualified platform: Linux x86_64. Rust 1.85+ and Git are required to build;
-Python 3 is used only by the demonstration and full migration qualification.
+Qualified platform: Linux x86_64. Rust 1.85+ and Git are required to build.
+Python 3 runs the demonstration and corpus qualification.
 
 ```fish
 ./scripts/install-dolt.sh
 cargo install --locked --path .
 set -gx SCROLLS_ACTOR patrick
 scrolls --dolt "$PWD/.tools/dolt" init
+scrolls prime
+scrolls new evidence --title 'Observed result' --body 'Measured behavior.'
+scrolls search 'measured behavior'
 ```
 
-Run from this checkout, or pass an absolute `--dolt` path and `--store` path.
-The installer verifies the pinned archive digest and never replaces a shared
-Dolt binary. `--role agent` is the default. Roles are cooperative local policy,
-not authenticated identities; anyone with filesystem access can bypass them.
+For a custom ontology, initialize a fresh store with
+`scrolls init --schema examples/handbook.yaml`. The
+[handbook](examples/handbook.yaml) and [research](examples/research.yaml) examples
+exercise the same engine as the [bundled schema](schemas/knowledge.yaml).
 
-## Quickstart (fish)
+## Three responsibilities
 
-`jq` makes it convenient to use IDs returned by the versioned JSON interface.
-Every write requires an actor. Pass a stable `--op-id` when retrying automation.
+- **Orientation:** `prime` delivers the configured schema guide, authored
+  instructions and explicit startup pins. Its byte budget is soft and reported.
+- **Retrieval:** `show`, `context`, `list`, `search`, `query` and direction-aware
+  `walk`. Immediate references include historical records; follow bodies explicitly.
+- **Authoring:** `new`, `edit`, `status`, `link`, `unlink`, atomic `batch`, and
+  proposal review. Write policy and ownership guards come from configuration.
 
-```fish
-set evidence (scrolls --json --op-id evidence-demo new evidence \
-    --title 'Rollback readback' --body 'The interrupted transaction left no rows.' | jq -r .data.id)
-set proposal (scrolls --json --op-id knowledge-demo new knowledge \
-    --title 'Atomic local writes' --body 'Writes and their receipts commit together.' \
-    --supports $evidence)
-set record (echo $proposal | jq -r .data.id)
-set branch (echo $proposal | jq -r .data.branch)
-scrolls --proposal $branch status $record current --expect 1
-scrolls review $branch
-scrolls --role human review accept $branch
-scrolls show $record
-scrolls history $record
-scrolls render --out ./knowledge-export
-```
+`schema show`, `schema export`, `schema validate FILE`, and
+`schema apply FILE --expect REV` manage configuration. Applying a schema always
+requires proposal review and revalidation against current data at acceptance.
 
-The export destination must be new. Bodies accept `--body`, `--body-file PATH`,
-`--body-file -`, or piped stdin. `edit` opens `$VISUAL` / `$EDITOR` on a terminal;
-`--editor` explicitly selects that behavior. `show` returns each record's
-numeric `revision`, which is required by `edit`, `status`, and graph mutations.
-Reference relations (`about`, `asks_about`, `related`) change only their source;
-referencing a protected target does not require review.
+See the [command reference](docs/commands.md), [0.2 migration guide](docs/migration-0.2.md),
+[design](docs/design.md), and [selection examples](examples/queries/).
+Document-specific commands and authoring shortcuts have been replaced by generic
+operations. Retrieval profiles, generated summaries, embeddings and automatic
+context expansion are outside this release.
 
-For a pinned import:
+## Safety and compatibility
 
-```fish
-set source /path/to/liskov-agent-orchestrator
-set revision (git -C $source rev-parse HEAD)
-scrolls --json import markdown "$source/docs" --rev $revision
-scrolls doctor
-scrolls show ADR-0236
-scrolls doctrine --for repos/liskov-rs/src/example.sql
-scrolls render --format liskov --out ./liskov-docs-export
-```
+Dolt access is serialized by a store lock. Batches use one initial revision
+snapshot, increment each affected existing record once, and commit the graph
+and one operation receipt atomically. `--dry-run` previews; `--op-id` makes retries
+idempotent. Roles are cooperative attribution, not authenticated identities.
+Guarded lifecycle changes use pre-change ownership and are checked again when a
+human accepts a proposal. Frozen imported history remains immutable.
 
-Import requires an empty store. It reads Git objects, excludes untracked and
-uncommitted bytes, and preserves original metadata and assets. Repeating the
-same source commit is safe; changed-source reimport requires a new store.
-Exports include every native kind, a complete graph, stable ID-based filenames,
-and an ID-to-path manifest. Native decisions and local questions have separate
-views; they do not become numbered ADRs or legacy ledger records. `prime` always
-delivers matched doctrine in full, even beyond its default 16,000-byte budget.
+Store format 3, ontology format 1 and CLI JSON envelope 2 accompany this release.
+Resolve pending proposals before `migrate`. Migration preserves identity,
+revisions, receipts, source files and history, installing empty startup pins.
+Native exports include the complete graph and active configuration. The pinned
+Git Liskov adapter retains explicit compatibility checks and corpus qualification.
+No live ledger migration or documentation-authority cutover is part of this release.
 
-Imported backlog, epic, milestone, question, and untyped archive records are
-immutable. Newly authored local questions are independent of the legacy inbox.
+Beads connections are explicit: bind local work stores, refresh cached metadata,
+and publish backlinks when requested. Ordinary reads remain offline. Beads
+context contains cached metadata and directly linked document references.
+The external Beads backlink payload remains version 1.
 
-## Beads integration
-
-Beads 1.3.0 is qualified. Existing Scrolls stores need `scrolls migrate` after
-pending proposals have been accepted or rejected. New stores already use schema 2.
+## Verify
 
 ```fish
-scrolls beads bind work --directory /path/to/beads-workspace --bd /path/to/bd
-scrolls link $record implemented_by work:bd-example --expect 2
-# Accept the returned proposal through the normal review workflow.
-scrolls beads refs work:bd-example
-scrolls context --bead work:bd-example
-scrolls beads refresh --all
-scrolls --dry-run beads publish --all
-scrolls beads publish --all
-```
-
-Replace the example issue ID and record revision with actual values from Beads
-and `scrolls show`. Relationships are many-to-many and owned by Scrolls. Ordinary
-reads remain offline; `refresh` explicitly caches bead titles/statuses and
-`publish` explicitly reconciles backlinks in Beads metadata. Publication includes
-main only, preserves unrelated metadata, and never changes work status or gates.
-See the [Beads command contract](docs/commands.md#beads-references).
-
-## Verification
-
-```fish
+./scripts/install-dolt.sh
+./scripts/install-beads.sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release --all-targets
-python3 scripts/demo.py --out /tmp/scrolls-demo
-./scripts/install-beads.sh
+python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
 python3 scripts/verify-beads.py --binary target/release/scrolls
-python3 scripts/verify-corpus.py /path/to/orchestrator --rev COMMIT --out /tmp/scrolls-qualification
 ```
 
-Real-Dolt tests fail if the private binary is missing. CI runs the same Rust
-checks and the demonstration. Full corpus qualification is an explicit local
-check because the orchestrator corpus is private; its pinned policy pack must
-already be present in the source repository's verified cache.
+The pinned corpus check uses a disposable destination and does not open the live
+Beads ledger:
 
-See the [command reference](docs/commands.md), [migration report](docs/migration-report.md),
-and [design baseline and implementation boundary](docs/design.md).
+```fish
+python3 scripts/verify-corpus.py /path/to/orchestrator --rev COMMIT --out /tmp/scrolls-corpus --binary target/release/scrolls
+```
+
+The exact source commit must have its pinned policy pack available locally. Prior
+0.1 qualification is retained in [migration-report.md](docs/migration-report.md);
+[0.2 qualification](docs/ontology-0.2-qualification.md) records the new release checks.

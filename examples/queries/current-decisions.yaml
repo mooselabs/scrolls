@@ -1,0 +1,5 @@
+op: all
+args:
+  - {op: compare, field: kind, cmp: eq, value: decision}
+  - {op: compare, field: status, cmp: eq, value: accepted}
+  - {op: relation, relation: supersedes, direction: incoming, max: 0}

@@ -26,9 +26,12 @@ fn policy_and_budget() {
     assert!(policy::lint(&g).contains(&format!("{}:missing-support", k.id)));
     g.add_edge(&e.id, "supports", &k.id, "", "alice");
     assert!(policy::lint(&g).is_empty());
-    let packet = query::context(&g, &k.id, 10).unwrap();
-    assert!(packet["items"].as_array().unwrap().is_empty());
-    assert!(packet["used_bytes"].as_u64().unwrap() <= 10);
+    assert!(
+        query::context(&g, &k.id, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("at least")
+    );
     assert!(transition("evidence", "archived", "captured").is_err());
 }
 #[test]
@@ -62,63 +65,26 @@ fn human_presentation_preserves_body_lines_and_neutralizes_controls() {
 }
 
 #[test]
-fn mandatory_doctrine_is_complete_deterministic_and_exactly_accounted() {
+fn pinned_orientation_is_complete_and_exactly_accounted() {
     use serde_json::json;
     let mut g = Graph::default();
     for id in ["sc-b", "sc-a"] {
-        let mut r = Record::new("doctrine", id, &"é\n\"".repeat(6000), "author").unwrap();
+        let mut r = Record::new("note", id, &"é\n\"".repeat(6000), "alice").unwrap();
         r.id = id.into();
-        r.status = "active".into();
-        r.fields = json!({"glob":"**/*.rs"});
-        r.original = Some(json!({"body":r.body}));
-        g.records.insert(r.id.clone(), r);
+        g.records.insert(id.into(), r);
     }
-    let mut primer = Record::new("primer", "optional", "optional", "author").unwrap();
-    primer.status = "current".into();
-    g.records.insert(primer.id.clone(), primer.clone());
-    g.add_edge("sc-a", "applies_to", "glob:**/*.rs", "", "author");
-    let routing =
-        json!({"triggers":[{"id":"sc-a","globs":["**/*.rs"],"scope_clause":"a judgement"}]});
-    let packet = query::prime(&g, &routing, &["src/a.rs".into()], "author", 16000).unwrap();
-    let items = packet["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["id"], "sc-a");
-    for item in items {
-        assert_eq!(item["body"], g.records[item["id"].as_str().unwrap()].body);
-        assert!(item.get("original").is_none());
-    }
-    let size = serde_json::to_vec(items).unwrap().len();
+    g.schema.pins = vec!["sc-b".into(), "sc-a".into(), "sc-b".into()];
+    let packet = query::prime(&g, 10).unwrap();
+    assert_eq!(packet["items"].as_array().unwrap().len(), 2);
+    assert_eq!(packet["items"][0]["id"], "sc-b");
+    let content = json!({"guide":packet["guide"],"instructions":packet["instructions"],"items":packet["items"]});
+    let size = serde_json::to_vec(&content).unwrap().len();
     assert_eq!(packet["used_bytes"], size);
-    assert_eq!(packet["mandatory_bytes"], size);
-    assert_eq!(packet["over_budget_bytes"], size - 16000);
-    assert_eq!(packet["omitted"], json!([primer.id]));
-    assert_eq!(packet["undecided_doctrine"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        query::prime(&g, &routing, &["src/a.rs".into()], "author", 16000).unwrap(),
-        packet
-    );
-    assert!(
-        query::context(&g, "sc-a", 16000).unwrap()["items"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(scrolls::presentation::human(&json!({"data":packet})).contains("budget exceeded"));
-    for id in ["sc-a", "sc-b"] {
-        g.records.get_mut(id).unwrap().body = "small rule".into();
-    }
-    let all = query::prime(&g, &routing, &["src/a.rs".into()], "author", 16000).unwrap();
-    assert_eq!(all["items"].as_array().unwrap().len(), 3);
-    let exact = serde_json::to_vec(&all["items"]).unwrap().len();
-    assert_eq!(all["used_bytes"], exact);
-    assert_eq!(
-        query::prime(&g, &routing, &["src/a.rs".into()], "author", exact).unwrap()["items"],
-        all["items"]
-    );
-    let omitted = query::prime(&g, &routing, &["src/a.rs".into()], "author", exact - 1).unwrap();
-    assert_eq!(omitted["items"].as_array().unwrap().len(), 2);
-    assert_eq!(omitted["over_budget_bytes"], 0);
-    assert_eq!(omitted["mandatory_bytes"], omitted["used_bytes"]);
+    assert_eq!(packet["over_budget_bytes"], size - 10);
+    assert_eq!(query::prime(&g, 10).unwrap(), packet);
+    assert!(query::context(&g, "sc-a", 10).is_err());
+    g.schema.pins.push("missing".into());
+    assert!(query::prime(&g, 10).is_err());
 }
 
 #[test]
@@ -164,50 +130,34 @@ fn trigger_parser_routing_and_lint_share_validation() {
 }
 
 #[test]
-fn answered_question_groups_are_atomic_and_unambiguous() {
-    use serde_json::json;
+fn contexts_include_only_document_and_immediate_references() {
     let mut g = Graph::default();
-    let mut q = Record::new("question", "Question", "question text", "alice").unwrap();
-    q.status = "answered".into();
-    q.fields = json!({"asked_by":"alice"});
-    g.records.insert(q.id.clone(), q.clone());
-    assert!(query::prime(&g, &json!({}), &[], "alice", 16000).is_err());
-    let mut a = Record::new("answer", "Answer", "accepted answer", "bob").unwrap();
-    a.status = "accepted".into();
-    a.revision = 7;
-    g.records.insert(a.id.clone(), a.clone());
-    g.add_edge(&a.id, "answers", &q.id, "", "bob");
-    for status in ["offered", "declined"] {
-        let mut alt = Record::new("answer", "Alternative", "excluded", "charlie").unwrap();
-        alt.status = status.into();
-        g.add_edge(&alt.id, "answers", &q.id, "", "charlie");
-        g.records.insert(alt.id.clone(), alt);
+    let a = Record::new("note", "A", "main body", "alice").unwrap();
+    let mut b = Record::new("knowledge", "B", "neighbor body", "alice").unwrap();
+    b.status = "retired".into();
+    let c = Record::new("note", "C", "distant body", "alice").unwrap();
+    for r in [&a, &b, &c] {
+        g.records.insert(r.id.clone(), r.clone());
     }
-    let full = query::prime(&g, &json!({}), &[], "alice", 16000).unwrap();
-    assert_eq!(full["items"].as_array().unwrap().len(), 2);
-    assert_eq!(full["items"][0]["accepted_answer_id"], a.id);
-    assert_eq!(full["items"][1]["question_id"], q.id);
-    assert_eq!(full["items"][1]["actor"], "bob");
-    assert_eq!(full["items"][1]["revision"], 7);
-    let size = serde_json::to_vec(&full["items"]).unwrap().len();
-    assert_eq!(full["used_bytes"], size);
+    g.add_edge(&a.id, "related", &b.id, "", "alice");
+    g.add_edge(&b.id, "related", &c.id, "", "alice");
+    let data = query::context(&g, &a.id, 16000).unwrap();
+    assert_eq!(data["items"][0]["body"], "main body");
+    assert_eq!(data["items"][1]["status"], "retired");
+    assert!(data["items"][1].get("body").is_none());
+    assert_eq!(data["items"].as_array().unwrap().len(), 2);
+    let size = serde_json::to_vec(&data["items"]).unwrap().len();
+    assert_eq!(data["used_bytes"], size);
     assert_eq!(
-        query::prime(&g, &json!({}), &[], "alice", size).unwrap()["items"],
-        full["items"]
+        query::context(&g, &a.id, size).unwrap()["items"],
+        data["items"]
     );
     assert_eq!(
-        query::prime(&g, &json!({}), &[], "alice", size - 1).unwrap()["omitted"],
-        json!([q.id, a.id])
-    );
-    let mut duplicate = a.clone();
-    duplicate.id = "sc-duplicate".into();
-    g.add_edge(&duplicate.id, "answers", &q.id, "", "bob");
-    g.records.insert(duplicate.id.clone(), duplicate);
-    assert!(query::prime(&g, &json!({}), &[], "alice", 16000).is_err());
-    g.records.get_mut(&q.id).unwrap().frozen = true;
-    assert_eq!(
-        query::prime(&g, &json!({}), &[], "alice", 16000).unwrap()["items"],
-        json!([])
+        query::context(&g, &a.id, size - 1).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -449,59 +399,26 @@ fn qualified_bead_references_policy_and_body_links() {
 }
 
 #[test]
-fn bead_context_prioritizes_current_guidance_and_marks_history() {
+fn bead_context_is_direct_references_including_notes_and_history() {
     let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
     let mut g = Graph::default();
-    let mut ids = std::collections::BTreeMap::new();
-    for (kind, status, name) in [
-        ("question", "open", "open"),
-        ("decision", "accepted", "decision"),
-        ("decision", "superseded", "old"),
-        ("knowledge", "stale", "stale"),
-        ("note", "recorded", "note"),
-        ("evidence", "captured", "evidence"),
-        ("question", "answered", "answered"),
-        ("answer", "accepted", "answer"),
-    ] {
-        let mut r = Record::new(kind, name, "body", "alice").unwrap();
+    for (kind, status) in [("note", "recorded"), ("knowledge", "retired")] {
+        let mut r = Record::new(kind, kind, "body", "alice").unwrap();
         r.status = status.into();
-        ids.insert(name, r.id.clone());
-        if name != "answer" {
-            g.add_edge(&r.id, "related_work", target, "", "alice");
-        }
+        g.add_edge(&r.id, "related_work", target, "", "alice");
         g.records.insert(r.id.clone(), r);
     }
-    g.add_edge(&ids["evidence"], "supports", &ids["decision"], "", "alice");
-    g.add_edge(&ids["answer"], "answers", &ids["answered"], "", "alice");
     let data = query::bead_context(&g, target, 16000).unwrap();
-    let items = data["items"].as_array().unwrap();
+    assert_eq!(data["items"].as_array().unwrap().len(), 2);
     assert!(
-        data["linked_documents"]
+        data["items"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|r| r["kind"] != "note")
+            .all(|v| v.get("body").is_none())
     );
-    assert_eq!(items[0]["id"], ids["open"]);
-    assert_eq!(items[1]["id"], ids["decision"]);
-    assert!(items.iter().all(|v| v["id"] != ids["note"]));
     assert_eq!(
-        items.iter().filter(|v| v["id"] == ids["evidence"]).count(),
-        1
+        query::bead_context(&g, target, 2).unwrap()["items"],
+        serde_json::json!([])
     );
-    for name in ["old", "stale", "answered", "evidence"] {
-        let r = items.iter().find(|v| v["id"] == ids[name]).unwrap();
-        assert_eq!(r["summary_only"], true);
-        assert!(r["status"].is_string());
-    }
-    assert!(
-        items
-            .iter()
-            .any(|v| v["id"] == ids["answer"] && v["body"] == "body")
-    );
-    let small = query::bead_context(&g, target, 2).unwrap();
-    assert_eq!(small["items"], serde_json::json!([]));
-    assert!(!small["omitted"].as_array().unwrap().is_empty());
-    assert_eq!(small["used_bytes"], 2);
-    assert_eq!(data, query::bead_context(&g, target, 16000).unwrap());
 }
