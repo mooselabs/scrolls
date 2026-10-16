@@ -229,5 +229,8 @@ pub const RELATIONS: &[&str] = &[
     "promoted_to",
     "depends_on",
     "blocks",
+    "related_work",
+    "implemented_by",
+    "produced_by",
     "related",
 ];

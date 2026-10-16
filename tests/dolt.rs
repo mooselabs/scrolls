@@ -442,3 +442,160 @@ fn committed_import_render_and_frozen_history() {
         "changed-source",
     );
 }
+
+#[test]
+fn work_references_obey_review_retry_and_render_contracts() {
+    let f = Fixture::new();
+    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
+    let e = f.ok(&["new", "evidence", "--title", "Readback", "--body", "facts"]);
+    let id = e["id"].as_str().unwrap();
+    let args = [
+        "--op-id",
+        "work-link",
+        "link",
+        id,
+        "produced_by",
+        target,
+        "--expect",
+        "1",
+    ];
+    let linked = f.ok(&args);
+    assert_eq!(f.ok(&args), linked);
+    f.fail(
+        &["link", id, "related_work", target, "--expect", "1"],
+        "stale edit",
+    );
+    assert_eq!(f.ok(&["beads", "refs", target])["documents"][0]["id"], id);
+    assert_eq!(
+        f.ok(&["show", id])["related_work"][0]["bead"]["resolution"],
+        "unresolved"
+    );
+    let knowledge = f.ok(&[
+        "new",
+        "knowledge",
+        "--title",
+        "Conclusion",
+        "--body",
+        "reason",
+        "--supports",
+        id,
+    ]);
+    let kid = knowledge["id"].as_str().unwrap();
+    let proposal = knowledge["branch"].as_str().unwrap();
+    f.ok(&[
+        "--proposal",
+        proposal,
+        "link",
+        kid,
+        "implemented_by",
+        target,
+        "--expect",
+        "1",
+    ]);
+    assert_eq!(
+        f.ok(&["beads", "refs", target])["documents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    f.fail(
+        &["--proposal", proposal, "beads", "publish", target],
+        "main",
+    );
+    f.ok(&["review", "accept", proposal]);
+    assert_eq!(
+        f.ok(&["beads", "refs", target])["documents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let packet = f.ok(&["context", "--bead", target]);
+    assert!(
+        packet["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == kid && v["summary_only"] == true)
+    );
+    let out = f.dir.path().join("native");
+    f.ok(&["render", "--out", out.to_str().unwrap()]);
+    assert!(
+        std::fs::read_to_string(out.join(format!("scrolls/{id}.md")))
+            .unwrap()
+            .contains("## Related work")
+    );
+    assert!(
+        out.join("scrolls/beads/00000000-0000-4000-8000-000000000001/bd-a.md")
+            .exists()
+    );
+    f.fail(
+        &[
+            "render",
+            "--format",
+            "liskov",
+            "--out",
+            f.dir.path().join("legacy").to_str().unwrap(),
+        ],
+        "not representable",
+    );
+    let before = f.ok(&["show", id]);
+    f.ok(&[
+        "--dry-run",
+        "unlink",
+        id,
+        "produced_by",
+        target,
+        "--expect",
+        "3",
+    ]);
+    assert_eq!(before, f.ok(&["show", id]));
+}
+
+#[test]
+fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
+    let f = Fixture::new();
+    let e = f.ok(&["new", "evidence", "--title", "Source", "--body", "facts"]);
+    let id = e["id"].as_str().unwrap();
+    // Construct a v1 fixture without changing any record or original bytes.
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction(&(put("metadata","schema",&1).unwrap()+"DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"),"v1 fixture","test").unwrap();
+    }
+    let before = f.ok(&["show", id]);
+    let pending = f.ok(&["new", "entity", "--title", "Billing", "--body", ""]);
+    f.fail(&["migrate"], "pending proposals");
+    f.ok(&[
+        "review",
+        "reject",
+        pending["branch"].as_str().unwrap(),
+        "--reason",
+        "fixture",
+    ]);
+    f.ok(&["--dry-run", "migrate"]);
+    assert_eq!(f.ok(&["doctor"])["schema_version"], 1);
+    let migrated = f.ok(&["--op-id", "migration", "migrate"]);
+    assert_eq!(migrated["schema_version"], 2);
+    assert_eq!(migrated, f.ok(&["--op-id", "migration", "migrate"]));
+    assert_eq!(f.ok(&["doctor"])["schema_version"], 2);
+    assert_eq!(before["record"], f.ok(&["show", id])["record"]);
+    let uri = format!(
+        "scrolls://{}/{}",
+        migrated["store_id"].as_str().unwrap(),
+        id
+    );
+    assert_eq!(before["record"], f.ok(&["show", &uri])["record"]);
+    f.fail(
+        &[
+            "show",
+            &format!("scrolls://00000000-0000-4000-8000-000000000009/{id}"),
+        ],
+        "identity mismatch",
+    );
+    f.ok(&["review", pending["branch"].as_str().unwrap()]);
+    f.ok(&["new", "entity", "--title", "After migration", "--body", ""]);
+    assert_eq!(migrated, f.ok(&["--op-id", "migration", "migrate"]));
+    assert_eq!(f.ok(&["migrate"])["already_current"], true);
+}

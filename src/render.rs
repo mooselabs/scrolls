@@ -64,6 +64,7 @@ pub struct Options<'a> {
     pub out: &'a Path,
     pub format: Format,
     pub dry_run: bool,
+    pub beads: &'a crate::beads::Local,
 }
 pub fn render(
     g: &Graph,
@@ -77,6 +78,7 @@ pub fn render(
         out,
         format,
         dry_run,
+        beads,
     } = options;
     if out.exists() || out.symlink_metadata().is_ok() {
         bail!("render destination must be fresh: {}", out.display());
@@ -237,6 +239,71 @@ pub fn render(
         for r in g.records.values() {
             if r.path.is_none() {
                 output.insert(format!("scrolls/{}.md",r.id),format!("---\n{}---\n{}",serde_yaml::to_string(&json!({"id":r.id,"kind":r.kind,"title":r.title,"status":r.status,"owner":r.owner}))?,r.body).into_bytes());
+            }
+        }
+        // Derived navigation is emitted only for qualified work references.
+        // Untouched imported documents remain byte-for-byte identical.
+        let mut work = std::collections::BTreeSet::new();
+        for r in g.records.values() {
+            let edges: Vec<_> = g
+                .edges
+                .values()
+                .filter(|e| e.from == r.id && e.to.starts_with("beads://"))
+                .collect();
+            if edges.is_empty() {
+                continue;
+            }
+            let path = r
+                .path
+                .clone()
+                .unwrap_or_else(|| format!("scrolls/{}.md", r.id));
+            if let Some(bytes) = output.get_mut(&path) {
+                bytes.extend_from_slice(b"\n\n## Related work\n\n");
+                for edge in edges {
+                    let reference = crate::work_ref::BeadRef::parse(&edge.to)?;
+                    let target = format!(
+                        "scrolls/beads/{}/{}.md",
+                        reference.project_id, reference.issue_id
+                    );
+                    let line = format!(
+                        "- `{}`: [{}]({})\n",
+                        edge.rel,
+                        reference.issue_id,
+                        relative(&path, &target)
+                    );
+                    bytes.extend_from_slice(line.as_bytes());
+                    work.insert(edge.to.clone());
+                }
+            }
+        }
+        for uri in work {
+            let reference = crate::work_ref::BeadRef::parse(&uri)?;
+            let path = format!(
+                "scrolls/beads/{}/{}.md",
+                reference.project_id, reference.issue_id
+            );
+            let mut body = format!(
+                "# {}\n\nReference: `{uri}`\n\nCached observation:\n\n```json\n{}\n```\n\n## Documents\n\n",
+                reference.issue_id,
+                serde_json::to_string_pretty(&beads.summary(&uri))?
+            );
+            for doc in crate::beads::refs(g, &uri) {
+                let record = &g.records[doc["id"].as_str().unwrap()];
+                let target = record
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| format!("scrolls/{}.md", record.id));
+                body.push_str(&format!(
+                    "- [{}]({}) — {} / {}; {}\n",
+                    record.id,
+                    relative(&path, &target),
+                    record.kind,
+                    record.status,
+                    doc["relations"]
+                ));
+            }
+            if output.insert(path.clone(), body.into_bytes()).is_some() {
+                bail!("reserved Beads render path {path}");
             }
         }
         output.insert(

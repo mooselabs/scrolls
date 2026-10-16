@@ -101,7 +101,7 @@ pub fn packet(g: &Graph, full: Vec<String>, titles: Vec<String>, budget: usize) 
             continue;
         }
         let v = if summary {
-            json!({"id":id,"title":r.title,"kind":r.kind,"summary_only":true})
+            json!({"id":id,"title":r.title,"kind":r.kind,"status":r.status,"revision":r.revision,"summary_only":true})
         } else {
             serde_json::to_value(r)?
         };
@@ -169,4 +169,107 @@ pub fn doctrine(g: &Graph, routing: &Value, paths: &[String]) -> Result<Value> {
     Ok(
         json!({"matched":matched.into_iter().filter_map(|id|g.records.get(&id)).collect::<Vec<_>>(),"undecided":undecided}),
     )
+}
+
+/// A bead's accepted/current context, with historical links explicitly summarized.
+pub fn bead_context(g: &Graph, reference: &str, budget: usize) -> Result<Value> {
+    let linked: BTreeSet<_> = g
+        .edges
+        .values()
+        .filter(|e| e.to == reference && g.records.get(&e.from).is_some_and(|r| r.kind != "note"))
+        .map(|e| e.from.clone())
+        .collect();
+    let mut candidates = linked.clone();
+    for id in &linked {
+        // Include questions about the linked document itself as well as its entities.
+        for item in context(g, id, usize::MAX)?["items"].as_array().unwrap() {
+            if let Some(id) = item["id"].as_str() {
+                candidates.insert(id.into());
+            }
+        }
+        for e in g
+            .edges
+            .values()
+            .filter(|e| e.from == *id && matches!(e.rel.as_str(), "about" | "applies_to"))
+        {
+            if g.records.get(&e.to).is_some_and(|r| r.kind == "entity") {
+                let packet = context(g, &e.to, usize::MAX)?;
+                for item in packet["items"].as_array().unwrap() {
+                    if let Some(id) = item["id"].as_str() {
+                        candidates.insert(id.into());
+                    }
+                }
+            }
+        }
+        if g.records
+            .get(id)
+            .is_some_and(|r| r.kind == "question" && r.status == "answered")
+        {
+            for e in g
+                .edges
+                .values()
+                .filter(|e| e.to == *id && e.rel == "answers")
+            {
+                if g.records
+                    .get(&e.from)
+                    .is_some_and(|r| r.status == "accepted")
+                {
+                    candidates.insert(e.from.clone());
+                }
+            }
+        }
+    }
+    let mut full = vec![];
+    let mut summaries = BTreeSet::new();
+    for id in &candidates {
+        let Some(r) = g.records.get(id) else {
+            continue;
+        };
+        if r.kind == "note" {
+            continue;
+        }
+        let rank = match (r.kind.as_str(), r.status.as_str()) {
+            ("question", "open") => Some(0),
+            ("decision", "accepted")
+                if !g
+                    .edges
+                    .values()
+                    .any(|e| e.rel == "supersedes" && e.to == *id) =>
+            {
+                Some(1)
+            }
+            ("knowledge" | "primer", "current") => Some(2),
+            ("doctrine", "active") => Some(3),
+            ("answer", "accepted") => Some(4),
+            _ => None,
+        };
+        if let Some(rank) = rank {
+            full.push((rank, id.clone()));
+        } else {
+            summaries.insert(id.clone());
+        }
+    }
+    for e in g
+        .edges
+        .values()
+        .filter(|e| e.rel == "supports" && candidates.contains(&e.to))
+    {
+        summaries.insert(e.from.clone());
+    }
+    full.sort();
+    let full: Vec<_> = full.into_iter().map(|(_, id)| id).collect();
+    for id in &full {
+        summaries.remove(id);
+    }
+    let mut result = packet(g, full, summaries.into_iter().collect(), budget)?;
+    result["linked_documents"] = serde_json::to_value(
+        crate::beads::refs(g, reference)
+            .into_iter()
+            .filter(|r| r["kind"] != "note")
+            .collect::<Vec<_>>(),
+    )?;
+    result["scope"] = json!(
+        "linked documents and their entity context; not a complete path-based doctrine evaluation"
+    );
+    Ok(result)
 }

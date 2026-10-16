@@ -60,3 +60,87 @@ fn human_presentation_preserves_body_lines_and_neutralizes_controls() {
     assert!(!text.contains('\u{1b}'));
     assert!(text.contains("Dolt revision: abc"));
 }
+
+#[test]
+fn qualified_bead_references_policy_and_body_links() {
+    use scrolls::work_ref::BeadRef;
+    let a = "beads://00000000-0000-4000-8000-000000000001/bd-a.1";
+    let b = "beads://00000000-0000-4000-8000-000000000002/bd-a.1";
+    assert_ne!(BeadRef::parse(a).unwrap(), BeadRef::parse(b).unwrap());
+    for bad in [
+        "bd-a",
+        "beads://missing/bd-a",
+        "beads://00000000-0000-4000-8000-000000000001/../x",
+    ] {
+        assert!(BeadRef::parse(bad).is_err());
+    }
+    let mut g = Graph::default();
+    let q = Record::new("question", "Gate", &format!("[work]({a})"), "alice").unwrap();
+    g.records.insert(q.id.clone(), q.clone());
+    policy::extract_links(&mut g, &q.id, "alice");
+    assert_eq!(g.edges.len(), 1);
+    assert!(policy::lint(&g).is_empty());
+    g.add_edge(&q.id, "blocks", a, "", "alice");
+    policy::extract_links(&mut g, &q.id, "alice");
+    assert_eq!(g.edges.len(), 2);
+    g.add_edge(&q.id, "implemented_by", b, "", "alice");
+    assert!(!policy::lint(&g).is_empty());
+}
+
+#[test]
+fn bead_context_prioritizes_current_guidance_and_marks_history() {
+    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
+    let mut g = Graph::default();
+    let mut ids = std::collections::BTreeMap::new();
+    for (kind, status, name) in [
+        ("question", "open", "open"),
+        ("decision", "accepted", "decision"),
+        ("decision", "superseded", "old"),
+        ("knowledge", "stale", "stale"),
+        ("note", "recorded", "note"),
+        ("evidence", "captured", "evidence"),
+        ("question", "answered", "answered"),
+        ("answer", "accepted", "answer"),
+    ] {
+        let mut r = Record::new(kind, name, "body", "alice").unwrap();
+        r.status = status.into();
+        ids.insert(name, r.id.clone());
+        if name != "answer" {
+            g.add_edge(&r.id, "related_work", target, "", "alice");
+        }
+        g.records.insert(r.id.clone(), r);
+    }
+    g.add_edge(&ids["evidence"], "supports", &ids["decision"], "", "alice");
+    g.add_edge(&ids["answer"], "answers", &ids["answered"], "", "alice");
+    let data = query::bead_context(&g, target, 16000).unwrap();
+    let items = data["items"].as_array().unwrap();
+    assert!(
+        data["linked_documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["kind"] != "note")
+    );
+    assert_eq!(items[0]["id"], ids["open"]);
+    assert_eq!(items[1]["id"], ids["decision"]);
+    assert!(items.iter().all(|v| v["id"] != ids["note"]));
+    assert_eq!(
+        items.iter().filter(|v| v["id"] == ids["evidence"]).count(),
+        1
+    );
+    for name in ["old", "stale", "answered", "evidence"] {
+        let r = items.iter().find(|v| v["id"] == ids[name]).unwrap();
+        assert_eq!(r["summary_only"], true);
+        assert!(r["status"].is_string());
+    }
+    assert!(
+        items
+            .iter()
+            .any(|v| v["id"] == ids["answer"] && v["body"] == "body")
+    );
+    let small = query::bead_context(&g, target, 2).unwrap();
+    assert_eq!(small["items"], serde_json::json!([]));
+    assert!(!small["omitted"].as_array().unwrap().is_empty());
+    assert_eq!(small["used_bytes"], 2);
+    assert_eq!(data, query::bead_context(&g, target, 16000).unwrap());
+}

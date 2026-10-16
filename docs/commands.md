@@ -68,7 +68,7 @@ A filesystem lock serializes all access. Dolt tables contain stable keyed JSON
 rows, so the merge conflict unit is a record or edge, not a Markdown file.
 Original source files live in `source_files`, including hashes, modes, and
 base64 bytes. Import metadata includes the exact commit and lint baseline.
-There is no SQLite substitute or Beads connection. Dolt uses a private
+Beads access is explicit through the integration below. Dolt uses a private
 `dolt-home` configuration with version checks and telemetry disabled; no shared
 Dolt configuration is changed.
 
@@ -88,3 +88,92 @@ changes are rejected before publication. `RENDERED` and
 `SCROLLS-MANIFEST.json` carry versions without changing legacy frontmatter.
 Six directory indexes are refreshed after representable edits. Unchanged
 exports are byte-for-byte copies, with index content checked independently.
+
+
+## Beads references
+
+Qualified adapter: Beads **1.3.0**, selected with `beads bind --bd`. Binding,
+refresh, and publication verify that version and the workspace's persistent
+`project_id`. Aliases and machine paths remain local. References persisted in
+edges use `beads://PROJECT-UUID/FULL-ISSUE-ID`; commands also accept
+`NAME:FULL-ISSUE-ID` after binding. Bare or abbreviated IDs are not inferred.
+
+| Command | Behavior |
+| --- | --- |
+| `migrate` | Atomically upgrade schema 1 to 2, adding a persistent Scrolls store UUID and relation registry entries. Main only; resolve pending proposals first. Supports actor, dry run, and operation receipts. Historical branches remain readable. |
+| `beads bind NAME --directory PATH [--bd PATH] [--timeout SECONDS]` | Pin project identity and a local executable/workspace binding. Default executable is `bd`; timeout defaults to 30 seconds and allows 1–300. Rebinding may change local paths but cannot change project identity. |
+| `beads list` | Local bindings, cached observations, and publication results; no Beads contact. |
+| `beads refs REF` | Referencing documents with relation, lifecycle, and revision, from the selected Scrolls branch. |
+| `context --bead REF [--budget BYTES]` | Linked documents and their entity context, ordered deterministically; no Beads contact. |
+| `beads refresh REF` or `beads refresh --all` | Explicit read-only Beads lookup. All means all qualified references on the selected branch. |
+| `beads publish REF` or `beads publish --all` | Explicit main-to-Beads backlink reconciliation. Requires actor, rejects proposal selection, supports dry run and operation IDs. |
+
+`link`/`unlink` accept these relations to Beads targets:
+
+- `related_work`: any record.
+- `implemented_by`: decision, knowledge, primer; records intent, not completion.
+- `produced_by`: evidence, knowledge, primer, note.
+- `blocks`: question; records an informational relationship, without scheduler enforcement.
+
+The source revision is required; an external target has no Scrolls revision.
+Protected sources still require a proposal, and frozen imported records remain
+immutable. Canonical Markdown links acquire a fallback `related_work` edge using
+the existing body-link convention. Removing prose does not remove asserted edges;
+use `unlink`. Legacy unqualified `blocks` targets are preserved and lint warns;
+only qualified references participate in this integration.
+
+`show` includes related work with cached resolution information. It also accepts
+`scrolls://STORE-UUID/RECORD-ID` and checks that `--store` selects the matching
+store. This URI is a portable CLI reference; no browser protocol handler is installed.
+Native exports add related-work navigation and per-bead backlink pages. Liskov
+exports refuse new work relationships that their format cannot represent.
+
+Context prioritizes open questions, accepted decisions, current knowledge, active
+doctrine, then accepted answers. Other linked states and evidence are summaries
+with explicit lifecycle; notes remain excluded. Accepted answers to linked
+answered questions are included. Entity expansion follows the existing context
+rules. This is not a complete path-based doctrine evaluation. Budgets bound the
+compact `items` array, as in ordinary context; relationship and bead metadata in
+the envelope are excluded. Consumed records retain exact Scrolls commit attribution.
+
+### Local observations and failure behavior
+
+`.scrolls/beads.json` holds bindings, cached summaries, and publication receipts,
+protected by the store's process lock and atomic file replacement. These are local
+integration state, not reviewed knowledge. Copying a store does not make its
+machine bindings portable. Ordinary show/context/render/refs never invoke Beads.
+
+Refresh records the observed title, status, issue update time, observation time,
+and latest attempt. Cached state is always labelled as such. On lookup failure,
+the previous successful observation remains, with an explicit failure. Missing
+bindings, unavailable executables/stores, malformed output, timeouts, and identity
+mismatches never turn into an invented current status. Bulk commands return
+per-target results, `data.failed`, `ok: false`, and exit 1 on partial failure.
+
+### Published backlinks
+
+Each Beads issue carries one top-level key per Scrolls store:
+`scrolls/STORE_UUID_WITHOUT_HYPHENS`. This spelling satisfies Beads' metadata-key
+query grammar. The value has `schema_version: 1`, `store_id`, `source_commit`, and
+sorted `documents` containing ID, URI, title, kind, lifecycle status, record
+revision, and relation names. Main membership does not imply lifecycle acceptance.
+
+Publication uses atomic metadata merges/unsets and preserves every other top-level
+key, including other Scrolls stores. It never updates issue descriptions, status,
+assignee, dependencies, or `external_ref`. No hooks or remote push are requested
+by Scrolls; the adapter runs with Beads' sandbox flag. Beads' own configured local
+mutation hooks remain Beads behavior.
+
+`publish --all` considers current graph links, previous publication targets, and
+all Beads issues carrying this store's metadata key, including closed issues.
+It can therefore remove obsolete backlinks after receipt loss. Removing the last
+link removes only this store's key. Unchanged document projections are skipped;
+their original `source_commit` remains the version actually published.
+
+The Scrolls lock pins main throughout a publication. Per-target receipts are
+saved before/after external work, and every changed projection is read back.
+There is no distributed transaction. A crash can leave some beads updated;
+rerunning reconciles actual state rather than trusting an old receipt. An explicit
+`--op-id` binds the command, actor, and source Scrolls commit; use a fresh ID if
+main changes. Dry runs read the proposed diff without updating either store or
+local integration state. Publication never runs during review acceptance.

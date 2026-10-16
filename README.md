@@ -68,6 +68,29 @@ same source commit is safe; changed-source reimport requires a new store.
 Imported backlog, epic, milestone, question, and untyped archive records are
 immutable. Newly authored local questions are independent of the legacy inbox.
 
+## Beads integration
+
+Beads 1.3.0 is qualified. Existing Scrolls stores need `scrolls migrate` after
+pending proposals have been accepted or rejected. New stores already use schema 2.
+
+```fish
+scrolls beads bind work --directory /path/to/beads-workspace --bd /path/to/bd
+scrolls link $record implemented_by work:bd-example --expect 2
+# Accept the returned proposal through the normal review workflow.
+scrolls beads refs work:bd-example
+scrolls context --bead work:bd-example
+scrolls beads refresh --all
+scrolls --dry-run beads publish --all
+scrolls beads publish --all
+```
+
+Replace the example issue ID and record revision with actual values from Beads
+and `scrolls show`. Relationships are many-to-many and owned by Scrolls. Ordinary
+reads remain offline; `refresh` explicitly caches bead titles/statuses and
+`publish` explicitly reconciles backlinks in Beads metadata. Publication includes
+main only, preserves unrelated metadata, and never changes work status or gates.
+See the [Beads command contract](docs/commands.md#beads-references).
+
 ## Verification
 
 ```fish
@@ -76,6 +99,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release --all-targets
 python3 scripts/demo.py --out /tmp/scrolls-demo
+./scripts/install-beads.sh
+python3 scripts/verify-beads.py --binary target/release/scrolls
 python3 scripts/verify-corpus.py /path/to/orchestrator --rev COMMIT --out /tmp/scrolls-qualification
 ```
 

@@ -120,3 +120,33 @@ calls, executable doctrine checks, hooks, and web/Slack/MCP interfaces remain
 deferred. Imported frozen history cannot be changed. Liskov export refuses
 native additions and unsupported graph/metadata changes; native export carries
 the complete normalized graph alongside original paths.
+
+## Beads integration qualification — 2026-10-16
+
+The Beads integration uses a private SHA-256-pinned Beads 1.3.0 test binary and
+disposable embedded stores with an isolated home directory. It does not connect
+to the live orchestrator ledger. `scripts/verify-beads.py` qualifies reviewed
+relationships, offline context, explicit refresh, publication preview, human
+Beads backlinks, repeat publication, separate Scrolls namespaces, and closed-issue
+cleanup after receipt loss. Metadata and work-state preservation are checked.
+Rust boundary fixtures additionally exercise timeout, malformed output, partial
+failure, identity mismatch, concurrent unrelated metadata, operation-ID conflicts,
+and interruption after an external write. CI runs both suites.
+
+Corpus qualification uses orchestrator commit
+`77f9200961d6b344fdf9ae89d3b612271d04a98d`:
+
+- 9,242 paths: 8,199 Markdown documents and 1,043 assets; zero byte mismatches.
+- All six directory indexes match independently regenerated content.
+- 3,407 frozen backlog/question files remain unchanged.
+- The representable evidence edit changes only its document and `raw/README.md`.
+- Zero additional validator diagnostics. Source, pristine export, and edited
+  export all return validator exit 1 with the same pre-existing diagnostic:
+  ADR-0238 references `EPIC-20261015-k7wd`, which is absent from the frozen Git
+  work records while the live Beads ledger is intentionally disconnected.
+  This proves diagnostic parity, not a clean source-validator result.
+
+Reproduce with the verification commands in the README, passing the commit above
+to `verify-corpus.py`. The corpus itself and local integration state remain
+untracked. Schema-1 upgrades, rejected proposal history, migration replay,
+native work-link rendering, and Liskov export rejection have real-Dolt tests.
