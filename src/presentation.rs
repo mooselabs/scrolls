@@ -109,6 +109,14 @@ pub fn human(envelope: &Value) -> String {
             out.push_str("\nGraph changes:\n");
             out.push_str(diff);
         }
+        out.push_str(&format!(
+            "\nMain revision: {}\nProposal revision: {}\nReview token: {}\n\nAfter reviewing, accept these revisions with:\nscrolls --role human review accept {} --review-token {}\nAny change to main or this proposal requires another review.\n",
+            data["main_revision"].as_str().unwrap_or(""),
+            data["proposal_revision"].as_str().unwrap_or(""),
+            data["review_token"].as_str().unwrap_or(""),
+            shell_words::quote(data["proposal"]["branch"].as_str().unwrap_or("")),
+            data["review_token"].as_str().unwrap_or("")
+        ));
         out
     } else if data.as_array().is_some_and(|a| {
         a.iter()

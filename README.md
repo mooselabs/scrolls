@@ -64,17 +64,24 @@ set record (echo $proposal | jq -r .data.id)
 set branch (echo $proposal | jq -r .data.branch)
 
 scrolls --proposal $branch status $record current --expect 1
-scrolls review $branch
+set review (scrolls --json review $branch)
+echo $review | jq .data
+set review_token (echo $review | jq -r .data.review_token)
 ```
 
 After inspecting the proposal, a human accepts it:
 
 ```fish
-scrolls --role human review accept $branch
+scrolls --role human review accept $branch --review-token $review_token
 scrolls show $record
 scrolls history $record
 scrolls render --out ./knowledge-export
 ```
+
+Acceptance is bound to the proposal and main revisions in the inspected output.
+Any change to either, including an unrelated main write, requires another review.
+Tokens check revisions within the cooperative role model; they do not authenticate
+a person or prove that someone read the output.
 
 The export destination must be new. Review acceptance merges the proposal; the
 explicit `status` command above is what makes the knowledge `current`.
@@ -118,7 +125,7 @@ record's numeric revision and write results to obtain proposal branch names.
 | `scrolls ask 'Which retention policy should we use?'` | Open an owned question. |
 | `scrolls inbox --owner me` | List your open local questions. |
 | `scrolls proposals` / `scrolls review BRANCH` | Find proposals and inspect their changes. |
-| `scrolls --role human review accept BRANCH` | Accept a reviewed proposal. |
+| `scrolls --role human review accept BRANCH --review-token TOKEN` | Accept a reviewed proposal. |
 | `scrolls history ID` | Inspect historical record snapshots. |
 | `scrolls stale` / `scrolls lint` / `scrolls doctor` | Check review dates, graph integrity, and store health. |
 | `scrolls render --out NEW_DIR` | Export a fresh Markdown tree and graph. |
@@ -141,7 +148,10 @@ This project uses Scrolls for versioned knowledge.
 - Use `scrolls context <id>` and `scrolls show <id>` to inspect relevant knowledge.
 - Capture observations as evidence and link conclusions to their supporting evidence.
 - Use `--json` for automation, `--expect` for revisions, and stable `--op-id` values for retries.
-- Inspect proposals with `scrolls review <branch>` and leave acceptance to a human.
+- Inspect completed proposals with `scrolls review <branch>` and leave acceptance to a human.
+- Preserve the returned review token. Acceptance requires that exact token; any
+  change to main or the proposal requires a fresh human review. Never automatically
+  refresh a stale token and retry acceptance.
 - Keep task status and execution dependencies in the project's work tracker.
 ```
 
@@ -195,9 +205,11 @@ scrolls beads bind work --directory /path/to/beads-workspace --bd /path/to/bd
 set revision (scrolls --json show $record | jq -r .data.record.revision)
 set link (scrolls --json link $record implemented_by work:bd-example --expect $revision)
 set link_branch (echo $link | jq -r .data.branch)
-scrolls review $link_branch
+set link_review (scrolls --json review $link_branch)
+echo $link_review | jq .data
+set link_token (echo $link_review | jq -r .data.review_token)
 # A human accepts after reviewing the change.
-scrolls --role human review accept $link_branch
+scrolls --role human review accept $link_branch --review-token $link_token
 
 scrolls beads refs work:bd-example
 scrolls context --bead work:bd-example
@@ -307,6 +319,7 @@ verified cache. See the qualification reports for exact results and limitations.
 - [Design](docs/design.md): implementation boundary followed by the broader design.
 - [Migration report](docs/migration-report.md): pinned corpus import/export evidence.
 - [Correctness qualification](docs/correctness-qualification.md): doctrine, relationships, answers, and export checks.
+- [Review acceptance qualification](docs/review-acceptance-qualification.md): revision binding, retries, recovery, and corpus parity.
 
 The README's onboarding structure is inspired by the
 [Beads README](https://github.com/steveyegge/beads/blob/main/README.md); the commands

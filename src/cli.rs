@@ -218,12 +218,16 @@ pub enum Cmd {
         owner: Option<String>,
     },
     Proposals,
-    /// Inspect: review BRANCH. Decide: review accept|reject BRANCH.
+    /// Inspect: review BRANCH. Accept with --review-token from that inspection.
     Review {
         action: String,
         branch: Option<String>,
         #[arg(long)]
         reason: Option<String>,
+        /// Bind acceptance to the inspected proposal and main revisions.
+        #[arg(long)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review_token: Option<String>,
     },
     History {
         id: Option<String>,

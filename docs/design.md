@@ -313,7 +313,8 @@ scrolls doctrine list --active
 # review
 scrolls proposals                     pending proposal branches
 scrolls review <proposal>             the Dolt diff, scroll by scroll
-scrolls review accept|reject <proposal> [--reason]
+scrolls review accept <proposal> --review-token <inspected-token> [--reason]
+scrolls review reject <proposal> --reason <reason>
 
 # health
 scrolls lint [--model]                mechanical pass; --model adds the frontier-model pass
@@ -419,6 +420,13 @@ Dolt diff: new rows, changed cells, new edges, each with the actor and the
 itself stored as evidence. Pending proposals are invisible to `prime`,
 `context` and `search` unless `--include-proposals` is passed, so an agent
 cannot cite its own unreviewed claim.
+
+The local CLI binds acceptance to the exact proposal and main revisions returned
+by inspection. Pass the preserved `review_token` to `review accept`; any change
+to either branch requires a new review, including unrelated main writes. This
+also applies to dry runs. An identical completed `--op-id` retry returns its
+original receipt before checking current revisions. Tokens are cooperative
+revision checks, not authentication or proof that a person read the diff.
 
 **Accept runs a check before it merges.** When a human accepts a proposal
 that touches `decision` or `knowledge`, Scrolls runs the mechanical lint

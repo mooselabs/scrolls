@@ -854,6 +854,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         action,
         branch: arg,
         reason,
+        review_token,
     } = &cli.command
     else {
         unreachable!()
@@ -861,6 +862,9 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
     let action = action.as_str();
     let arg = arg.as_deref();
     let reason = reason.as_deref();
+    if action != "accept" && review_token.is_some() {
+        bail!("--review-token is only valid for review accept; omit it for inspection or rejection")
+    }
     let deciding = action == "accept" || action == "reject";
     let name = proposal_name(
         s,
@@ -880,6 +884,9 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         .context("proposal metadata missing")?;
     if !deciding {
         let base = s.head("main")?;
+        let proposal_revision = s.head(&name)?;
+        let token =
+            crate::review_token::ReviewToken::new(&name, &base, &proposal_revision).encode()?;
         s.checkout(&name)?;
         let proposed = s.graph()?;
         let ancestor = s.run(&["merge-base", "main", &name])?.trim().to_string();
@@ -903,7 +910,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         let diff = s.run(&["diff", "main", &name, "edges"])?;
         return wrap(
             s,
-            json!({"proposal":proposal,"main_revision":base,"merge_base":ancestor,"records":changes,"graph_diff":diff}),
+            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff}),
             &name,
         );
     }
@@ -941,6 +948,15 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         );
     }
     let base = s.head("main")?;
+    let proposal_revision = s.head(&name)?;
+    let token = review_token.as_deref().with_context(|| {
+        format!(
+            "review accept requires --review-token; run scrolls review {name} and pass its token"
+        )
+    })?;
+    crate::review_token::ReviewToken::decode(token)
+        .with_context(|| format!("run scrolls review {name} again and pass its review_token"))?
+        .check(&name, &base, &proposal_revision)?;
     let temp = format!("review/{}", uuid::Uuid::new_v4().simple());
     s.run(&["checkout", "-b", &temp, "main"])?;
     s.journal_review(&temp, &base)?;
@@ -966,11 +982,13 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             );
         }
         if cli.dry_run {
-            return Ok(json!({"dry_run":true,"validated":true,"proposal":name,"base":base}));
+            return Ok(
+                json!({"dry_run":true,"validated":true,"proposal":name,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token}),
+            );
         }
         proposal.status = "accepted".into();
         proposal.reason = reason.map(str::to_string);
-        let result = json!({"proposal":proposal,"op_id":op,"validated_base":base});
+        let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
         let mut sql = put("metadata", &name, &proposal)?;
         sql.push_str(&receipt(op, hash, who, &cli.command, &result)?);
         s.transaction(&sql, &format!("accept {name} by {who}"), who)?;

@@ -161,7 +161,8 @@ def create(kind, title, body="Local qualification record.", **options):
         args.extend(["--" + key.replace("_", "-"), value])
     result = data(*args)
     if result["branch"] != "main":
-        data("--role", "human", "review", "accept", result["branch"])
+        review = data("review", result["branch"])
+        data("--role", "human", "review", "accept", result["branch"], "--review-token", review["review_token"])
     return result["id"]
 
 

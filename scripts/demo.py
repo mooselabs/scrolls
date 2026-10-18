@@ -47,7 +47,8 @@ entity = call(
     "--body",
     "The local storage subsystem.",
 )
-call("review", "accept", entity["branch"])
+review = call("review", entity["branch"])
+call("review", "accept", entity["branch"], "--review-token", review["review_token"])
 e = call(
     "new",
     "evidence",
@@ -73,8 +74,8 @@ k = call(
     entity["id"],
 )
 call("--proposal", k["branch"], "status", k["id"], "current", "--expect", "1")
-call("review", k["branch"])
-call("review", "accept", k["branch"])
+review = call("review", k["branch"])
+call("review", "accept", k["branch"], "--review-token", review["review_token"])
 packet = call("context", entity["id"], "--budget", "16000")
 assert any(r["id"] == k["id"] for r in packet["items"])
 q = call(
@@ -106,7 +107,8 @@ assert question["accepted_answer_id"] == answer["id"]
 assert any(r["id"] == answer["id"] for r in packet["items"])
 doctrine = call("new", "doctrine", "--title", "Mandatory demo rule", "--body", "Read the complete rule.\n" * 1000, "--field", "glob=demo/**")
 call("--proposal", doctrine["branch"], "status", doctrine["id"], "active", "--expect", "1")
-call("review", "accept", doctrine["branch"])
+review = call("review", doctrine["branch"])
+call("review", "accept", doctrine["branch"], "--review-token", review["review_token"])
 packet = call("prime", "--for", "demo/file.rs")
 assert packet["over_budget_bytes"] > 0
 assert any(r["id"] == doctrine["id"] for r in packet["items"])

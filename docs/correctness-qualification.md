@@ -1,5 +1,8 @@
 # Scrolls correctness qualification
 
+The later [review acceptance qualification](review-acceptance-qualification.md)
+covers revision-bound acceptance and repeats the pinned corpus checks.
+
 Qualified on 2026-10-16. Tested implementation commit:
 `f23b0f251ce933ed0626076329b18d3f3915062b` (tree `db2b81fd79e43fd29ba7bb6bc60554afdf75592f`).
 The worktree was clean throughout the committed corpus qualification, and the

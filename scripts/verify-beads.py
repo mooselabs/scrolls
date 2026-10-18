@@ -54,7 +54,8 @@ with tempfile.TemporaryDirectory(prefix="scrolls-beads-qualification-") as tmp:
     scrolls("--proposal", branch, "status", knowledge["id"], "current", "--expect", "1")
     scrolls("--proposal", branch, "link", knowledge["id"], "implemented_by", reference, "--expect", "2")
     assert scrolls("beads", "refs", reference)["documents"] == []
-    scrolls("review", "accept", branch)
+    review = scrolls("review", branch)
+    scrolls("review", "accept", branch, "--review-token", review["review_token"])
     packet = scrolls("context", "--bead", reference)
     assert any(x["id"] == knowledge["id"] and x["body"] == "Current understanding" for x in packet["items"])
     refreshed = scrolls("beads", "refresh", "--all")
@@ -82,7 +83,8 @@ with tempfile.TemporaryDirectory(prefix="scrolls-beads-qualification-") as tmp:
     scrolls("beads", "publish", "--all", store="second")
     assert len([k for k in beads("show", issue_id)[0]["metadata"] if k.startswith("scrolls/")]) == 2
     unlinked = scrolls("unlink", knowledge["id"], "implemented_by", reference, "--expect", "3")
-    scrolls("review", "accept", unlinked["branch"])
+    review = scrolls("review", unlinked["branch"])
+    scrolls("review", "accept", unlinked["branch"], "--review-token", review["review_token"])
     # Simulate lost publication receipts; discover stale projections in Beads.
     sidecar = root / "knowledge" / "beads.json"
     local = json.loads(sidecar.read_text())

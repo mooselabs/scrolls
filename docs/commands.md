@@ -37,8 +37,8 @@ read by the retry; `data` is the original operation result.
 | `accept ANSWER --expect REV --expect-question REV` | Human question owner accepts an offered answer and marks its open question answered. |
 | `inbox [--owner NAME\|me]` | Open local questions; imported frozen questions are excluded. |
 | `proposals` | Pending, accepted, and rejected proposals with attribution and reasons. |
-| `review BRANCH` | Body and metadata before/after plus graph changes. |
-| `review accept BRANCH [--reason TEXT]` | Human-only temporary merge, structural validation, and guarded main advance. Does not automatically change record lifecycle status. |
+| `review BRANCH` | Body and metadata before/after plus graph changes, `main_revision`, `proposal_revision`, and `review_token`. |
+| `review accept BRANCH --review-token TOKEN [--reason TEXT]` | Human-only temporary merge, structural validation, and guarded main advance. Does not automatically change record lifecycle status. |
 | `review reject BRANCH --reason TEXT` | Human-only rejection retained on the original proposal branch; history remains. |
 | `history [ID]` | Dolt commits, or historical record snapshots with commit attribution. |
 | `lint` | Structural errors, imported debt, and missing-about warnings. Mutations reject newly introduced structural errors. |
@@ -93,6 +93,32 @@ depends_on, blocks, related. `blocks` can target an external work ID;
 `depends_on` require a reason. Body links to stable Scrolls IDs get a fallback
 `related` edge when no stronger edge exists. Lifecycle and edge policies are
 implemented in the library; registry editing is deferred.
+
+## Revision-bound proposal acceptance
+
+Inspect the completed proposal and preserve its `review_token`. Acceptance,
+including `--dry-run`, requires that token and the human role. The token binds
+the branch and both full Dolt commit hashes: **any main advance**, even an
+unrelated write, or any proposal change requires another review. Stale errors
+name the changed revision and leave heads, receipts, and recovery state unchanged.
+Never automatically refresh a token and retry. Inspection and rejection reject
+`--review-token`; rejection otherwise retains its existing policy.
+
+Successful acceptance returns `review_token`, `proposal_revision`, and
+`validated_base` (the reviewed main revision), also stored in its transactional
+receipt. Dry runs report the same binding without accepting. An identical
+`--op-id` retry returns the original result even after main advances; changing
+the token with that operation ID is an argument mismatch. Historical tokenless
+successful receipts still replay, but new tokenless acceptance is refused.
+Schema-1 and schema-2 stores need no migration: review existing pending proposals
+with the updated CLI to obtain tokens. There is no bypass flag.
+
+The deterministic token format is `v1.` followed by unpadded URL-safe base64 of
+canonical JSON containing `branch`, `main_revision`, and `proposal_revision`, in
+that order. It has no timestamp or stored review session. Tokens check revisions
+under cooperative roles; they neither authenticate a human nor prove reading.
+Malformed, unsupported-version, wrong-branch, and stale tokens require a fresh
+review. Existing merge-conflict and structural validation still apply.
 
 ## Storage and recovery
 
