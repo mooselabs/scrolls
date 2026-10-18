@@ -191,6 +191,7 @@ fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
             &[],
             "rev",
             Options {
+                import_files: &[],
                 out: &out,
                 format,
                 beads: &scrolls::beads::Local::default(),
@@ -274,6 +275,7 @@ fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
         &[],
         "rev",
         Options {
+            import_files: &[],
             out: &out,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),
@@ -294,6 +296,7 @@ fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
             &[],
             "rev",
             Options {
+                import_files: &[],
                 out: &dir.path().join("bad"),
                 format: Format::Liskov,
                 beads: &scrolls::beads::Local::default(),
@@ -344,6 +347,7 @@ fn native_supersession_cannot_publish_incompatible_legacy_status() {
         &[],
         "rev",
         Options {
+            import_files: &[],
             out: &out,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),
@@ -361,6 +365,7 @@ fn native_supersession_cannot_publish_incompatible_legacy_status() {
         &[],
         "rev",
         Options {
+            import_files: &[],
             out: &bad,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),

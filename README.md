@@ -195,7 +195,7 @@ can require both endpoint revisions. See [relationship rules](docs/commands.md).
 The adapter is qualified against **Beads 1.3.0**. It keeps work references in
 Scrolls and requires explicit commands to contact Beads. Existing older stores
 need `scrolls migrate` after pending proposals are accepted or rejected; new
-stores use format 3.
+stores use format 4.
 
 Bind an existing Beads workspace and link the knowledge record from the quick
 start. Replace `bd-example` with a full issue ID from that workspace:
@@ -259,6 +259,34 @@ silently discard it. Start with `scrolls doctor` and the
 This release provides local operation and proposal review. Remote synchronization,
 server storage, authenticated access, embeddings, executable doctrine checks,
 and web/MCP interfaces remain outside the implemented scope.
+
+## Import profiles
+
+Import a pinned Git collection with a bundled or custom YAML profile:
+
+```fish
+scrolls import profiles list
+scrolls import profiles show pep
+scrolls import plan git /path/to/peps --root peps --rev COMMIT \
+    --source python.peps --profile pep --out peps.plan.json
+scrolls import apply peps.plan.json --op-id peps-initial --dry-run
+scrolls import apply peps.plan.json --op-id peps-initial
+scrolls show PEP-0008 --provenance
+scrolls render --out ./peps-export
+```
+
+Planning requires an initialized format-4 store and actor. It reads committed
+Git objects and leaves the store unchanged. Apply verifies the plan against the
+same store, actor, main revision and schema; protected imports become one proposal.
+Use `--profile-file FILE` for your own mapping. The canonical bundled profiles are
+[PEP](profiles/pep.yaml) and [handbook](profiles/handbook.yaml).
+
+Captured records and declared source relationships remain source-owned. Local
+notes and relationships can cite them. Native export preserves original bytes
+and executable modes under `sources/SOURCE_ID/`, alongside normalized views and
+provenance. RST is shown as literal source. Multiple independent sources are
+supported; changed-source refresh, deletions and section retrieval are deferred.
+See the [profile contract](docs/import-profiles.md) and [migration guide](docs/migration-0.3.md).
 
 ## Markdown import and export
 

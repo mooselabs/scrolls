@@ -1,4 +1,4 @@
-# Scrolls 0.2 design
+# Scrolls 0.3 design
 
 Scrolls is a local document graph backed by private Dolt 2.2.0. Its engine is
 independent of an information architecture. `schemas/knowledge.yaml` supplies
@@ -54,9 +54,11 @@ glob edges, and imported routing; unresolved text remains diagnostic data.
 Walk is bounded and direction-aware, returning references and traversed edges
 unless full records are explicitly requested.
 
-Store format 3 and JSON envelope 2 accompany package version 0.2.0. Migration
-requires resolved proposals, installs the bundled schema with empty pins, and
-preserves record revisions, store identity, receipts, source files and history.
+Store format 4 and JSON envelope 2 accompany package version 0.3.0. Migration
+requires resolved proposals, preserves configured ontologies from format 3, and
+installs the bundled ontology for older stores. It preserves record revisions,
+store identity, receipts, legacy source files and history. Format-4 DDL is prepared
+and validated on a journaled temporary Dolt branch before main advances.
 Historical branches remain readable. Native export includes the complete graph,
 active schema and schema revision. The Liskov import/export adapter retains its
 explicit compatibility checks and independent corpus qualification.
@@ -65,3 +67,16 @@ Retrieval profiles, execution stages, workflow languages, generated summaries,
 embeddings, automatic expansion, live ledger migration and documentation-authority
 cutover are outside this release. This design supersedes proposals for retrieval
 profiles and ontology-specific authoring commands.
+
+Configurable [import profiles](import-profiles.md) map committed Git files into
+the active ontology. `markdown_frontmatter` and `rst_headers` preserve originals,
+raw metadata and source spans. Plans bind a read-only store snapshot, embedded
+profile, source tree, actor and candidate digest. Apply recomputes the candidate
+and uses one transaction for graph, provenance, originals and operation receipt.
+Protected or guarded imports route to one proposal with the same isolation.
+
+Engine-owned source membership protects captured properties and imported edges
+across mutations, schemas and acceptance. Local notes and relationships can cite
+captured records. Native export keeps original source subtrees and executable
+modes, plus normalized views, source links and reference assertions. Generic
+sources cannot use Liskov export. Changed-source reconciliation is deferred.

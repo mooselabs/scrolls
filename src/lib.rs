@@ -15,3 +15,6 @@ pub mod work_ref;
 pub mod schema;
 
 pub mod mutation;
+
+pub mod profile;
+pub mod source_import;

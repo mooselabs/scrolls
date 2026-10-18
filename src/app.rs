@@ -80,6 +80,11 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
     }
 }
 pub fn run(cli: &Cli) -> Result<Value> {
+    if let Cmd::Import { command } = &cli.command {
+        if !matches!(command, ImportCommand::Markdown { .. }) {
+            return crate::source_import::run(cli, command);
+        }
+    }
     if matches!(
         cli.command,
         Cmd::Ask { .. }
@@ -124,6 +129,12 @@ pub fn run(cli: &Cli) -> Result<Value> {
         proposal_name(&store, branch)?;
     }
     store.checkout(branch)?;
+    let selected_format = store
+        .one::<u32>("metadata", "schema")?
+        .context("missing store format")?;
+    if selected_format > 4 {
+        bail!("unsupported store format {selected_format}; use a newer Scrolls writer");
+    }
     if init {
         if branch != "main" {
             bail!("init operates on main")
@@ -155,7 +166,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative local roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative local roles; not authenticated identity"}),
             branch,
         );
     }
@@ -177,10 +188,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if let Some(result) = store.receipt(&op, &hash)? {
             return wrap(&store, result, branch);
         }
-        if schema == 3 {
+        if schema == 4 {
             return wrap(
                 &store,
-                json!({"schema_version":3,"already_current":true}),
+                json!({"schema_version":4,"already_current":true}),
                 branch,
             );
         }
@@ -190,20 +201,22 @@ pub fn run(cli: &Cli) -> Result<Value> {
         let store_id = store
             .one::<String>("metadata", "store_id")?
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let result = json!({"schema_version":3,"store_id":store_id,"op_id":op});
+        let result = json!({"schema_version":4,"store_id":store_id,"op_id":op});
         if cli.dry_run {
             return wrap(&store, json!({"dry_run":true,"result":result}), branch);
         }
-        let mut sql = put("metadata", "schema", &3)?;
-        sql.push_str(&put(
-            "metadata",
-            "ontology",
-            &crate::schema::Schema::default(),
-        )?);
+        let mut sql = put("metadata", "schema", &4)?;
+        if schema < 3 {
+            sql.push_str(&put(
+                "metadata",
+                "ontology",
+                &crate::schema::Schema::default(),
+            )?);
+        }
         sql.push_str(&put("metadata", "store_id", &store_id)?);
         // Translate legacy diagnostics from preserved import originals, never
         // from current records (which could contain new violations).
-        if store.one::<ImportInfo>("metadata", "import")?.is_some() {
+        if schema < 3 && store.one::<ImportInfo>("metadata", "import")?.is_some() {
             let current = store.graph()?;
             let mut original = Graph::default();
             for record in current.records.values() {
@@ -235,10 +248,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
             )?);
         }
         sql.push_str(&receipt(&op, &hash, actor(cli)?, &cli.command, &result)?);
-        store.transaction(&sql, "upgrade Scrolls to store format 3", actor(cli)?)?;
+        store.migrate_format4(&sql, actor(cli)?)?;
         return wrap(&store, result, branch);
     }
-    if schema < 3 && cli.command.mutation() && !matches!(cli.command, Cmd::Review { .. }) {
+    if schema < 4 && cli.command.mutation() && !matches!(cli.command, Cmd::Review { .. }) {
         bail!(
             "store format {schema} is read-only; resolve pending proposals, then run scrolls migrate"
         );
@@ -591,7 +604,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             path,
             at.as_deref(),
         )?,
-        Cmd::Show { id } => {
+        Cmd::Show { id, provenance } => {
             let name = if let Some(rest) = id.strip_prefix("scrolls://") {
                 let (uuid, record) = rest.split_once('/').context("invalid Scrolls URI")?;
                 let current: String = store
@@ -606,7 +619,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             };
             let id = graph.resolve(name)?;
             consumed.push(id.clone());
-            json!({"uri":store.one::<String>("metadata","store_id")?.map(|s|crate::work_ref::document_uri(&s,&id)),"record":graph.records[&id],"references":query::references(&graph,&id),"edges":graph.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::beads::related(&graph,&id,&local)})
+            json!({"uri":store.one::<String>("metadata","store_id")?.map(|s|crate::work_ref::document_uri(&s,&id)),"record":graph.records[&id],"references":query::references(&graph,&id),"edges":graph.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::beads::related(&graph,&id,&local),"provenance":if *provenance {crate::source_import::provenance(&graph,&id)} else {Value::Null}})
         }
         Cmd::Search {
             terms,
@@ -703,6 +716,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 format: *format,
                 dry_run: cli.dry_run,
                 beads: &local,
+                import_files: &if schema >= 4 {
+                    store.import_files()?
+                } else {
+                    vec![]
+                },
             },
         )?,
         _ => bail!("unsupported command"),
@@ -780,7 +798,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         let configuration_diff = s.run(&["diff", "main", &name, "metadata"])?;
         return wrap(
             s,
-            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff,"configuration_diff":configuration_diff}),
+            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff,"configuration_diff":configuration_diff,"imports":crate::source_import::summary(&proposed,&if s.one::<u32>("metadata","schema")?==Some(4){s.import_files()?}else{vec![]})}),
             &name,
         );
     }
@@ -842,6 +860,14 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             .one::<ImportInfo>("metadata", "import")?
             .map(|i| i.lint_debt)
             .unwrap_or_default();
+        for (id, source) in &merged.import_sources {
+            if !main_graph.import_sources.contains_key(id)
+                && (source.schema_hash != main_graph.schema.revision()
+                    || source.schema_hash != merged.schema.revision())
+            {
+                bail!("stale_plan: import schema changed; reject proposal and create a new plan");
+            }
+        }
         policy::validate_change(main_graph, &merged, &debt)?;
         merged.schema.validate()?;
         for pin in &merged.schema.pins {

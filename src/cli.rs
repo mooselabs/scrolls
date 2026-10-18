@@ -111,6 +111,8 @@ pub enum Cmd {
     },
     Show {
         id: String,
+        #[arg(long)]
+        provenance: bool,
     },
     Search {
         terms: String,
@@ -266,6 +268,17 @@ pub enum Cmd {
 }
 #[derive(Debug, Serialize, Subcommand)]
 pub enum ImportCommand {
+    Profiles {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
+    Apply {
+        plan: PathBuf,
+    },
     Markdown {
         dir: PathBuf,
         #[arg(long)]
@@ -349,5 +362,34 @@ pub enum SchemaCommand {
         file: PathBuf,
         #[arg(long)]
         expect: String,
+    },
+}
+
+#[derive(Debug, Serialize, Subcommand)]
+pub enum ProfileCommand {
+    List,
+    Show { name: String },
+    Validate { file: PathBuf },
+}
+#[derive(Debug, Serialize, Subcommand)]
+pub enum PlanCommand {
+    Git {
+        repo: PathBuf,
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        rev: String,
+        #[arg(long)]
+        source: String,
+        #[arg(
+            long,
+            conflicts_with = "profile_file",
+            required_unless_present = "profile_file"
+        )]
+        profile: Option<String>,
+        #[arg(long, conflicts_with = "profile", required_unless_present = "profile")]
+        profile_file: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
     },
 }

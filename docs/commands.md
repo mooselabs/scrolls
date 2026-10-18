@@ -1,4 +1,4 @@
-# Scrolls 0.2 command reference
+# Scrolls 0.3 command reference
 
 Global flags: `--store DIR`, `--dolt FILE`, `--json`, `--actor NAME`,
 `--role human|agent`, `--proposal BRANCH`, `--op-id ID`, `--dry-run`, `--session ID`.
@@ -7,7 +7,7 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 
 | Command | Contract |
 |---|---|
-| `init [--schema FILE]` | Create a format 3 store using a supplied or bundled ontology. |
+| `init [--schema FILE]` | Create a format 4 store using a supplied or bundled ontology. |
 | `schema show` | Active typed configuration and schema revision. |
 | `schema export` | YAML on stdout, suitable for editing (also with `--json`). |
 | `schema validate FILE` | Check format and compatibility against the selected graph. |
@@ -121,3 +121,25 @@ remain separate from document authority. No live ledger is migrated by this rele
 
 Acceptance requires the `review_token` returned by `review BRANCH`. It binds both
 main and proposal revisions; any intervening write requires a fresh inspection.
+
+## Configurable imports (0.3)
+
+- `import profiles list` and `import profiles show NAME` need no store.
+- `import profiles validate FILE` checks strict YAML and the active ontology.
+- `import plan git REPO --root PATH --rev REV --source SOURCE_ID --profile NAME --out PLAN`
+  captures a read-only main snapshot; use `--profile-file FILE` instead of `--profile`.
+- `import apply PLAN --op-id ID` revalidates all bindings and commits one complete
+  source or routes it to one proposal. `--dry-run` writes no receipt or graph data.
+- `show ID --provenance` includes captured metadata, spans, assertions and source.
+
+Plans bind the store UUID, main/schema revisions, actor/role, Git commit/tree/root,
+embedded profile, interpreter and candidate digests. Exact receipt retries are
+checked before stale-plan errors. Rejected operations remain rejected; a new
+operation ID can propose again. Changed accepted sources return
+`source_update_unsupported`. Review tokens remain required for acceptance.
+
+Native export includes `sources/SOURCE_ID/`, `scrolls/imports.json`, linked native
+views and manifest provenance. Review displays file paths, hashes and modes.
+Captured properties and imported edges cannot be changed by authoring, batches,
+schema changes or review. New local relationships still follow endpoint revision,
+ownership and proposal rules. See [the complete contract](import-profiles.md).

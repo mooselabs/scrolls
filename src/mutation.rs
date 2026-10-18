@@ -206,6 +206,10 @@ pub fn apply(
                     .with_context(|| format!("unknown relation {rel}"))?;
                 let to = if to.starts_with('$') {
                     resolve(&g, &handles, to)?
+                } else if !to.starts_with("beads://")
+                    && g.records.values().any(|r| r.aliases.contains(to))
+                {
+                    g.resolve(to)?
                 } else if to.starts_with("beads://")
                     || (rule.external.iter().any(|e| e == "beads")
                         && to.contains(':')
@@ -231,6 +235,33 @@ pub fn apply(
                         }
                     }
                 };
+                let key = Edge {
+                    from: from.clone(),
+                    rel: rel.clone(),
+                    to: to.clone(),
+                    why: String::new(),
+                    actor: String::new(),
+                    created: String::new(),
+                }
+                .key();
+                let captured = g
+                    .import_members
+                    .values()
+                    .any(|m| m.edges.contains_key(&key));
+                if captured {
+                    if let Mutation::Link { why, .. } = op {
+                        ensure!(
+                            why.is_empty() || why == &g.edges[&key].why,
+                            "source_ownership: cannot modify imported assertion"
+                        );
+                        check(before, &from, *expect, true)?;
+                        if !g.schema.reference(rel)? {
+                            check(before, &to, *expect_to, true)?;
+                        }
+                        continue;
+                    }
+                    bail!("source_ownership: cannot remove imported assertion");
+                }
                 check(before, &from, *expect, true)?;
                 if g.records.contains_key(&to) {
                     if g.schema.reference(rel)? {
