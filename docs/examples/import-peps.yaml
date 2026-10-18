@@ -1,0 +1,65 @@
+# Proposed import-profile format. Not accepted by the current Scrolls CLI.
+format: 1
+id: pep
+description: Pinned Python Enhancement Proposals as external evidence.
+assets: unmatched
+coverage:
+  min_documents: 1
+  min_by_rule: {peps: 1}
+documents:
+  - id: peps
+    include: ['pep-[0-9][0-9][0-9][0-9].rst']
+    codec: rst_headers
+    values:
+      number: {from: /headers/pep, normalize: unsigned_integer, required: true}
+      title: {from: /headers/title, normalize: trim, required: true}
+      status: {from: /headers/status, normalize: trim, required: true}
+      type: {from: /headers/type, normalize: trim, required: true}
+      author: {from: /headers/author, required: true}
+      created: {from: /headers/created, required: true}
+      python_version: {from: /headers/python-version}
+      topic: {from: /headers/topic}
+      replaces: {from: /headers/replaces, normalize: unsigned_integer_list}
+      superseded_by: {from: /headers/superseded-by, normalize: unsigned_integer_list}
+      requires: {from: /headers/requires, normalize: unsigned_integer_list}
+    identity:
+      key: {template: 'pep/{number}'}
+      aliases:
+        - {template: 'PEP-{number:04d}'}
+        - {template: 'PEP {number}'}
+        - {template: 'https://peps.python.org/pep-{number:04d}/'}
+    record:
+      kind: {literal: evidence}
+      title: {template: 'PEP {number}: {title}'}
+      body: {source: body, representation: fenced_source, language: rst}
+      fields:
+        pep_number: {value: number}
+        pep_status: {value: status}
+        pep_type: {value: type}
+        authors: {value: author}
+        source_created: {value: created}
+        python_version: {value: python_version}
+        topic: {value: topic}
+        canonical_url: {template: 'https://peps.python.org/pep-{number:04d}/'}
+    references:
+      - id: replaces
+        value: replaces
+        source_relation: Replaces
+        target_key: 'pep/{target}'
+        direction: outgoing
+        relation: supersedes
+        on_missing: retain
+      - id: superseded_by
+        value: superseded_by
+        source_relation: Superseded-By
+        target_key: 'pep/{target}'
+        direction: incoming
+        relation: supersedes
+        on_missing: retain
+      - id: requires
+        value: requires
+        source_relation: Requires
+        target_key: 'pep/{target}'
+        direction: outgoing
+        # Preserved as source assertions; default evidence cannot use depends_on.
+        on_missing: retain

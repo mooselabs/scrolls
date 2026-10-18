@@ -1,0 +1,36 @@
+# Proposed import-profile format. Each chapter must supply a stable frontmatter id.
+format: 1
+id: handbook
+description: Markdown handbook chapters captured as external evidence.
+assets: unmatched
+coverage: {min_documents: 1}
+documents:
+  - id: chapters
+    include: ['chapters/*.md']
+    codec: markdown_frontmatter
+    values:
+      key: {from: /frontmatter/id, normalize: trim, required: true}
+      title: {from: /frontmatter/title, normalize: trim, required: true}
+      tags: {from: /frontmatter/tags, normalize: string_list, default: []}
+      updated: {from: /frontmatter/updated, normalize: date, date_format: '%Y-%m-%d'}
+    identity:
+      key: {template: 'chapter/{key}'}
+      aliases: [{template: 'chapter:{key}'}]
+    record:
+      kind: {literal: evidence}
+      title: {value: title}
+      body: {source: body, representation: markdown}
+      fields:
+        tags: {value: tags}
+        source_updated: {value: updated}
+  - id: readme
+    include: [README.md]
+    codec: markdown_frontmatter
+    values:
+      path: {from: /path, required: true}
+    identity:
+      key: {value: path}
+    record:
+      kind: {literal: evidence}
+      title: {literal: Handbook overview}
+      body: {source: body, representation: markdown}

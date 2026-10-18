@@ -2,6 +2,10 @@
 
 Status: design baseline with local v1 implementation · Created: 2026-10-16 · Owner: Patrick McEvoy
 
+Proposed extension: [configurable import profiles](import-profiles.md) defines
+declarative source mappings, stable source identities, pinned plans, provenance,
+and atomic imports. Its example syntax and commands are not yet implemented.
+
 ## Implementation boundary (2026-10-16)
 
 The local Rust implementation is described in [commands.md](commands.md) and
