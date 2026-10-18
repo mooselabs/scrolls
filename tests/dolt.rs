@@ -946,7 +946,7 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
     {
         let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
         s.checkout("main").unwrap();
-        s.transaction(&(put("metadata","schema",&1).unwrap()+"DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"),"v1 fixture","test").unwrap();
+        s.transaction(&((put("metadata","schema",&1).unwrap()+"DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members;")+"DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"),"v1 fixture","test").unwrap();
     }
     let before = f.ok(&["show", id]);
     f.fail(
@@ -964,9 +964,9 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
     f.ok(&["--dry-run", "migrate"]);
     assert_eq!(f.ok(&["doctor"])["schema_version"], 1);
     let migrated = f.ok(&["--op-id", "migration", "migrate"]);
-    assert_eq!(migrated["schema_version"], 3);
+    assert_eq!(migrated["schema_version"], 4);
     assert_eq!(migrated, f.ok(&["--op-id", "migration", "migrate"]));
-    assert_eq!(f.ok(&["doctor"])["schema_version"], 3);
+    assert_eq!(f.ok(&["doctor"])["schema_version"], 4);
     assert_eq!(before["record"], f.ok(&["show", id])["record"]);
     let uri = format!(
         "scrolls://{}/{}",
@@ -1281,7 +1281,9 @@ fn format_two_migration_preserves_identity_receipts_and_historical_reads() {
         let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
         s.checkout("main").unwrap();
         s.transaction(
-            &(put("metadata", "schema", &2).unwrap() + "DELETE FROM metadata WHERE id='ontology';"),
+            &((put("metadata", "schema", &2).unwrap()
+                + "DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members;")
+                + "DELETE FROM metadata WHERE id='ontology';"),
             "old format fixture",
             "test",
         )
@@ -1357,7 +1359,8 @@ fn migration_translates_import_debt_from_originals_not_current_violations() {
                 &Vec::<scrolls::model::Edge>::new(),
             )
             .unwrap()
-            + &put("metadata", "schema", &2).unwrap()
+            + &(put("metadata", "schema", &2).unwrap()
+                + "DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members;")
             + "DELETE FROM metadata WHERE id='ontology';";
         s.transaction(&sql, "legacy import fixture", "test")
             .unwrap();
@@ -1740,7 +1743,7 @@ fn historical_tokenless_receipts_and_both_store_schemas() {
         let root = f.dir.path().join("store");
         if schema == 1 {
             let s = Store::open(&root, &dolt(), false).unwrap();
-            s.transaction(&(put("metadata", "schema", &1).unwrap() + "DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"), "schema 1 fixture", "test").unwrap();
+            s.transaction(&((put("metadata","schema",&1).unwrap()+"DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members;") + "DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"), "schema 1 fixture", "test").unwrap();
         }
         if schema < 3 {
             f.ok(&["migrate"]);
@@ -1799,7 +1802,7 @@ fn historical_tokenless_receipts_and_both_store_schemas() {
             &["review", "accept", next["branch"].as_str().unwrap()],
             "requires --review-token",
         );
-        assert_eq!(f.ok(&["doctor"])["schema_version"], 3);
+        assert_eq!(f.ok(&["doctor"])["schema_version"], 4);
     }
 }
 
@@ -1868,6 +1871,591 @@ fn revision_bound_receipts_survive_review_recovery() {
     }
 }
 
+fn import_fixture(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("chapters")).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@localhost"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(
+        root.join("chapters/one.md"),
+        "---\nid: one\ntitle: One\ntags: [test]\n---\nCaptured [literal](sc-does-not-exist).\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("README.md"), "# Overview\n").unwrap();
+    std::fs::write(root.join("run.sh"), "#!/bin/sh\necho source\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    std::fs::write(
+        root.join(".gitattributes"),
+        "chapters/one.md export-ignore\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-qm", "source"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+fn plan_import(
+    f: &Fixture,
+    repo: &std::path::Path,
+    name: &str,
+    profile: Option<&std::path::Path>,
+) -> PathBuf {
+    let plan = f
+        .dir
+        .path()
+        .join(format!("{name}-{}.json", uuid::Uuid::new_v4()));
+    let mut args = vec![
+        "import",
+        "plan",
+        "git",
+        repo.to_str().unwrap(),
+        "--root",
+        ".",
+        "--rev",
+        "HEAD",
+        "--source",
+        name,
+        "--out",
+        plan.to_str().unwrap(),
+    ];
+    if let Some(path) = profile {
+        args.extend(["--profile-file", path.to_str().unwrap()]);
+    } else {
+        args.extend(["--profile", "handbook"]);
+    }
+    f.ok(&args);
+    plan
+}
+fn persistent_files(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, String> {
+    fn walk(root: &std::path::Path, out: &mut std::collections::BTreeMap<PathBuf, String>) {
+        for e in std::fs::read_dir(root).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out)
+            } else {
+                out.insert(p.clone(), scrolls::model::digest(std::fs::read(p).unwrap()));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, &mut out);
+    out
+}
+#[test]
+fn profile_plan_readonly_apply_ownership_multiple_sources_and_export() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let root = f.dir.path().join("store");
+    let before = persistent_files(&root);
+    let plan = plan_import(&f, &repo, "book", None);
+    assert_eq!(persistent_files(&root), before);
+    let plan2 = plan_import(&f, &repo, "book", None);
+    let read =
+        |p: &PathBuf| -> Value { serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap() };
+    assert_eq!(read(&plan), read(&plan2));
+    f.ok(&[
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+        "--op-id",
+        "book",
+        "--dry-run",
+    ]);
+    assert_eq!(persistent_files(&root), before);
+    let args = ["import", "apply", plan.to_str().unwrap(), "--op-id", "book"];
+    let result = f.ok(&args);
+    assert_eq!(result["coverage"]["documents"], 2);
+    assert_eq!(f.ok(&args), result);
+    let id = scrolls::source_import::record_id("book", "chapter/one");
+    let view = f.ok(&["show", "book:chapter/one", "--provenance"]);
+    assert_eq!(view["record"]["id"], id);
+    assert_eq!(view["provenance"]["membership"]["path"], "chapters/one.md");
+    assert!(f.ok(&["lint"])["errors"].as_array().unwrap().is_empty());
+    f.fail(
+        &["edit", &id, "--expect", "1", "--body", "changed"],
+        "source_ownership",
+    );
+    f.fail(
+        &["status", &id, "archived", "--expect", "1"],
+        "source_ownership",
+    );
+    let note = f.ok(&[
+        "new",
+        "note",
+        "--title",
+        "Local interpretation",
+        "--body",
+        "",
+    ]);
+    let note = note["id"].as_str().unwrap();
+    f.ok(&["link", &id, "related", note, "--expect", "1"]);
+    assert_eq!(f.ok(&["show", &id])["record"]["revision"], 2);
+    f.ok(&["unlink", &id, "related", note, "--expect", "2"]);
+    let batch=f.batch_file(json!([{"op":"new","handle":"k","kind":"knowledge","title":"Interpretation"},{"op":"link","from":"book:chapter/one","rel":"supports","to":"$k","expect":3}]));
+    let p = f.ok(&["batch", batch.to_str().unwrap()]);
+    let b = p["branch"].as_str().unwrap();
+    f.ok(&["review", "accept", b, "--review-token", &f.review_token(b)]);
+    let plan_other = plan_import(&f, &repo, "other", None);
+    f.ok(&[
+        "import",
+        "apply",
+        plan_other.to_str().unwrap(),
+        "--op-id",
+        "other",
+    ]);
+    f.fail(&["show", "chapter:one"], "book:chapter/one");
+    assert_eq!(
+        f.ok(&["show", "other:chapter:one"])["record"]["kind"],
+        "evidence"
+    );
+    let out = f.dir.path().join("export");
+    f.ok(&["render", "--out", out.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(out.join("sources/book/chapters/one.md")).unwrap(),
+        std::fs::read(repo.join("chapters/one.md")).unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(out.join("sources/book/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(out.join("SCROLLS-MANIFEST.json")).unwrap()).unwrap();
+    let normalized =
+        std::fs::read_to_string(out.join(manifest["records"][&id].as_str().unwrap())).unwrap();
+    assert!(normalized.contains("Captured [literal](sc-does-not-exist)."));
+    assert!(normalized.contains("Original source"));
+    f.fail(
+        &[
+            "render",
+            "--format",
+            "liskov",
+            "--out",
+            f.dir.path().join("bad-export").to_str().unwrap(),
+        ],
+        "generic sources",
+    );
+    f.ok(&args); // exact receipt still wins after main advances
+    let changed = read(&plan);
+    let corrupt = f.batch_file(changed);
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&corrupt).unwrap()).unwrap();
+    v["source"]["profile_hash"] = json!("tampered");
+    std::fs::write(&corrupt, serde_json::to_vec(&v).unwrap()).unwrap();
+    f.fail(
+        &[
+            "import",
+            "apply",
+            corrupt.to_str().unwrap(),
+            "--op-id",
+            "bad",
+        ],
+        "stale_plan",
+    );
+}
+#[test]
+fn profile_proposal_retry_rejection_and_schema_pinning() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let profile = f.dir.path().join("profile.yaml");
+    std::fs::write(
+        &profile,
+        scrolls::profile::HANDBOOK.replace("literal: evidence", "literal: entity"),
+    )
+    .unwrap();
+    let plan = plan_import(&f, &repo, "protected", Some(&profile));
+    std::fs::write(&profile, "edited after planning").unwrap();
+    let args = [
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+        "--op-id",
+        "first",
+    ];
+    let p = f.ok(&args);
+    let branch = p["branch"].as_str().unwrap();
+    assert!(branch.starts_with("proposal/"));
+    f.fail(&["show", "protected:chapter/one"], "unknown record");
+    assert_eq!(f.ok(&args)["proposal_status"], "pending");
+    let review = f.ok(&["review", branch]);
+    assert_eq!(review["imports"]["files"].as_array().unwrap().len(), 4);
+    assert!(review["imports"]["files"][0].get("bytes").is_none());
+    f.ok(&["review", "reject", branch, "--reason", "test"]);
+    assert_eq!(f.ok(&args)["proposal_status"], "rejected");
+    let p = f.ok(&[
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+        "--op-id",
+        "second",
+    ]);
+    let b = p["branch"].as_str().unwrap();
+    let schema = f.ok(&["schema", "show"]);
+    let mut next = schema["schema"].clone();
+    next["instructions"] = json!("changed interpretation");
+    let file = f.batch_file(next);
+    let change = f.ok(&[
+        "schema",
+        "apply",
+        file.to_str().unwrap(),
+        "--expect",
+        schema["schema_revision"].as_str().unwrap(),
+    ]);
+    let c = change["branch"].as_str().unwrap();
+    f.ok(&["review", "accept", c, "--review-token", &f.review_token(c)]);
+    f.fail(
+        &["review", "accept", b, "--review-token", &f.review_token(b)],
+        "stale_plan",
+    );
+    f.ok(&["review", "reject", b, "--reason", "replan"]);
+    std::fs::write(
+        &profile,
+        scrolls::profile::HANDBOOK.replace("literal: evidence", "literal: entity"),
+    )
+    .unwrap();
+    let plan = plan_import(&f, &repo, "protected", Some(&profile));
+    let p = f.ok(&[
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+        "--op-id",
+        "third",
+    ]);
+    let b = p["branch"].as_str().unwrap();
+    f.ok(&["review", "accept", b, "--review-token", &f.review_token(b)]);
+    assert_eq!(
+        f.ok(&["show", "protected:chapter/one"])["record"]["kind"],
+        "entity"
+    );
+}
+#[test]
+fn profile_readonly_rejects_dirty_journal_wrong_actor_and_stale_main() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let plan = plan_import(&f, &repo, "book", None);
+    f.fail(
+        &[
+            "--actor",
+            "bob",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+            "--op-id",
+            "wrong",
+        ],
+        "actor",
+    );
+    f.ok(&["new", "note", "--title", "Advance", "--body", ""]);
+    f.fail(
+        &[
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+            "--op-id",
+            "stale",
+        ],
+        "stale_plan",
+    );
+    let root = f.dir.path().join("store");
+    std::fs::write(root.join("migration-journal.json"), "{}").unwrap();
+    let args = [
+        "import",
+        "plan",
+        "git",
+        repo.to_str().unwrap(),
+        "--root",
+        ".",
+        "--rev",
+        "HEAD",
+        "--source",
+        "book",
+        "--profile",
+        "handbook",
+        "--out",
+        plan.to_str().unwrap(),
+    ];
+    let before = persistent_files(&root);
+    f.fail(&args, "recovery_required");
+    assert_eq!(before, persistent_files(&root));
+    std::fs::remove_file(root.join("migration-journal.json")).unwrap();
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.sql("INSERT INTO metadata VALUES ('unexplained','1')")
+            .unwrap();
+    }
+    let before = persistent_files(&root);
+    f.fail(&args, "dirty");
+    assert_eq!(before, persistent_files(&root));
+}
+
+#[test]
+fn migration_journal_recovers_only_owned_temporary_state() {
+    for advanced in [false, true] {
+        let f = Fixture::new();
+        let root = f.dir.path().join("store");
+        let main;
+        {
+            let s = Store::open(&root, &dolt(), false).unwrap();
+            s.checkout("main").unwrap();
+            s.transaction("DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members; REPLACE INTO metadata VALUES ('schema','3');","format3 fixture","test").unwrap();
+            main = s.head("main").unwrap();
+            let branch = format!("migration/{}", uuid::Uuid::new_v4().simple());
+            let mut j = json!({"format":1,"branch":branch,"base":main,"target":null,"expected":{}});
+            std::fs::write(
+                root.join("migration-journal.json"),
+                serde_json::to_vec(&j).unwrap(),
+            )
+            .unwrap();
+            s.run(&["checkout", "-b", &branch, "main"]).unwrap();
+            s.sql("CREATE TABLE import_sources (id VARCHAR(128) PRIMARY KEY,payload LONGTEXT NOT NULL)").unwrap();
+            if advanced {
+                s.sql("CREATE TABLE import_files (id VARCHAR(128) PRIMARY KEY,payload LONGTEXT NOT NULL); CREATE TABLE import_members (id VARCHAR(128) PRIMARY KEY,payload LONGTEXT NOT NULL)").unwrap();
+                let mut expected = serde_json::Map::new();
+                s.sql("REPLACE INTO metadata VALUES ('schema','4')")
+                    .unwrap();
+                for t in [
+                    "records",
+                    "edges",
+                    "source_files",
+                    "metadata",
+                    "operations",
+                    "registry",
+                    "import_sources",
+                    "import_files",
+                    "import_members",
+                ] {
+                    let rows: std::collections::BTreeMap<String, String> = s
+                        .sql(&format!("SELECT id,payload FROM {t} ORDER BY id"))
+                        .unwrap()
+                        .iter()
+                        .map(|r| {
+                            (
+                                r["id"].as_str().unwrap().into(),
+                                r["payload"].as_str().unwrap().into(),
+                            )
+                        })
+                        .collect();
+                    expected.insert(
+                        t.into(),
+                        json!(scrolls::model::digest(serde_json::to_vec(&rows).unwrap())),
+                    );
+                }
+                j["expected"] = json!(expected);
+                s.transaction(
+                    &put("metadata", "migration_owner", &j).unwrap(),
+                    "migration fixture",
+                    "test",
+                )
+                .unwrap();
+                j["target"] = json!(s.head(&branch).unwrap());
+                std::fs::write(
+                    root.join("migration-journal.json"),
+                    serde_json::to_vec(&j).unwrap(),
+                )
+                .unwrap();
+                s.checkout("main").unwrap();
+                s.run(&["merge", "--ff-only", &branch]).unwrap();
+            }
+        }
+        let data = f.ok(&["doctor"]);
+        assert_eq!(data["schema_version"], if advanced { 4 } else { 3 });
+        assert!(!root.join("migration-journal.json").exists());
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        if !advanced {
+            assert_eq!(s.head("main").unwrap(), main);
+        }
+        assert!(
+            !s.branches()
+                .unwrap()
+                .iter()
+                .any(|b| b.starts_with("migration/"))
+        );
+    }
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    let main;
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        main = s.head("main").unwrap();
+        let branch = format!("migration/{}", uuid::Uuid::new_v4().simple());
+        let j = json!({"format":1,"branch":branch,"base":main,"target":null});
+        std::fs::write(
+            root.join("migration-journal.json"),
+            serde_json::to_vec(&j).unwrap(),
+        )
+        .unwrap();
+        s.run(&["checkout", "-b", &branch, "main"]).unwrap();
+        s.sql("REPLACE INTO metadata VALUES ('unexpected','true')")
+            .unwrap();
+    }
+    f.fail(&["doctor"], "unexpected migration working set");
+    assert!(root.join("migration-journal.json").exists());
+}
+
+#[test]
+fn prepared_import_rolls_back_all_collections_and_receipt() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let plan = plan_import(&f, &repo, "book", None);
+    let plan: scrolls::source_import::Plan =
+        serde_json::from_slice(&std::fs::read(plan).unwrap()).unwrap();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    s.checkout("main").unwrap();
+    let before = s.graph().unwrap();
+    let head = s.head("main").unwrap();
+    let c = scrolls::source_import::build(&before, &plan.source).unwrap();
+    let sql = scrolls::storage::graph_changes(&before, &c.graph).unwrap()
+        + &scrolls::source_import::persist(&c).unwrap()
+        + &put(
+            "operations",
+            "failed-import",
+            &json!({"result":"must not persist"}),
+        )
+        .unwrap()
+        + "INSERT INTO missing_table VALUES (1);";
+    assert!(
+        s.transaction(&sql, "failed prepared import", "alice")
+            .is_err()
+    );
+    s.clean().unwrap();
+    assert_eq!(s.head("main").unwrap(), head);
+    assert!(s.graph().unwrap().records.is_empty());
+    for table in ["import_sources", "import_files", "import_members"] {
+        assert!(s.rows::<Value>(table).unwrap().is_empty());
+    }
+    assert!(
+        s.one::<Value>("operations", "failed-import")
+            .unwrap()
+            .is_none()
+    );
+}
+#[test]
+fn custom_research_import_cli_without_additional_fields() {
+    let f = Fixture {
+        dir: tempfile::tempdir().unwrap(),
+    };
+    f.ok(&[
+        "init",
+        "--schema",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/research.yaml"),
+    ]);
+    let schema_before = f.ok(&["schema", "show"]);
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.transaction("DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members; REPLACE INTO metadata VALUES ('schema','3');","format3 custom fixture","test").unwrap();
+    }
+    f.ok(&["migrate"]);
+    assert_eq!(f.ok(&["schema", "show"]), schema_before);
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let mut p: Value = serde_yaml::from_str(scrolls::profile::HANDBOOK).unwrap();
+    for r in p["documents"].as_array_mut().unwrap() {
+        r["record"]["kind"] = json!({"literal":"trial"});
+        r["record"]["fields"] = json!({"count":{"literal":0}});
+    }
+    let profile = f.batch_file(p);
+    let plan = plan_import(&f, &repo, "research", Some(&profile));
+    f.ok(&[
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+        "--op-id",
+        "research",
+    ]);
+    let r = f.ok(&["show", "research:chapter/one", "--provenance"]);
+    assert_eq!(r["record"]["fields"], json!({"count":0,"replicated":false}));
+    assert_eq!(
+        r["provenance"]["membership"]["metadata"]["tags"],
+        json!(["test"])
+    );
+}
+
+#[test]
+fn import_namespace_races_are_serialized() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let profile = f.dir.path().join("protected.yaml");
+    std::fs::write(
+        &profile,
+        scrolls::profile::HANDBOOK.replace("literal: evidence", "literal: entity"),
+    )
+    .unwrap();
+    let first = plan_import(&f, &repo, "raced", Some(&profile));
+    std::fs::write(
+        &profile,
+        scrolls::profile::HANDBOOK
+            .replace("literal: evidence", "literal: entity")
+            .replace("Handbook overview", "Changed overview"),
+    )
+    .unwrap();
+    let second = plan_import(&f, &repo, "raced", Some(&profile));
+    let children: Vec<_> = [(&first, "first"), (&second, "second")]
+        .into_iter()
+        .map(|(plan, op)| {
+            f.command(&["import", "apply", plan.to_str().unwrap(), "--op-id", op])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(outputs.iter().filter(|o| o.status.success()).count(), 1);
+    let failed = outputs.iter().find(|o| !o.status.success()).unwrap();
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("source_update_unsupported"));
+    assert_eq!(f.ok(&["proposals"]).as_array().unwrap().len(), 1);
+    assert!(
+        f.ok(&["doctor"])["import_sources"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn historical_checkout_cannot_bypass_newer_main_writer_fence() {
     let f = Fixture::new();
@@ -1889,4 +2477,100 @@ fn historical_checkout_cannot_bypass_newer_main_writer_fence() {
         &["new", "note", "--title", "Forbidden", "--body", ""],
         "unsupported store format 99",
     );
+}
+
+#[test]
+fn migration_recovery_preserves_foreign_rows_in_new_tables() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction("DROP TABLE import_sources; DROP TABLE import_files; DROP TABLE import_members; REPLACE INTO metadata VALUES ('schema','3');","old format fixture","test").unwrap();
+        let base = s.head("main").unwrap();
+        let branch = format!("migration/{}", uuid::Uuid::new_v4().simple());
+        let j = json!({"format":1,"base":base,"branch":branch,"target":null});
+        std::fs::write(
+            root.join("migration-journal.json"),
+            serde_json::to_vec(&j).unwrap(),
+        )
+        .unwrap();
+        s.run(&["checkout", "-b", &branch, "main"]).unwrap();
+        s.sql("CREATE TABLE import_sources (id VARCHAR(128) PRIMARY KEY,payload LONGTEXT NOT NULL); INSERT INTO import_sources VALUES ('foreign','{}');").unwrap();
+    }
+    f.fail(&["doctor"], "unexpected migration table data");
+    assert!(root.join("migration-journal.json").exists());
+}
+
+#[test]
+fn readonly_snapshot_checks_recovery_after_acquiring_the_lock() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    let lock = std::fs::File::open(root.join("lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    std::fs::write(root.join("review-journal.json"), "{}").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader_root = root.clone();
+    let reader = std::thread::spawn(move || {
+        let result = Store::open_readonly(&reader_root, &dolt())
+            .map(drop)
+            .map_err(|e| e.to_string());
+        send.send(result).unwrap();
+    });
+    assert!(matches!(
+        receive.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    // The writer completes recovery before releasing its lock; the reader sees
+    // that completed state, rather than racing its temporary journal.
+    std::fs::remove_file(root.join("review-journal.json")).unwrap();
+    fs2::FileExt::unlock(&lock).unwrap();
+    receive
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    reader.join().unwrap();
+}
+
+#[test]
+fn imported_file_key_collision_never_overwrites_another_tuple() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let plan = plan_import(&f, &repo, "book", None);
+    let parsed: scrolls::source_import::Plan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let root = f.dir.path().join("store");
+    let key;
+    let foreign = json!({"source_id":"other","file":{"path":"foreign"}});
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let g = s.graph().unwrap();
+        let c = scrolls::source_import::build(&g, &parsed.source).unwrap();
+        key = c.files[0].key();
+        s.transaction(
+            &put("import_files", &key, &foreign).unwrap(),
+            "synthetic collision fixture",
+            "test",
+        )
+        .unwrap();
+    }
+    let plan = plan_import(&f, &repo, "book", None);
+    f.fail(
+        &[
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+            "--op-id",
+            "collision",
+        ],
+        "duplicate",
+    );
+    let s = Store::open(&root, &dolt(), false).unwrap();
+    s.checkout("main").unwrap();
+    assert_eq!(s.one::<Value>("import_files", &key).unwrap(), Some(foreign));
+    assert!(s.graph().unwrap().records.is_empty());
+    assert!(s.one::<Value>("operations", "collision").unwrap().is_none());
+    s.clean().unwrap();
 }

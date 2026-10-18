@@ -93,7 +93,10 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
                 }
             }
         }
-        for cap in re.captures_iter(&r.body) {
+        for cap in re
+            .captures_iter(&r.body)
+            .filter(|_| !g.import_members.contains_key(&r.id))
+        {
             if !g.records.contains_key(&cap[1]) {
                 out.insert(format!("{}:body-link:{}", r.id, &cap[1]));
             }
@@ -141,6 +144,7 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
     out
 }
 pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) -> Result<()> {
+    crate::source_import::ownership(before, after)?;
     // Frozen rows and assertion owners remain immutable, including at review.
     for (id, old) in &before.records {
         if old.frozen {
@@ -253,6 +257,9 @@ pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) 
     Ok(())
 }
 pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
+    if g.import_members.contains_key(id) {
+        return;
+    }
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     let body = g.records[id].body.clone();
     let beads = regex::Regex::new(r"\]\((beads://[^)\s]+)\)").unwrap();

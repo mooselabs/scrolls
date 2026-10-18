@@ -25,6 +25,387 @@ pub struct Store {
     _lock: File,
 }
 impl Store {
+    /// Open without recovery, branch checkout, configuration writes or initialization.
+    pub fn open_readonly(root: &Path, binary: &Path) -> Result<Self> {
+        let root = fs::canonicalize(root).context("store missing; run init first")?;
+        let lock = OpenOptions::new().read(true).open(root.join("lock"))?;
+        lock.lock_exclusive()?;
+        // Check recovery state only after the previous writer has released its lock.
+        for journal in ["review-journal.json", "migration-journal.json"] {
+            if root.join(journal).exists() {
+                bail!("recovery_required: outstanding {journal}; run doctor before planning");
+            }
+        }
+        let s = Self {
+            db: root.join("dolt"),
+            root,
+            binary: fs::canonicalize(binary)?,
+            _lock: lock,
+        };
+        let version = s.run(&["version"])?;
+        if version.lines().next() != Some(format!("dolt version {DOLT_VERSION}").as_str()) {
+            bail!("Dolt {DOLT_VERSION} required");
+        }
+        s.clean()?;
+        // Inspect all branch working sets; a dirty inactive branch is not a snapshot.
+        if !s
+            .sql("SELECT * FROM dolt_branches WHERE dirty = 1")?
+            .is_empty()
+        {
+            bail!("dirty_state: resolve dirty branches before planning");
+        }
+        Ok(s)
+    }
+    pub fn rows_at<T: DeserializeOwned>(&self, table: &str, rev: &str) -> Result<Vec<T>> {
+        self.sql(&format!(
+            "SELECT payload FROM {table} AS OF {} ORDER BY id",
+            revision_literal(rev)
+        ))?
+        .into_iter()
+        .map(|v| {
+            Ok(serde_json::from_str(
+                v["payload"].as_str().context("missing payload")?,
+            )?)
+        })
+        .collect()
+    }
+    pub fn one_at<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        id: &str,
+        rev: &str,
+    ) -> Result<Option<T>> {
+        self.sql(&format!(
+            "SELECT payload FROM {table} AS OF {} WHERE id={}",
+            revision_literal(rev),
+            literal(id)
+        ))?
+        .first()
+        .map(|v| {
+            Ok(serde_json::from_str(
+                v["payload"].as_str().context("missing payload")?,
+            )?)
+        })
+        .transpose()
+    }
+    fn import_rows<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        rev: Option<&str>,
+        key: fn(&T) -> String,
+    ) -> Result<Vec<T>> {
+        let at = rev
+            .map(|r| format!(" AS OF {}", revision_literal(r)))
+            .unwrap_or_default();
+        self.sql(&format!("SELECT id,payload FROM {table}{at} ORDER BY id"))?
+            .into_iter()
+            .map(|row| {
+                let value: T =
+                    serde_json::from_str(row["payload"].as_str().context("import payload")?)?;
+                anyhow::ensure!(
+                    row["id"] == key(&value),
+                    "source_ownership: invalid keyed import row in {table}"
+                );
+                Ok(value)
+            })
+            .collect()
+    }
+    pub fn import_files(&self) -> Result<Vec<crate::source_import::File>> {
+        if self.one::<u32>("metadata", "schema")?.unwrap_or(1) < 4 {
+            return Ok(vec![]);
+        }
+        self.import_rows("import_files", None, crate::source_import::File::key)
+    }
+    pub fn graph_at(&self, rev: &str) -> Result<Graph> {
+        let format = self.one_at::<u32>("metadata", "schema", rev)?.unwrap_or(1);
+        let mut g = Graph {
+            schema: self
+                .one_at("metadata", "ontology", rev)?
+                .unwrap_or_default(),
+            records: self
+                .rows_at::<Record>("records", rev)?
+                .into_iter()
+                .map(|mut r| {
+                    r.normalize_metadata();
+                    (r.id.clone(), r)
+                })
+                .collect(),
+            edges: self
+                .rows_at::<Edge>("edges", rev)?
+                .into_iter()
+                .map(|e| (e.key(), e))
+                .collect(),
+            ..Graph::default()
+        };
+        if format >= 4 {
+            g.import_sources = self
+                .import_rows::<crate::source_import::Source>("import_sources", Some(rev), |s| {
+                    s.source_id.clone()
+                })?
+                .into_iter()
+                .map(|s| (s.source_id.clone(), s))
+                .collect();
+            g.import_members = self
+                .import_rows::<crate::source_import::Member>(
+                    "import_members",
+                    Some(rev),
+                    crate::source_import::Member::row_key,
+                )?
+                .into_iter()
+                .map(|m| (m.record_id.clone(), m))
+                .collect();
+        }
+        crate::source_import::validate(&g)?;
+        Ok(g)
+    }
+    fn migration_journal(&self, value: &Value) -> Result<()> {
+        let mut f = tempfile::NamedTempFile::new_in(&self.root)?;
+        f.write_all(&serde_json::to_vec(value)?)?;
+        f.as_file().sync_all()?;
+        f.persist(self.root.join("migration-journal.json"))?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+    fn migration_expected(&self, sql: &str) -> Result<Value> {
+        let tables = [
+            "records",
+            "edges",
+            "source_files",
+            "metadata",
+            "operations",
+            "registry",
+            "import_sources",
+            "import_files",
+            "import_members",
+        ];
+        let mut expected =
+            std::collections::BTreeMap::<String, std::collections::BTreeMap<String, String>>::new();
+        for table in tables {
+            let mut rows = std::collections::BTreeMap::new();
+            if !table.starts_with("import_") {
+                for row in self.sql(&format!("SELECT id,payload FROM {table} ORDER BY id"))? {
+                    let id = row["id"].as_str().context("migration row ID")?;
+                    if table != "metadata" || id != "migration_owner" {
+                        rows.insert(
+                            id.into(),
+                            row["payload"].as_str().context("migration payload")?.into(),
+                        );
+                    }
+                }
+            }
+            expected.insert(table.into(), rows);
+        }
+        let re = regex::Regex::new(
+            r"REPLACE INTO ([a-z_]+) \(id,payload\) VALUES \(CONVERT\(0x([0-9a-f]+) USING utf8mb4\),CONVERT\(0x([0-9a-f]+) USING utf8mb4\)\);",
+        )?;
+        for line in sql.lines().filter(|l| !l.trim().is_empty()) {
+            let cap = re.captures(line).context("unexpected migration SQL")?;
+            anyhow::ensure!(
+                cap.get(0).unwrap().as_str() == line,
+                "unexpected migration SQL suffix"
+            );
+            let id = String::from_utf8(hex::decode(&cap[2])?)?;
+            let payload = String::from_utf8(hex::decode(&cap[3])?)?;
+            expected
+                .get_mut(&cap[1])
+                .context("unexpected migration table")?
+                .insert(id, payload);
+        }
+        Ok(json!(
+            expected
+                .into_iter()
+                .map(|(table, rows)| (table, digest(serde_json::to_vec(&rows).unwrap())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        ))
+    }
+    fn verify_migration(&self, j: &Value, rev: &str) -> Result<()> {
+        let tables = self.sql(&format!("SHOW TABLES AS OF {}", revision_literal(rev)))?;
+        let names: std::collections::BTreeSet<_> = tables
+            .iter()
+            .filter_map(|row| {
+                row.as_object()?
+                    .values()
+                    .next()?
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        let wanted: std::collections::BTreeSet<_> = [
+            "records",
+            "edges",
+            "source_files",
+            "metadata",
+            "operations",
+            "registry",
+            "import_sources",
+            "import_files",
+            "import_members",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        anyhow::ensure!(
+            names == wanted,
+            "unexpected migration table inventory; preserve journal for inspection"
+        );
+        let expected = j["expected"]
+            .as_object()
+            .context("migration journal lacks expected state; inspect manually")?;
+        for (table, hash) in expected {
+            anyhow::ensure!(
+                [
+                    "records",
+                    "edges",
+                    "source_files",
+                    "metadata",
+                    "operations",
+                    "registry",
+                    "import_sources",
+                    "import_files",
+                    "import_members"
+                ]
+                .contains(&table.as_str()),
+                "invalid migration table"
+            );
+            let mut rows = std::collections::BTreeMap::<String, String>::new();
+            for row in self.sql(&format!(
+                "SELECT id,payload FROM {table} AS OF {} ORDER BY id",
+                revision_literal(rev)
+            ))? {
+                let id = row["id"].as_str().context("migration row")?;
+                if table != "metadata" || id != "migration_owner" {
+                    rows.insert(
+                        id.into(),
+                        row["payload"].as_str().context("migration payload")?.into(),
+                    );
+                }
+            }
+            anyhow::ensure!(
+                hash == &json!(digest(serde_json::to_vec(&rows)?)),
+                "unexpected migration content in {table}; preserve journal for inspection"
+            );
+        }
+        anyhow::ensure!(expected.len() == 9, "invalid migration expected state");
+        Ok(())
+    }
+    pub fn migrate_format4(&self, sql: &str, actor: &str) -> Result<()> {
+        self.clean()?;
+        let active = self.sql("SELECT active_branch() AS branch")?;
+        anyhow::ensure!(
+            active[0]["branch"] == "main",
+            "migration requires clean main"
+        );
+        let base = self.head("main")?;
+        let branch = format!("migration/{}", uuid::Uuid::new_v4().simple());
+        let mut journal = json!({"format":1,"branch":branch,"base":base,"target":null,"expected":self.migration_expected(sql)?});
+        self.migration_journal(&journal)?;
+        self.run(&["checkout", "-b", &branch, "main"])?;
+        // DDL survives SQL rollback in Dolt 2.2.0. Only this private branch sees it.
+        self.sql("CREATE TABLE import_sources (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE import_files (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE import_members (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL);")?;
+        self.transaction(
+            &(sql.to_owned() + &put("metadata", "migration_owner", &journal)?),
+            "migrate Scrolls format 4",
+            actor,
+        )?;
+        journal["target"] = json!(self.head(&branch)?);
+        self.migration_journal(&journal)?;
+        self.graph()?.schema.validate()?;
+        self.verify_migration(&journal, &self.head(&branch)?)?;
+        anyhow::ensure!(
+            self.head("main")? == base,
+            "migration main changed; inspect journal"
+        );
+        self.checkout("main")?;
+        self.run(&["merge", "--ff-only", &branch])?;
+        self.recover_migration()
+    }
+    pub fn recover_migration(&self) -> Result<()> {
+        let path = self.root.join("migration-journal.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        let j: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let branch = j["branch"].as_str().context("invalid migration journal")?;
+        let base = j["base"].as_str().context("invalid migration base")?;
+        anyhow::ensure!(
+            j["format"] == 1
+                && branch.starts_with("migration/")
+                && branch.len() == 42
+                && branch[10..].bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid migration journal; inspect manually"
+        );
+        let main = self.head("main")?;
+        let active = self.sql("SELECT active_branch() AS branch")?[0]["branch"]
+            .as_str()
+            .context("active branch")?
+            .to_string();
+        let branches = self.branches()?;
+        if !branches.iter().any(|b| b == branch) {
+            anyhow::ensure!(
+                active == "main" && (main == base || j["target"] == main),
+                "unexpected migration state; inspect journal"
+            );
+            self.clean()?;
+            fs::remove_file(path)?;
+            return Ok(());
+        }
+        let head = self.head(branch)?;
+        let owned = if head == base {
+            true
+        } else {
+            let marker: Option<Value> = self.one_at("metadata", "migration_owner", branch)?;
+            marker.is_some_and(|m| m["branch"] == branch && m["base"] == base && m["format"] == 1)
+                && (j["target"].is_null() || j["target"] == head)
+        };
+        anyhow::ensure!(
+            owned && (main == base || main == head) && ["main", branch].contains(&active.as_str()),
+            "unexpected migration state; preserve journal for inspection"
+        );
+        if head != base {
+            self.verify_migration(&j, &head)?;
+        }
+        if active == branch {
+            let dirty = self.sql("SELECT * FROM dolt_status")?;
+            anyhow::ensure!(
+                head == base || dirty.is_empty(),
+                "unexpected dirty migrated branch; inspect journal"
+            );
+            for row in &dirty {
+                anyhow::ensure!(
+                    ["import_sources", "import_files", "import_members"]
+                        .iter()
+                        .any(|n| row["table_name"] == *n)
+                        && row["status"] == "new table",
+                    "unexpected migration working set; inspect journal"
+                );
+            }
+            if !dirty.is_empty() {
+                // Dolt reset --hard leaves untracked tables. Drop only the new tables
+                // whose names/status were verified above, on our temporary branch.
+                for row in &dirty {
+                    let table = row["table_name"].as_str().context("migration table name")?;
+                    anyhow::ensure!(
+                        self.rows::<Value>(table)?.is_empty(),
+                        "unexpected migration table data in {table}; preserve journal for inspection"
+                    );
+                    self.sql(&format!(
+                        "DROP TABLE IF EXISTS {}",
+                        row["table_name"].as_str().context("migration table name")?
+                    ))?;
+                }
+                self.run(&["reset", "--hard"])?;
+            }
+            self.checkout("main")?;
+        } else {
+            self.clean()?;
+        }
+        // Never reset main, including after a successful fast-forward.
+        self.run(&["branch", "-D", branch])?;
+        fs::remove_file(path)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+
     pub fn open(root: &Path, binary: &Path, init: bool) -> Result<Self> {
         let binary = fs::canonicalize(binary).with_context(|| {
             format!(
@@ -76,14 +457,14 @@ impl Store {
             }
             fs::create_dir_all(&s.db)?;
             s.run(&["init", "--name", "Scrolls", "--email", "scrolls@localhost"])?;
-            s.sql("CREATE TABLE records (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE edges (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE source_files (id VARCHAR(2048) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE operations (id VARCHAR(256) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE registry (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL);")?;
+            s.sql("CREATE TABLE import_sources (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE import_files (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE import_members (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE records (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE edges (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE source_files (id VARCHAR(2048) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE operations (id VARCHAR(256) PRIMARY KEY, payload LONGTEXT NOT NULL); CREATE TABLE registry (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT NOT NULL);")?;
             let mut sql = String::new();
             sql.push_str(&put(
                 "metadata",
                 "ontology",
                 &crate::schema::Schema::default(),
             )?);
-            sql.push_str(&put("metadata", "schema", &3)?);
+            sql.push_str(&put("metadata", "schema", &4)?);
             sql.push_str(&put(
                 "metadata",
                 "store_id",
@@ -93,10 +474,11 @@ impl Store {
         }
         // A killed operation may leave a clean proposal or review branch checked out.
         // Never reset an unexplained working set, even on a temporary branch.
+        s.recover_migration()?;
         s.recover_review()?;
         s.clean()?;
         let schema: Option<u32> = s.one("metadata", "schema")?;
-        if !matches!(schema, Some(1..=3)) {
+        if !matches!(schema, Some(1..=4)) {
             bail!("unsupported store schema; doctor before upgrading");
         }
         Ok(s)
@@ -154,7 +536,7 @@ impl Store {
         Ok(String::from_utf8(out.stdout)?)
     }
     pub fn sql(&self, sql: &str) -> Result<Vec<Value>> {
-        let mut f = tempfile::NamedTempFile::new_in(&self.root)?;
+        let mut f = tempfile::NamedTempFile::new()?;
         f.write_all(sql.as_bytes())?;
         let raw = self.run(&[
             "sql",
@@ -188,6 +570,13 @@ impl Store {
     pub fn checkout(&self, branch: &str) -> Result<()> {
         self.clean()?;
         self.run(&["checkout", branch])?;
+        let format = self
+            .one::<u32>("metadata", "schema")?
+            .context("missing store format")?;
+        anyhow::ensure!(
+            format <= 4,
+            "unsupported store format {format}; use a newer Scrolls writer"
+        );
         Ok(())
     }
     pub fn revision(&self) -> Result<String> {
@@ -231,7 +620,8 @@ impl Store {
         .transpose()
     }
     pub fn graph(&self) -> Result<Graph> {
-        Ok(Graph {
+        let format = self.one::<u32>("metadata", "schema")?.unwrap_or(1);
+        let mut g = Graph {
             schema: self.one("metadata", "ontology")?.unwrap_or_default(),
             records: self
                 .rows::<Record>("records")?
@@ -246,7 +636,28 @@ impl Store {
                 .into_iter()
                 .map(|e| (e.key(), e))
                 .collect(),
-        })
+            ..Graph::default()
+        };
+        if format >= 4 {
+            g.import_sources = self
+                .import_rows::<crate::source_import::Source>("import_sources", None, |s| {
+                    s.source_id.clone()
+                })?
+                .into_iter()
+                .map(|s| (s.source_id.clone(), s))
+                .collect();
+            g.import_members = self
+                .import_rows::<crate::source_import::Member>(
+                    "import_members",
+                    None,
+                    crate::source_import::Member::row_key,
+                )?
+                .into_iter()
+                .map(|m| (m.record_id.clone(), m))
+                .collect();
+        }
+        crate::source_import::validate(&g)?;
+        Ok(g)
     }
     pub fn transaction(&self, changes: &str, message: &str, actor: &str) -> Result<()> {
         let sql = format!(
@@ -343,6 +754,14 @@ impl Store {
         f.sync_data()?;
         Ok(())
     }
+}
+/// Append immutable rows. Duplicate keys must fail rather than replace a tuple.
+pub fn insert<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
+    Ok(format!(
+        "INSERT INTO {table} (id,payload) VALUES ({},{});\n",
+        literal(id),
+        literal(&serde_json::to_string(value)?)
+    ))
 }
 pub fn put<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
     Ok(format!(

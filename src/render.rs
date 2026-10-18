@@ -66,6 +66,7 @@ fn legacy_status(r: &Record, old: &Record) -> Result<String> {
     .into())
 }
 pub struct Options<'a> {
+    pub import_files: &'a [crate::source_import::File],
     pub out: &'a Path,
     pub format: Format,
     pub dry_run: bool,
@@ -79,12 +80,17 @@ pub fn render(
     revision: &str,
     options: Options<'_>,
 ) -> Result<Value> {
+    crate::source_import::health(g, options.import_files)?;
     let Options {
         out,
         format,
         dry_run,
         beads,
+        import_files,
     } = options;
+    if format == Format::Liskov && !g.import_sources.is_empty() {
+        bail!("generic sources require native export; Liskov format is unsupported");
+    }
     if out.exists() || out.symlink_metadata().is_ok() {
         bail!("render destination must be fresh: {}", out.display());
     }
@@ -122,6 +128,19 @@ pub fn render(
     for f in files {
         safe_path(&f.path)?;
         insert_new(&mut output, f.path.clone(), STANDARD.decode(&f.bytes)?)?;
+    }
+    for f in import_files {
+        crate::source_import::path(&f.file.path)?;
+        crate::source_import::namespace(&f.source_id)?;
+        let bytes = STANDARD.decode(&f.file.bytes)?;
+        if digest(&bytes) != f.file.sha256 {
+            bail!("source file checksum mismatch: {}", f.file.path);
+        }
+        insert_new(
+            &mut output,
+            format!("sources/{}/{}", f.source_id, f.file.path),
+            bytes,
+        )?;
     }
     let mut locations = BTreeMap::new();
     let mut occupied = std::collections::BTreeSet::new();
@@ -319,8 +338,15 @@ pub fn render(
             }
         }
     }
+    if !g.import_sources.is_empty() {
+        insert_new(
+            &mut output,
+            "scrolls/imports.json".into(),
+            serde_json::to_vec_pretty(&crate::source_import::summary(g, import_files))?,
+        )?;
+    }
     let hashes: BTreeMap<_, _> = output.iter().map(|(p, b)| (p.clone(), digest(b))).collect();
-    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only});
+    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()});
     for path in output.keys() {
         safe_path(path)?;
         for ancestor in Path::new(path).ancestors().skip(1) {
@@ -343,11 +369,26 @@ pub fn render(
         fs::create_dir_all(target.parent().unwrap())?;
         let mut f = fs::File::create(&target)?;
         f.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(source) = import_files
+            .iter()
+            .find(|s| format!("sources/{}/{}", s.source_id, s.file.path) == *path)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &target,
+                fs::Permissions::from_mode(if source.file.mode == 0o100755 {
+                    0o755
+                } else {
+                    0o644
+                }),
+            )?;
+        }
         f.sync_all()?;
     }
     fs::write(
         stage.path().join("RENDERED"),
-        format!("Scrolls 0.2.0\nDolt revision: {revision}\n"),
+        format!("Scrolls 0.3.0\nDolt revision: {revision}\n"),
     )?;
     fs::write(
         stage.path().join("SCROLLS-MANIFEST.json"),
@@ -359,7 +400,9 @@ pub fn render(
         let _ = fs::remove_dir(&destination);
         return Err(e.into());
     }
-    Ok(json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only}))
+    Ok(
+        json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()}),
+    )
 }
 fn render_work_navigation(
     g: &Graph,
@@ -540,8 +583,25 @@ fn supplemental(
         r.status,
         r.revision,
         r.actor,
-        rendered_links(&r.body, path, locations)?
+        if g.import_members.contains_key(&r.id) {
+            r.body.clone()
+        } else {
+            rendered_links(&r.body, path, locations)?
+        }
     );
+    if let Some(m) = g.import_members.get(&r.id) {
+        let original = format!("sources/{}/{}", m.source_id, m.path);
+        text.push_str(&format!(
+            "\n[Original source]({}) · Source `{}` · Codec `{}`\n",
+            relative(path, &original),
+            m.source_id,
+            m.codec
+        ));
+        text.push_str(&format!(
+            "\nSource reference assertions: see [provenance]({}).\n",
+            relative(path, "scrolls/imports.json")
+        ));
+    }
     text.push_str("\n## Relationships\n\n");
     for e in g.edges.values().filter(|e| e.from == r.id || e.to == r.id) {
         let other = if e.from == r.id { &e.to } else { &e.from };

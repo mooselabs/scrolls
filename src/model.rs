@@ -150,6 +150,8 @@ pub struct Proposal {
 }
 #[derive(Clone, Default, Debug)]
 pub struct Graph {
+    pub import_sources: BTreeMap<String, crate::source_import::Source>,
+    pub import_members: BTreeMap<String, crate::source_import::Member>,
     pub schema: crate::schema::Schema,
     pub records: BTreeMap<String, Record>,
     pub edges: BTreeMap<String, Edge>,
@@ -159,20 +161,35 @@ impl Graph {
         if self.records.contains_key(name) {
             return Ok(name.into());
         }
-        let ids: Vec<_> = self
+        let aliases: Vec<_> = self
             .records
             .values()
-            .filter(|r| {
-                r.path.as_deref() == Some(name)
-                    || r.title.eq_ignore_ascii_case(name)
-                    || r.aliases.iter().any(|a| a == name)
-            })
+            .filter(|r| r.path.as_deref() == Some(name) || r.aliases.iter().any(|a| a == name))
             .map(|r| r.id.clone())
             .collect();
+        let ids = if aliases.is_empty() {
+            self.records
+                .values()
+                .filter(|r| r.title.eq_ignore_ascii_case(name))
+                .map(|r| r.id.clone())
+                .collect()
+        } else {
+            aliases
+        };
         match ids.as_slice() {
             [id] => Ok(id.clone()),
             [] => bail!("unknown record {name}; use search or list"),
-            _ => bail!("ambiguous alias {name}: {}", ids.join(", ")),
+            _ => bail!(
+                "ambiguous alias {name}: {}",
+                ids.iter()
+                    .map(|id| self
+                        .import_members
+                        .get(id)
+                        .map(|m| format!("{}:{}", m.source_id, m.key))
+                        .unwrap_or(id.clone()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
     pub fn add_edge(&mut self, from: &str, rel: &str, to: &str, why: &str, actor: &str) {

@@ -17,6 +17,12 @@ jobs:
       - run: cargo build --locked --release --all-targets
       - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
       - run: python3 scripts/verify-beads.py --binary target/release/scrolls
+      - uses: actions/checkout@v4
+        with:
+          repository: python/peps
+          ref: 6068058b896441388bbf22f2607ab681193f6a3d
+          path: .verification/peps
+      - run: python3 scripts/verify-imports.py .verification/peps --binary target/release/scrolls --out /tmp/scrolls-import-qualification
       - uses: actions/upload-artifact@v4
         with:
           name: scrolls-linux-amd64

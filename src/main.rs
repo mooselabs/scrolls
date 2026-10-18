@@ -47,7 +47,7 @@ fn main() {
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":2,"ok":false,"error":{"message":format!("{e:#}")}})
+                    serde_json::json!({"schema_version":2,"ok":false,"error":{"message":format!("{e:#}"),"diagnostic":scrolls::source_import::diagnostic(&e)}})
                 );
             } else {
                 eprintln!("scrolls: {e:#}");

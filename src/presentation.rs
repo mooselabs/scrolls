@@ -63,6 +63,12 @@ pub fn human(envelope: &Value) -> String {
                 serde_json::to_string_pretty(work).unwrap()
             ));
         }
+        if data["provenance"].is_object() {
+            out.push_str(&format!(
+                "\nSource provenance:\n{}\n",
+                serde_json::to_string_pretty(&data["provenance"]).unwrap()
+            ));
+        }
         out
     } else if let Some(items) = data["items"].as_array() {
         let mut out = String::new();
@@ -122,6 +128,12 @@ pub fn human(envelope: &Value) -> String {
                 out.push_str(&serde_json::to_string_pretty(&metadata).unwrap());
                 out.push('\n');
             }
+        }
+        if data["imports"].is_object() {
+            out.push_str(&format!(
+                "\nImported sources and files:\n{}\n",
+                serde_json::to_string_pretty(&data["imports"]).unwrap()
+            ));
         }
         if let Some(diff) = data["configuration_diff"].as_str() {
             out.push_str("\nConfiguration changes:\n");
