@@ -49,7 +49,10 @@ with tempfile.TemporaryDirectory(prefix="scrolls-beads-qualification-") as tmp:
     scrolls("beads", "bind", "work", "--directory", repo, "--bd", bd)
     reference = "work:" + issue_id
     evidence = scrolls("new", "evidence", "--title", "Readback", "--body", "Observed outcome")
-    knowledge = scrolls("new", "knowledge", "--title", "Decision rationale", "--body", "Current understanding", "--supports", evidence["id"])
+    batch = root / "knowledge.json"
+    batch.write_text(json.dumps([{"op":"new","handle":"k","kind":"knowledge","title":"Decision rationale","body":"Current understanding"},{"op":"link","from":evidence["id"],"rel":"supports","to":"$k","expect":1}]))
+    knowledge = scrolls("batch", batch)
+    knowledge["id"] = knowledge["handles"]["k"]
     branch = knowledge["branch"]
     scrolls("--proposal", branch, "status", knowledge["id"], "current", "--expect", "1")
     scrolls("--proposal", branch, "link", knowledge["id"], "implemented_by", reference, "--expect", "2")
@@ -57,7 +60,7 @@ with tempfile.TemporaryDirectory(prefix="scrolls-beads-qualification-") as tmp:
     review = scrolls("review", branch)
     scrolls("review", "accept", branch, "--review-token", review["review_token"])
     packet = scrolls("context", "--bead", reference)
-    assert any(x["id"] == knowledge["id"] and x["body"] == "Current understanding" for x in packet["items"])
+    assert any(x.get("id") == knowledge["id"] and "body" not in x for x in packet["items"])
     refreshed = scrolls("beads", "refresh", "--all")
     assert refreshed["results"][0]["status"] == "closed"
     assert refreshed["results"][0]["observed_at"]

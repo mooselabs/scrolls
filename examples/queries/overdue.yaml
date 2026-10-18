@@ -1,0 +1,5 @@
+op: date_plus
+field: last_reviewed
+days: {field: review_every}
+cmp: lt
+value: $now

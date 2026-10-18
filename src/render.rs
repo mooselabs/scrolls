@@ -280,7 +280,9 @@ pub fn render(
     insert_new(
         &mut output,
         "scrolls/graph.json".into(),
-        serde_json::to_vec_pretty(&json!({"records":normalized,"edges":g.edges}))?,
+        serde_json::to_vec_pretty(
+            &json!({"records":normalized,"edges":g.edges,"schema":g.schema,"schema_revision":g.schema.revision()}),
+        )?,
     )?;
     insert_new(
         &mut output,
@@ -345,7 +347,7 @@ pub fn render(
     }
     fs::write(
         stage.path().join("RENDERED"),
-        format!("Scrolls v1\nDolt revision: {revision}\n"),
+        format!("Scrolls 0.2.0\nDolt revision: {revision}\n"),
     )?;
     fs::write(
         stage.path().join("SCROLLS-MANIFEST.json"),
@@ -437,7 +439,12 @@ fn native_path(r: &Record) -> Result<String> {
         "unsafe native record id {}",
         r.id
     );
-    lifecycle(&r.kind)?;
+    anyhow::ensure!(
+        r.kind
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+        "unsafe kind"
+    );
     let date = r
         .created
         .get(..10)

@@ -18,10 +18,13 @@ fn record(value: &Value) -> String {
 }
 fn summary(value: &Value) -> String {
     format!(
-        "{}  {}/{}  {}\n",
+        "{} {} {}  {}/{}  revision {}  {}\n",
+        value["direction"].as_str().unwrap_or(""),
+        value["relation"].as_str().unwrap_or(""),
         value["id"].as_str().unwrap_or(""),
         value["kind"].as_str().unwrap_or(""),
         value["status"].as_str().unwrap_or(""),
+        value["revision"],
         value["title"].as_str().unwrap_or("")
     )
 }
@@ -31,6 +34,11 @@ pub fn human(envelope: &Value) -> String {
         let mut out = record(&data["record"]);
         if let Some(uri) = data["uri"].as_str() {
             out.push_str(&format!("\nReference: {uri}\n"));
+        }
+        if let Some(refs) = data["references"].as_array() {
+            for r in refs {
+                out.push_str(&summary(r));
+            }
         }
         if let Some(edges) = data["edges"].as_array() {
             if !edges.is_empty() {
@@ -58,6 +66,16 @@ pub fn human(envelope: &Value) -> String {
         out
     } else if let Some(items) = data["items"].as_array() {
         let mut out = String::new();
+        if let Some(guide) = data.get("guide") {
+            out.push_str(&format!(
+                "Schema guide:\n{}\n\n",
+                serde_yaml::to_string(guide).unwrap()
+            ));
+        }
+        if let Some(instructions) = data["instructions"].as_str() {
+            out.push_str(instructions);
+            out.push_str("\n\n");
+        }
         if let Some(bead) = data.get("bead") {
             out.push_str(&format!("Bead (cached): {}\n\n", bead));
         }
@@ -74,7 +92,7 @@ pub fn human(envelope: &Value) -> String {
             data["used_bytes"], data["budget_bytes"], data["omitted"]
         ));
         if data["over_budget_bytes"].as_u64().unwrap_or(0) > 0 {
-            out.push_str(&format!("Mandatory doctrine: {} bytes; budget exceeded by {} bytes. All mandatory bodies included.\n", data["mandatory_bytes"], data["over_budget_bytes"]));
+            out.push_str(&format!("Orientation: {} bytes; budget exceeded by {} bytes. All guide, instructions and pins included.\n", data["used_bytes"], data["over_budget_bytes"]));
         }
         if let Some(clauses) = data.get("undecided_doctrine") {
             out.push_str(&format!(
@@ -104,6 +122,10 @@ pub fn human(envelope: &Value) -> String {
                 out.push_str(&serde_json::to_string_pretty(&metadata).unwrap());
                 out.push('\n');
             }
+        }
+        if let Some(diff) = data["configuration_diff"].as_str() {
+            out.push_str("\nConfiguration changes:\n");
+            out.push_str(diff);
         }
         if let Some(diff) = data["graph_diff"].as_str() {
             out.push_str("\nGraph changes:\n");

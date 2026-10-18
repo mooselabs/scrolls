@@ -1,142 +1,101 @@
 use crate::model::*;
-use anyhow::{Result, bail};
+use crate::schema::neighbor;
+use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
-
 pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
+    let rule = g
+        .schema
+        .relations
+        .get(&e.rel)
+        .with_context(|| format!("unknown relation {}", e.rel))?;
     let a = g
         .records
         .get(&e.from)
-        .ok_or_else(|| anyhow::anyhow!("missing source {}", e.from))?;
-    let b = g.records.get(&e.to);
-    if e.to.starts_with("beads://") {
-        let target = crate::work_ref::BeadRef::parse(&e.to)?;
-        if target.uri() != e.to {
-            bail!("non-canonical Beads reference");
-        }
-        let valid = match e.rel.as_str() {
-            "related_work" => true,
-            "implemented_by" => matches!(a.kind.as_str(), "decision" | "knowledge" | "primer"),
-            "produced_by" => matches!(
-                a.kind.as_str(),
-                "evidence" | "knowledge" | "primer" | "note"
-            ),
-            "blocks" => a.kind == "question",
-            _ => false,
+        .with_context(|| format!("missing source {}", e.from))?;
+    ensure!(
+        rule.from.iter().any(|k| k == "*" || k == &a.kind),
+        "invalid {} source {}",
+        e.rel,
+        a.kind
+    );
+    ensure!(
+        !rule.reason || !e.why.trim().is_empty(),
+        "{} requires --why",
+        e.rel
+    );
+    ensure!(
+        rule.self_link || e.from != e.to,
+        "{} forbids self links",
+        e.rel
+    );
+    if let Some(b) = g.records.get(&e.to) {
+        ensure!(
+            rule.to.iter().any(|k| k == "*" || k == &b.kind),
+            "invalid {} target {}",
+            e.rel,
+            b.kind
+        );
+        ensure!(
+            !rule.same_kind || a.kind == b.kind,
+            "{} requires same kind",
+            e.rel
+        );
+    } else {
+        let ty = if e.to.starts_with("beads://") {
+            ensure!(
+                crate::work_ref::BeadRef::parse(&e.to)?.uri() == e.to,
+                "non-canonical Beads reference"
+            );
+            "beads"
+        } else if let Some(glob) = e.to.strip_prefix("glob:") {
+            crate::triggers::glob(&e.from, &e.rel, glob)?;
+            "glob"
+        } else if e.to.starts_with("https://") || e.to.starts_with("http://") {
+            "url"
+        } else {
+            "text"
         };
-        if !valid {
-            bail!("invalid Beads relation {} from {}", e.rel, a.kind);
-        }
-        return Ok(());
-    }
-    if e.rel == "blocks" && a.kind == "question" && !e.to.is_empty() {
-        return Ok(());
-    }
-    if e.rel == "applies_to" && a.kind == "doctrine" && e.to.starts_with("glob:") {
-        crate::triggers::glob(&a.id, "applies_to", &e.to[5..])?;
-        return Ok(());
-    }
-    if matches!(
-        e.rel.as_str(),
-        "related_work" | "implemented_by" | "produced_by"
-    ) {
-        bail!("work relation requires a qualified Beads reference");
-    }
-    let b = b.ok_or_else(|| anyhow::anyhow!("missing target {}", e.to))?;
-    let ak = if a.kind == "primer" {
-        "knowledge"
-    } else {
-        &a.kind
-    };
-    let bk = if b.kind == "primer" {
-        "knowledge"
-    } else {
-        &b.kind
-    };
-    let valid = match e.rel.as_str() {
-        "supports" => ak == "evidence" && matches!(bk, "knowledge" | "decision"),
-        "derived_from" => ak == "knowledge" && matches!(bk, "knowledge" | "evidence"),
-        "supersedes" => a.kind == b.kind && a.id != b.id,
-        "contradicts" => {
-            matches!(ak, "knowledge" | "decision") && matches!(bk, "knowledge" | "decision")
-        }
-        "about" => bk == "entity",
-        "applies_to" => ak == "doctrine" && bk == "entity",
-        "asks_about" => ak == "question",
-        "answers" => ak == "answer" && bk == "question",
-        "promoted_to" => {
-            matches!(ak, "answer" | "evidence") && matches!(bk, "decision" | "knowledge")
-        }
-        "depends_on" => ak == "decision" && bk == "decision",
-        "related" => true,
-        _ => false,
-    };
-    if !valid {
-        bail!("invalid {} relation {} -> {}", e.rel, a.kind, b.kind);
-    }
-    if matches!(e.rel.as_str(), "supersedes" | "depends_on" | "contradicts")
-        && e.why.trim().is_empty()
-    {
-        bail!("{} requires --why", e.rel);
+        ensure!(
+            !e.to.trim().is_empty() && rule.external.iter().any(|t| t == ty),
+            "missing or invalid target {} for {}",
+            e.to,
+            e.rel
+        );
     }
     Ok(())
 }
 pub fn lint(g: &Graph) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let supported: BTreeSet<_> = g
-        .edges
-        .values()
-        .filter(|e| e.rel == "supports")
-        .map(|e| e.to.as_str())
-        .collect();
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     for r in g.records.values() {
-        if r.kind == "doctrine" {
-            if let Err(err) = crate::triggers::parse(&r.id, &r.fields, "glob") {
-                out.insert(format!("{err:#}"));
+        if let Err(e) = g.schema.validate_record(r) {
+            out.insert(format!("{e:#}"));
+        }
+        if let Some(k) = g.schema.kinds.get(&r.kind) {
+            for c in &k.cardinality {
+                if (c.skip_frozen && r.frozen) || c.status.as_ref().is_some_and(|s| s != &r.status)
+                {
+                    continue;
+                }
+                let n = g
+                    .edges
+                    .values()
+                    .filter(|e| e.rel == c.relation)
+                    .filter_map(|e| neighbor(e, &r.id, c.direction))
+                    .filter(|id| {
+                        c.related_status
+                            .as_ref()
+                            .is_none_or(|s| g.records.get(*id).is_some_and(|r| &r.status == s))
+                    })
+                    .count();
+                if n < c.min || c.max.is_some_and(|m| n > m) {
+                    out.insert(format!("{}:{}", r.id, c.name));
+                }
             }
         }
-        if !lifecycle(&r.kind).is_ok_and(|l| l.contains(&r.status.as_str())) {
-            out.insert(format!("{}:invalid-status", r.id));
-        }
-        if r.owner.trim().is_empty() || r.title.trim().is_empty() || r.review_every == 0 {
-            out.insert(format!("{}:required-fields", r.id));
-        }
-        if !["high", "medium", "low"].contains(&r.confidence.as_str()) {
-            out.insert(format!("{}:confidence", r.id));
-        }
-        if matches!(r.kind.as_str(), "knowledge" | "primer" | "decision")
-            && !supported.contains(r.id.as_str())
-        {
-            out.insert(format!("{}:missing-support", r.id));
-        }
-        if r.kind == "answer"
-            && g.edges
-                .values()
-                .filter(|e| e.rel == "answers" && e.from == r.id)
-                .count()
-                != 1
-        {
-            out.insert(format!("{}:answer-question", r.id));
-        }
-        if r.kind == "question" && r.status == "answered" && !r.frozen {
-            let n = g
-                .edges
-                .values()
-                .filter(|e| {
-                    e.rel == "answers"
-                        && e.to == r.id
-                        && g.records
-                            .get(&e.from)
-                            .is_some_and(|a| a.status == "accepted")
-                })
-                .count();
-            if n != 1 {
-                out.insert(format!("{}:accepted-answer", r.id));
-            }
-        }
-        for c in re.captures_iter(&r.body) {
-            if !g.records.contains_key(&c[1]) {
-                out.insert(format!("{}:body-link:{}", r.id, &c[1]));
+        for cap in re.captures_iter(&r.body) {
+            if !g.records.contains_key(&cap[1]) {
+                out.insert(format!("{}:body-link:{}", r.id, &cap[1]));
             }
         }
     }
@@ -145,7 +104,10 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
             out.insert(format!("edge:{key}:{err}"));
         }
     }
-    for rel in ["depends_on", "supersedes"] {
+    for (rel, rule) in &g.schema.relations {
+        if rule.cycles {
+            continue;
+        }
         fn visit(
             id: &str,
             rel: &str,
@@ -170,7 +132,7 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
             false
         }
         let mut done = BTreeSet::new();
-        for id in g.edges.values().filter(|e| e.rel == rel).map(|e| &e.from) {
+        for id in g.edges.values().filter(|e| &e.rel == rel).map(|e| &e.from) {
             if visit(id, rel, g, &mut BTreeSet::new(), &mut done) {
                 out.insert(format!("{id}:{rel}-cycle"));
             }
@@ -179,23 +141,114 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
     out
 }
 pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) -> Result<()> {
+    // Frozen rows and assertion owners remain immutable, including at review.
+    for (id, old) in &before.records {
+        if old.frozen {
+            ensure!(
+                after.records.get(id) == Some(old),
+                "{id} is immutable imported compatibility history"
+            );
+        }
+    }
+    for (key, edge) in before.edges.iter().chain(after.edges.iter()) {
+        if before.edges.get(key) == after.edges.get(key) {
+            continue;
+        }
+        let source = before.records.get(&edge.from);
+        ensure!(
+            !source.is_some_and(|r| r.frozen),
+            "{} is immutable imported compatibility history",
+            edge.from
+        );
+        let both = before
+            .schema
+            .relations
+            .get(&edge.rel)
+            .or_else(|| after.schema.relations.get(&edge.rel))
+            .is_some_and(|r| r.affects == crate::schema::Affects::Both);
+        ensure!(
+            !both || !before.records.get(&edge.to).is_some_and(|r| r.frozen),
+            "{} is immutable imported compatibility history",
+            edge.to
+        );
+    }
+    // Historical debt can remain unchanged, but edits cannot create fresh field violations.
     for (id, r) in &after.records {
-        if r.kind == "doctrine" && before.records.get(id) != Some(r) {
-            crate::triggers::parse(id, &r.fields, "glob")?;
-            for edge in after
-                .edges
-                .values()
-                .filter(|e| e.from == *id && e.rel == "applies_to")
-            {
-                edge_valid(after, edge)?;
+        if before.records.get(id) != Some(r) {
+            let old = before.records.get(id);
+            if let Some(kind) = after.schema.kinds.get(&r.kind) {
+                for (field, rule) in &kind.fields {
+                    if rule.glob {
+                        if let Some(value) = r.fields.get(field) {
+                            rule.validate(value)
+                                .with_context(|| format!("{id}:field:{field}"))?;
+                        }
+                    }
+                }
+            }
+
+            if old.is_none_or(|old| {
+                old.fields != r.fields
+                    || old.kind != r.kind
+                    || old.title != r.title
+                    || old.owner != r.owner
+                    || old.confidence != r.confidence
+                    || old.review_every != r.review_every
+                    || old.last_reviewed != r.last_reviewed
+            }) {
+                after.schema.validate_record(r)?;
             }
         }
     }
-    let errors = lint(after);
+    for r in after.records.values() {
+        if let Some(kind) = after.schema.kinds.get(&r.kind) {
+            for c in &kind.cardinality {
+                if (c.skip_frozen && r.frozen) || c.status.as_ref().is_some_and(|s| s != &r.status)
+                {
+                    continue;
+                }
+                let count = |g: &Graph| {
+                    g.edges
+                        .values()
+                        .filter(|e| e.rel == c.relation)
+                        .filter_map(|e| neighbor(e, &r.id, c.direction))
+                        .filter(|id| {
+                            c.related_status
+                                .as_ref()
+                                .is_none_or(|s| g.records.get(*id).is_some_and(|r| &r.status == s))
+                        })
+                        .count()
+                };
+                let n = count(after);
+                if n < c.min || c.max.is_some_and(|m| n > m) {
+                    let same_rule = before
+                        .schema
+                        .kinds
+                        .get(&r.kind)
+                        .is_some_and(|k| k.cardinality.contains(c));
+                    ensure!(
+                        same_rule && count(before) == n,
+                        "{}:{}: relationship count {n} violates min {} max {:?}",
+                        r.id,
+                        c.name,
+                        c.min,
+                        c.max
+                    );
+                }
+            }
+        }
+    }
     let baseline = lint(before);
-    let new: Vec<_> = errors.difference(&baseline).cloned().collect();
+    let errors = lint(after);
+    let new: Vec<_> = errors.difference(&baseline).collect();
     if !new.is_empty() {
-        bail!("structural validation failed: {}", new.join("; "));
+        bail!(
+            "structural validation failed: {}",
+            new.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     Ok(())
 }
@@ -208,26 +261,28 @@ pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
         let target = crate::work_ref::BeadRef::parse(&cap[1])
             .map(|r| r.uri())
             .unwrap_or_else(|_| cap[1].into());
-        if !g.edges.values().any(|e| e.from == id && e.to == target) {
-            g.add_edge(id, "related_work", &target, "body link", actor);
+        if g.schema.body_links.contains_key("beads")
+            && !g.edges.values().any(|e| e.from == id && e.to == target)
+        {
+            let rel = g.schema.body_links["beads"].clone();
+            g.add_edge(id, &rel, &target, "body link", actor);
         }
     }
     for cap in re.captures_iter(&body) {
         let target = &cap[1];
-        if g.records.contains_key(target)
+        if g.schema.body_links.contains_key("local")
+            && g.records.contains_key(target)
             && !g
                 .edges
                 .values()
                 .any(|e| (e.from == id && e.to == target) || (e.from == target && e.to == id))
         {
-            g.add_edge(id, "related", target, "body link", actor);
+            let rel = g.schema.body_links["local"].clone();
+            g.add_edge(id, &rel, target, "body link", actor);
         }
     }
 }
 
-pub fn reference_relation(rel: &str) -> bool {
-    matches!(rel, "about" | "asks_about" | "related")
-}
 pub fn lint_routing(routing: &serde_json::Value) -> BTreeSet<String> {
     let mut errors = BTreeSet::new();
     match crate::triggers::routing_entries(routing) {

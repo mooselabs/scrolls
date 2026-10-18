@@ -58,6 +58,27 @@ impl Fixture {
             .unwrap()
             .into()
     }
+    fn batch_file(&self, ops: Value) -> PathBuf {
+        let path = self
+            .dir
+            .path()
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, serde_json::to_vec(&ops).unwrap()).unwrap();
+        path
+    }
+    fn batch(&self, ops: Value) -> Value {
+        let file = self.batch_file(ops);
+        self.ok(&["batch", file.to_str().unwrap()])
+    }
+    fn supported(&self, evidence: &str, title: &str) -> Value {
+        let rev = self.ok(&["show", evidence])["record"]["revision"].clone();
+        let mut result = self.batch(json!([
+            {"op":"new","kind":"knowledge","handle":"doc","title":title,"body":"text"},
+            {"op":"link","from":evidence,"rel":"supports","to":"$doc","expect":rev}
+        ]));
+        result["id"] = result["handles"]["doc"].clone();
+        result
+    }
     fn fail(&self, args: &[&str], message: &str) {
         let (ok, v) = self.call(args);
         assert!(!ok, "{args:?}: {v}");
@@ -112,11 +133,11 @@ fn retry_concurrency_stale_and_questions() {
         &["edit", id, "--expect", "1", "--body", "stale"],
         "stale edit",
     );
-    let q = f.ok(&["ask", "What now?"]);
+    let q = f.ok(&["new", "question", "--title", "What now?", "--body", ""]);
     let q = q["id"].as_str().unwrap();
-    let a = f.ok(&["answer", q, "Yes", "--expect", "1"]);
-    let a = a["id"].as_str().unwrap();
-    f.ok(&["accept", a, "--expect", "1", "--expect-question", "2"]);
+    let a=f.batch(json!([{"op":"new","kind":"answer","handle":"a","title":"Yes","body":"Yes"},{"op":"link","from":"$a","rel":"answers","to":q,"expect_to":1}]));
+    let a = a["handles"]["a"].as_str().unwrap();
+    f.batch(json!([{"op":"status","id":a,"state":"accepted","expect":1},{"op":"status","id":q,"state":"answered","expect":2}]));
     assert_eq!(f.ok(&["show", q])["record"]["status"], "answered");
     assert!(!f.ok(&["history", q]).as_array().unwrap().is_empty());
 }
@@ -127,25 +148,26 @@ fn proposals_isolation_merge_and_conflict() {
         "new", "evidence", "--title", "Evidence", "--body", "observed",
     ]);
     let e = e["id"].as_str().unwrap();
-    let args = [
-        "--op-id",
-        "knowledge-1",
-        "new",
-        "knowledge",
-        "--title",
-        "Knowledge",
-        "--body",
-        "supported",
-        "--supports",
-        e,
-    ];
+    let file=f.batch_file(json!([{"op":"new","handle":"doc","kind":"knowledge","title":"Knowledge","body":"supported"},{"op":"link","from":e,"rel":"supports","to":"$doc","expect":1}]));
+    let args = ["--op-id", "knowledge-1", "batch", file.to_str().unwrap()];
     let p = f.ok(&args);
     let branch = p["branch"].as_str().unwrap();
-    let id = p["id"].as_str().unwrap();
+    let id = p["handles"]["doc"].as_str().unwrap();
     assert_eq!(f.ok(&args), p);
     f.fail(&["show", id], "unknown record");
     f.ok(&["review", branch]);
-    f.fail(&["--role", "agent", "review", "accept", branch], "human");
+    f.fail(
+        &[
+            "--role",
+            "agent",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &f.review_token(branch),
+        ],
+        "human",
+    );
     f.ok(&[
         "--proposal",
         branch,
@@ -155,19 +177,34 @@ fn proposals_isolation_merge_and_conflict() {
         "--expect",
         "1",
     ]);
-    let token = f.review_token(branch);
-    f.ok(&["review", "accept", branch, "--review-token", &token]);
+    f.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &f.review_token(branch),
+    ]);
     assert_eq!(f.ok(&["show", id])["record"]["status"], "current");
     let p1 = f.ok(&["edit", id, "--expect", "2", "--body", "one"]);
     let p2 = f.ok(&["edit", id, "--expect", "2", "--body", "two"]);
     let b1 = p1["branch"].as_str().unwrap();
     let b2 = p2["branch"].as_str().unwrap();
-    let token = f.review_token(b1);
-    f.ok(&["review", "accept", b1, "--review-token", &token]);
+    f.ok(&[
+        "review",
+        "accept",
+        b1,
+        "--review-token",
+        &f.review_token(b1),
+    ]);
     let before = f.ok(&["show", id]);
-    let token = f.review_token(b2);
     f.fail(
-        &["review", "accept", b2, "--review-token", &token],
+        &[
+            "review",
+            "accept",
+            b2,
+            "--review-token",
+            &f.review_token(b2),
+        ],
         "conflict",
     );
     assert_eq!(f.ok(&["show", id]), before);
@@ -251,16 +288,7 @@ fn rollback_interruption_and_dirty_refusal() {
 fn failed_validation_preserves_main() {
     let f = Fixture::new();
     let e = f.ok(&["new", "evidence", "--title", "Evidence", "--body", "facts"]);
-    let p = f.ok(&[
-        "new",
-        "knowledge",
-        "--title",
-        "Knowledge",
-        "--body",
-        "text",
-        "--supports",
-        e["id"].as_str().unwrap(),
-    ]);
+    let p = f.supported(e["id"].as_str().unwrap(), "Knowledge");
     let branch = p["branch"].as_str().unwrap();
     let root = f.dir.path().join("store");
     {
@@ -271,10 +299,15 @@ fn failed_validation_preserves_main() {
         s.transaction("DELETE FROM edges;", "external invalid edit", "test")
             .unwrap();
     }
-    let token = f.review_token(branch);
     f.fail(
-        &["review", "accept", branch, "--review-token", &token],
-        "structural validation",
+        &[
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &f.review_token(branch),
+        ],
+        "missing-support",
     );
     f.fail(&["show", p["id"].as_str().unwrap()], "unknown record");
     f.ok(&["doctor"]);
@@ -438,7 +471,7 @@ fn committed_import_render_and_frozen_history() {
     }
     let q = f.ok(&["show", "Q-20261016-abcd"]);
     let q = q["record"]["id"].as_str().unwrap();
-    f.fail(&["answer", q, "invented", "--expect", "1"], "immutable");
+    f.fail(&["status", q, "answered", "--expect", "1"], "immutable");
     let out = f.dir.path().join("render");
     f.ok(&[
         "render",
@@ -514,30 +547,33 @@ fn committed_import_render_and_frozen_history() {
 #[test]
 fn reference_ownership_concurrency_proposals_and_retries() {
     let f = Fixture::new();
-    let entity = f.ok(&["new", "entity", "--title", "Shared", "--body", "entity"]);
-    let entity_id = entity["id"].as_str().unwrap();
-    let token = f.review_token(entity["branch"].as_str().unwrap());
+    let entity = f.ok(&["new", "entity", "--title", "Shared", "--body", ""]);
+    let id = entity["id"].as_str().unwrap();
     f.ok(&[
         "review",
         "accept",
         entity["branch"].as_str().unwrap(),
         "--review-token",
-        &token,
+        &f.review_token(entity["branch"].as_str().unwrap()),
     ]);
-    let baseline = f.ok(&["show", entity_id])["record"].clone();
+    let baseline = f.ok(&["show", id])["record"].clone();
     let mut children = vec![];
-    for actor in ["agent-one", "agent-two"] {
+    for actor in ["one", "two"] {
+        let file=f.batch_file(json!([{"op":"new","handle":"e","kind":"evidence","title":actor},{"op":"link","from":"$e","rel":"about","to":id}]));
         children.push(
             f.command(&[
-                "--actor", actor, "--role", "agent", "new", "evidence", "--title", actor, "--body",
-                "facts", "--about", entity_id,
+                "--actor",
+                actor,
+                "--role",
+                "agent",
+                "batch",
+                file.to_str().unwrap(),
             ])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
         );
     }
-    let mut evidence = vec![];
     for child in children {
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -545,76 +581,36 @@ fn reference_ownership_concurrency_proposals_and_retries() {
             "{}",
             String::from_utf8_lossy(&out.stdout)
         );
-        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(result["data"]["branch"], "main");
-        assert_eq!(result["data"]["records"].as_object().unwrap().len(), 1);
-        evidence.push(result["data"]["id"].as_str().unwrap().to_string());
     }
-    let mut branches = vec![];
-    for (n, e) in evidence.iter().enumerate() {
-        let result = f.ok(&[
-            "--role",
-            "agent",
-            "new",
-            "knowledge",
-            "--title",
-            &format!("independent {n}"),
-            "--body",
-            "supported",
-            "--supports",
-            e,
-            "--about",
-            entity_id,
-        ]);
-        assert!(result["records"].get(entity_id).is_none());
-        branches.push(result["branch"].as_str().unwrap().to_string());
-    }
-    for b in &branches {
-        let token = f.review_token(b);
-        f.ok(&["review", "accept", b, "--review-token", &token]);
-    }
-    assert_eq!(f.ok(&["show", entity_id])["record"], baseline);
-    let q = f.ok(&["--role", "agent", "ask", "Direct?", "--about", entity_id]);
-    assert_eq!(q["branch"], "main");
-    assert_eq!(q["records"].as_object().unwrap().len(), 1);
+    assert_eq!(f.ok(&["show", id])["record"], baseline);
     let e = f.ok(&[
-        "--role",
-        "agent",
         "new",
         "evidence",
         "--title",
-        "Body ref",
+        "Body",
         "--body",
-        &format!("[entity]({entity_id}#anchor)"),
+        &format!("[entity]({id})"),
     ]);
-    let id = e["id"].as_str().unwrap();
-    assert_eq!(e["branch"], "main");
-    assert_eq!(e["records"].as_object().unwrap().len(), 1);
-    let unlink = [
+    let eid = e["id"].as_str().unwrap();
+    let args = [
         "--op-id",
-        "unlink-reference",
+        "unlink-ref",
         "unlink",
-        id,
+        eid,
         "related",
-        entity_id,
+        id,
         "--expect",
         "1",
-        "--expect-to",
-        "1",
     ];
-    let removed = f.ok(&unlink);
-    assert_eq!(removed, f.ok(&unlink));
-    assert_eq!(removed["records"], json!({id:2}));
-    f.fail(
-        &["link", id, "related", entity_id, "--expect", "1"],
-        "stale",
-    );
+    assert_eq!(f.ok(&args), f.ok(&args));
+    assert!(f.ok(&["show", eid])["edges"].as_array().unwrap().is_empty());
+    f.fail(&["link", eid, "related", id, "--expect", "1"], "stale");
     f.fail(
         &[
             "link",
-            id,
+            eid,
             "related",
-            entity_id,
+            id,
             "--expect",
             "2",
             "--expect-to",
@@ -622,81 +618,27 @@ fn reference_ownership_concurrency_proposals_and_retries() {
         ],
         "stale",
     );
-    let link = [
-        "--op-id",
-        "link-reference",
+    {
+        let store = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        store.checkout("main").unwrap();
+        let mut r = store.graph().unwrap().records[id].clone();
+        r.frozen = true;
+        store
+            .transaction(&put("records", id, &r).unwrap(), "freeze fixture", "test")
+            .unwrap();
+    }
+    f.ok(&[
         "link",
-        id,
+        eid,
         "related",
-        entity_id,
+        id,
         "--expect",
         "2",
-    ];
-    let added = f.ok(&link);
-    assert_eq!(added, f.ok(&link));
-    assert_eq!(added["records"], json!({id:3}));
-    assert_eq!(f.ok(&["show", entity_id])["record"], baseline);
-    let protected = f.ok(&[
-        "--role",
-        "agent",
-        "edit",
-        entity_id,
-        "--expect",
-        "1",
-        "--body",
-        "protected",
-    ]);
-    assert_ne!(protected["branch"], "main");
-    let protected_link = f.ok(&["link", entity_id, "related", id, "--expect", "1"]);
-    assert_ne!(protected_link["branch"], "main");
-    f.fail(
-        &["link", &evidence[0], "supports", entity_id, "--expect", "2"],
-        "expect-to",
-    );
-    // A frozen target can be referenced, but never changed or made an assertion owner.
-    {
-        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
-        s.checkout("main").unwrap();
-        let mut frozen = s.graph().unwrap().records[entity_id].clone();
-        frozen.frozen = true;
-        s.transaction(
-            &put("records", entity_id, &frozen).unwrap(),
-            "fixture frozen history",
-            "test",
-        )
-        .unwrap();
-    }
-    let frozen = f.ok(&["show", entity_id])["record"].clone();
-    f.ok(&[
-        "unlink",
-        id,
-        "related",
-        entity_id,
-        "--expect",
-        "3",
         "--expect-to",
         "1",
     ]);
-    f.ok(&[
-        "link",
-        id,
-        "related",
-        entity_id,
-        "--expect",
-        "4",
-        "--expect-to",
-        "1",
-    ]);
-    f.ok(&["ask", "History?", "--about", entity_id]);
-    f.fail(
-        &["link", entity_id, "related", id, "--expect", "1"],
-        "immutable",
-    );
-    f.fail(
-        &["edit", entity_id, "--expect", "1", "--body", "illegal"],
-        "immutable",
-    );
-    assert_eq!(f.ok(&["show", entity_id])["record"], frozen);
+    f.fail(&["edit", id, "--expect", "1", "--body", "bad"], "immutable");
+    f.fail(&["link", id, "related", eid, "--expect", "1"], "immutable");
 }
 
 #[test]
@@ -768,15 +710,15 @@ fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
         ],
         "applies_to",
     );
-    let token = f.review_token(branch);
-    f.ok(&["review", "accept", branch, "--review-token", &token]);
-    let packet = f.ok(&["prime", "--for", "src/main.rs"]);
-    assert_eq!(packet["items"].as_array().unwrap().len(), 1);
-    assert!(packet["over_budget_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(
-        packet["used_bytes"],
-        serde_json::to_vec(&packet["items"]).unwrap().len()
-    );
+    f.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &f.review_token(branch),
+    ]);
+    let packet = f.ok(&["prime"]);
+    assert_eq!(packet["items"], json!([]));
     let invalid = f.ok(&["edit", id, "--expect", "2", "--body", "changed"]);
     let bad_branch = invalid["branch"].as_str().unwrap();
     {
@@ -791,9 +733,14 @@ fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
         )
         .unwrap();
     }
-    let token = f.review_token(bad_branch);
     f.fail(
-        &["review", "accept", bad_branch, "--review-token", &token],
+        &[
+            "review",
+            "accept",
+            bad_branch,
+            "--review-token",
+            &f.review_token(bad_branch),
+        ],
         "glob",
     );
     {
@@ -808,49 +755,58 @@ fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
         )
         .unwrap();
     }
-    f.fail(&["prime"], "glob");
-    f.fail(&["doctrine"], "glob");
+    f.ok(&["prime"]);
+    let query = f.batch_file(json!({"op":"applicability"}));
+    f.fail(&["query", "--file", query.to_str().unwrap()], "glob");
     assert!(
         f.call(&["lint"]).1["data"]["errors"]
             .to_string()
             .contains("glob")
     );
-    f.fail(&["status", id, "active", "--expect", "2"], "glob");
+    f.fail(
+        &[
+            "edit", id, "--body", "change", "--field", "glob=[", "--expect", "2",
+        ],
+        "glob",
+    );
 }
 
 #[test]
-fn prime_delivers_answer_attribution_and_audits_both_ids() {
+fn prime_pins_are_reviewed_and_audit_revisions() {
     let f = Fixture::new();
-    let q = f.ok(&["ask", "Accepted answer?"]);
-    let q = q["id"].as_str().unwrap();
-    let a = f.ok(&[
-        "--actor",
-        "bob",
-        "answer",
-        q,
-        "accepted text",
-        "--expect",
-        "1",
+    let r = f.ok(&[
+        "new",
+        "note",
+        "--title",
+        "Startup",
+        "--body",
+        &"read this".repeat(3000),
     ]);
-    let a = a["id"].as_str().unwrap();
-    let other = f.ok(&["answer", q, "alternative", "--expect", "2"]);
-    let other = other["id"].as_str().unwrap();
-    f.ok(&["accept", a, "--expect", "1", "--expect-question", "3"]);
-    let accepted = f.ok(&["show", a])["record"].clone();
-    let p = f.ok(&["--session", "paired", "prime"]);
-    assert_eq!(p["items"].as_array().unwrap().len(), 2);
-    assert_eq!(p["items"][0]["accepted_answer_id"], a);
-    assert_eq!(p["items"][1]["actor"], accepted["actor"]);
-    assert_eq!(p["items"][1]["revision"], accepted["revision"]);
-    assert!(!p["items"].to_string().contains(other));
-    let audit = f.ok(&["consumed", "--for-session", "paired"]);
-    assert!(audit.to_string().contains(q));
-    assert!(audit.to_string().contains(a));
-    let size = serde_json::to_vec(&p["items"]).unwrap().len();
-    assert_eq!(
-        f.ok(&["prime", "--budget", &(size - 1).to_string()])["omitted"],
-        json!([q, a])
-    );
+    let id = r["id"].as_str().unwrap();
+    let schema = f.ok(&["schema", "show"]);
+    let mut config = schema["schema"].clone();
+    config["pins"] = json!([id, id]);
+    let path = f.batch_file(config);
+    let p = f.ok(&[
+        "schema",
+        "apply",
+        path.to_str().unwrap(),
+        "--expect",
+        schema["schema_revision"].as_str().unwrap(),
+    ]);
+    assert_eq!(f.ok(&["prime"])["items"], json!([]));
+    f.ok(&[
+        "review",
+        "accept",
+        p["branch"].as_str().unwrap(),
+        "--review-token",
+        &f.review_token(p["branch"].as_str().unwrap()),
+    ]);
+    let p = f.ok(&["--session", "pinned", "prime", "--budget", "1"]);
+    assert_eq!(p["items"].as_array().unwrap().len(), 1);
+    assert!(p["over_budget_bytes"].as_u64().unwrap() > 0);
+    let audit = f.ok(&["consumed", "--for-session", "pinned"]);
+    assert_eq!(audit[0]["record_revisions"][id], 1);
 }
 
 #[test]
@@ -880,16 +836,7 @@ fn work_references_obey_review_retry_and_render_contracts() {
         f.ok(&["show", id])["related_work"][0]["bead"]["resolution"],
         "unresolved"
     );
-    let knowledge = f.ok(&[
-        "new",
-        "knowledge",
-        "--title",
-        "Conclusion",
-        "--body",
-        "reason",
-        "--supports",
-        id,
-    ]);
+    let knowledge = f.supported(id, "Conclusion");
     let kid = knowledge["id"].as_str().unwrap();
     let proposal = knowledge["branch"].as_str().unwrap();
     f.ok(&[
@@ -913,8 +860,13 @@ fn work_references_obey_review_retry_and_render_contracts() {
         &["--proposal", proposal, "beads", "publish", target],
         "main",
     );
-    let token = f.review_token(proposal);
-    f.ok(&["review", "accept", proposal, "--review-token", &token]);
+    f.ok(&[
+        "review",
+        "accept",
+        proposal,
+        "--review-token",
+        &f.review_token(proposal),
+    ]);
     assert_eq!(
         f.ok(&["beads", "refs", target])["documents"]
             .as_array()
@@ -989,6 +941,7 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
     let f = Fixture::new();
     let e = f.ok(&["new", "evidence", "--title", "Source", "--body", "facts"]);
     let id = e["id"].as_str().unwrap();
+    let pending = f.ok(&["new", "entity", "--title", "Billing", "--body", ""]);
     // Construct a v1 fixture without changing any record or original bytes.
     {
         let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
@@ -996,7 +949,10 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
         s.transaction(&(put("metadata","schema",&1).unwrap()+"DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"),"v1 fixture","test").unwrap();
     }
     let before = f.ok(&["show", id]);
-    let pending = f.ok(&["new", "entity", "--title", "Billing", "--body", ""]);
+    f.fail(
+        &["new", "note", "--title", "blocked", "--body", ""],
+        "migrate",
+    );
     f.fail(&["migrate"], "pending proposals");
     f.ok(&[
         "review",
@@ -1008,9 +964,9 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
     f.ok(&["--dry-run", "migrate"]);
     assert_eq!(f.ok(&["doctor"])["schema_version"], 1);
     let migrated = f.ok(&["--op-id", "migration", "migrate"]);
-    assert_eq!(migrated["schema_version"], 2);
+    assert_eq!(migrated["schema_version"], 3);
     assert_eq!(migrated, f.ok(&["--op-id", "migration", "migrate"]));
-    assert_eq!(f.ok(&["doctor"])["schema_version"], 2);
+    assert_eq!(f.ok(&["doctor"])["schema_version"], 3);
     assert_eq!(before["record"], f.ok(&["show", id])["record"]);
     let uri = format!(
         "scrolls://{}/{}",
@@ -1029,6 +985,413 @@ fn schema_upgrade_preserves_records_and_refuses_pending_proposals() {
     f.ok(&["new", "entity", "--title", "After migration", "--body", ""]);
     assert_eq!(migrated, f.ok(&["--op-id", "migration", "migrate"]));
     assert_eq!(f.ok(&["migrate"])["already_current"], true);
+}
+
+#[test]
+fn custom_ontologies_complete_cli_roundtrip_and_configuration_revalidation() {
+    for schema_file in ["handbook.yaml", "research.yaml"] {
+        let f = Fixture {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join(schema_file);
+        f.ok(&["init", "--schema", schema_path.to_str().unwrap()]);
+        let (id, branch) = if schema_file == "handbook.yaml" {
+            let p = f.ok(&[
+                "--role",
+                "agent",
+                "new",
+                "page",
+                "--title",
+                "Welcome",
+                "--body",
+                "Read me",
+                "--field",
+                "tags=[\"intro\"]",
+            ]);
+            (
+                p["id"].as_str().unwrap().to_string(),
+                p["branch"].as_str().unwrap().to_string(),
+            )
+        } else {
+            let p=f.batch(json!([
+                {"op":"new","handle":"trial","kind":"trial","title":"Measurement","fields":{"count":3,"score":1.5,"observed":"2026-10-16T12:00:00Z","data":{"x":[1,2]}}},
+                {"op":"new","handle":"claim","kind":"hypothesis","title":"Claim","fields":{"claim":"Measurable"}},
+                {"op":"link","from":"$trial","rel":"corroborates","to":"$claim","why":"measurement"}
+            ]));
+            (
+                p["handles"]["claim"].as_str().unwrap().to_string(),
+                p["branch"].as_str().unwrap().to_string(),
+            )
+        };
+        f.fail(&["show", &id], "unknown record");
+        f.ok(&["review", &branch]);
+        f.ok(&[
+            "review",
+            "accept",
+            &branch,
+            "--review-token",
+            &f.review_token(&branch),
+        ]);
+        assert!(f.ok(&["lint"])["errors"].as_array().unwrap().is_empty());
+        let query =
+            f.batch_file(json!({"op":"compare","field":"owner","cmp":"eq","value":"$actor"}));
+        assert!(
+            !f.ok(&[
+                "query",
+                "--file",
+                query.to_str().unwrap(),
+                "--at",
+                "2026-10-16T12:00:00Z"
+            ])["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !f.ok(&["walk", &id, "--direction", "incoming"])["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let active = f.ok(&["schema", "show"]);
+        let mut config = active["schema"].clone();
+        config["pins"] = json!([id]);
+        let file = f.batch_file(config.clone());
+        f.ok(&["schema", "validate", file.to_str().unwrap()]);
+        f.fail(
+            &[
+                "schema",
+                "apply",
+                file.to_str().unwrap(),
+                "--expect",
+                "stale",
+            ],
+            "stale schema",
+        );
+        let p = f.ok(&[
+            "schema",
+            "apply",
+            file.to_str().unwrap(),
+            "--expect",
+            active["schema_revision"].as_str().unwrap(),
+        ]);
+        let view = f.ok(&["review", p["branch"].as_str().unwrap()]);
+        assert!(
+            view["configuration_diff"]
+                .as_str()
+                .unwrap()
+                .contains("ontology")
+        );
+        f.ok(&[
+            "review",
+            "accept",
+            p["branch"].as_str().unwrap(),
+            "--review-token",
+            &f.review_token(p["branch"].as_str().unwrap()),
+        ]);
+        assert_eq!(f.ok(&["prime", "--budget", "1"])["items"][0]["id"], id);
+        let out = f.dir.path().join("export");
+        f.ok(&["render", "--out", out.to_str().unwrap()]);
+        let graph: Value =
+            serde_json::from_slice(&std::fs::read(out.join("scrolls/graph.json")).unwrap())
+                .unwrap();
+        assert_eq!(graph["schema"], f.ok(&["schema", "show"])["schema"]);
+        assert!(graph["schema_revision"].is_string());
+        assert!(graph["records"].get(&id).is_some());
+        let kind = f.ok(&["show", &id])["record"]["kind"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        config["kinds"][&kind]["fields"]["required_new"] = json!({"type":"string","required":true});
+        let bad = f.batch_file(config);
+        f.fail(&["schema", "validate", bad.to_str().unwrap()], &id);
+    }
+    // The proposal is compatible when authored; main adds data that makes it incompatible.
+    let f = Fixture::new();
+    let active = f.ok(&["schema", "show"]);
+    let mut config = active["schema"].clone();
+    config["kinds"].as_object_mut().unwrap().remove("note");
+    config["relations"]["produced_by"]["from"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|k| k != "note");
+    let file = f.batch_file(config);
+    let p = f.ok(&[
+        "schema",
+        "apply",
+        file.to_str().unwrap(),
+        "--expect",
+        active["schema_revision"].as_str().unwrap(),
+    ]);
+    let note = f.ok(&["new", "note", "--title", "Concurrent", "--body", ""]);
+    f.fail(
+        &[
+            "review",
+            "accept",
+            p["branch"].as_str().unwrap(),
+            "--review-token",
+            &f.review_token(p["branch"].as_str().unwrap()),
+        ],
+        "unknown configured kind",
+    );
+    f.ok(&["show", note["id"].as_str().unwrap()]);
+    assert_eq!(f.ok(&["schema", "show"]), active);
+    let mut added = active["schema"].clone();
+    added["kinds"]["artifact"] = added["kinds"]["note"].clone();
+    let file = f.batch_file(added);
+    let p = f.ok(&[
+        "schema",
+        "apply",
+        file.to_str().unwrap(),
+        "--expect",
+        active["schema_revision"].as_str().unwrap(),
+    ]);
+    let branch = p["branch"].as_str().unwrap();
+    let record = f.ok(&[
+        "--proposal",
+        branch,
+        "new",
+        "artifact",
+        "--title",
+        "New configured kind",
+        "--body",
+        "",
+    ]);
+    f.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &f.review_token(branch),
+    ]);
+    f.ok(&["show", record["id"].as_str().unwrap()]);
+}
+
+#[test]
+fn batches_are_atomic_retryable_and_guards_cannot_be_bypassed() {
+    let f = Fixture::new();
+    let q = f.ok(&["new", "question", "--title", "Owned", "--body", ""]);
+    let q = q["id"].as_str().unwrap();
+    let answer=f.batch(json!([{"op":"new","handle":"a","kind":"answer","title":"Answer"},{"op":"link","from":"$a","rel":"answers","to":q,"expect_to":1}]));
+    let a = answer["handles"]["a"].as_str().unwrap();
+    let before = f.ok(&["show", q]);
+    let bad=f.batch_file(json!([{"op":"edit","id":q,"expect":2,"owner":"bob"},{"op":"status","id":a,"expect":1,"state":"accepted"},{"op":"status","id":q,"expect":2,"state":"answered"}]));
+    f.fail(
+        &["--actor", "bob", "batch", bad.to_str().unwrap()],
+        "pre-change owner",
+    );
+    assert_eq!(before, f.ok(&["show", q]));
+    let acceptance=f.batch_file(json!([{"op":"status","id":a,"expect":1,"state":"accepted"},{"op":"status","id":q,"expect":2,"state":"answered"}]));
+    let long_op = "g".repeat(200);
+    let proposal = f.ok(&[
+        "--op-id",
+        &long_op,
+        "--actor",
+        "assistant",
+        "--role",
+        "agent",
+        "batch",
+        acceptance.to_str().unwrap(),
+    ]);
+    let branch = proposal["branch"].as_str().unwrap();
+    f.fail(
+        &[
+            "--actor",
+            "bob",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &f.review_token(branch),
+        ],
+        "pre-change owner",
+    );
+    assert_eq!(before, f.ok(&["show", q]));
+    f.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &f.review_token(branch),
+    ]);
+    assert_eq!(f.ok(&["show", q])["record"]["status"], "answered");
+    let note = f.ok(&["new", "note", "--title", "Atomic", "--body", ""]);
+    let id = note["id"].as_str().unwrap();
+    let bad=f.batch_file(json!([{"op":"edit","id":id,"expect":1,"body":"changed"},{"op":"status","id":id,"expect":1,"state":"bad"}]));
+    f.fail(&["batch", bad.to_str().unwrap()], "invalid");
+    assert_eq!(f.ok(&["show", id])["record"]["revision"], 1);
+    let file=f.batch_file(json!([{"op":"edit","id":id,"expect":1,"body":"one"},{"op":"edit","id":id,"expect":1,"title":"two"}]));
+    let args = ["--op-id", "atomic", "batch", file.to_str().unwrap()];
+    let result = f.ok(&args);
+    assert_eq!(result, f.ok(&args));
+    assert_eq!(result["records"][id], 2);
+    std::fs::write(&file, "[]").unwrap();
+    f.fail(&args, "different arguments");
+    for old in [
+        "ask",
+        "answer",
+        "accept",
+        "supersede",
+        "inbox",
+        "doctrine",
+        "stale",
+    ] {
+        let args = match old {
+            "ask" => vec![old, "Title"],
+            "answer" => vec![old, q, "text", "--expect", "3"],
+            "accept" => vec![old, a, "--expect", "2", "--expect-question", "3"],
+            "supersede" => vec![
+                old,
+                q,
+                "--with",
+                a,
+                "--why",
+                "x",
+                "--expect",
+                "3",
+                "--expect-to",
+                "2",
+            ],
+            _ => vec![old],
+        };
+        f.fail(&args, "removed in 0.2.0");
+    }
+}
+
+#[test]
+fn format_two_migration_preserves_identity_receipts_and_historical_reads() {
+    let f = Fixture::new();
+    let args = [
+        "--op-id",
+        "prior-record",
+        "new",
+        "note",
+        "--title",
+        "Preserved",
+        "--body",
+        "original",
+    ];
+    let record = f.ok(&args);
+    let id = record["id"].as_str().unwrap();
+    let identity = f.ok(&["doctor"])["store_id"].clone();
+    let historical = "proposal/legacy-format-two";
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction(
+            &(put("metadata", "schema", &2).unwrap() + "DELETE FROM metadata WHERE id='ontology';"),
+            "old format fixture",
+            "test",
+        )
+        .unwrap();
+        let base = s.revision().unwrap();
+        s.run(&["checkout", "-b", historical]).unwrap();
+        let proposal = scrolls::model::Proposal {
+            branch: historical.into(),
+            base,
+            actor: "alice".into(),
+            status: "rejected".into(),
+            reason: Some("historical fixture".into()),
+        };
+        s.transaction(
+            &put("metadata", historical, &proposal).unwrap(),
+            "historical proposal",
+            "test",
+        )
+        .unwrap();
+        s.checkout("main").unwrap();
+    }
+    let before = f.ok(&["show", id]);
+    f.ok(&["migrate"]);
+    assert_eq!(f.ok(&["doctor"])["store_id"], identity);
+    assert_eq!(f.ok(&["show", id]), before);
+    assert_eq!(f.ok(&args), record);
+    assert_eq!(f.ok(&["prime"])["items"], json!([]));
+    assert_eq!(
+        f.ok(&["--proposal", historical, "show", id])["record"],
+        before["record"]
+    );
+    f.fail(
+        &[
+            "--proposal",
+            historical,
+            "edit",
+            id,
+            "--expect",
+            "1",
+            "--body",
+            "blocked",
+        ],
+        "migrate",
+    );
+}
+
+#[test]
+fn migration_translates_import_debt_from_originals_not_current_violations() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    let id;
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let mut record = scrolls::model::Record::new("note", "Legacy", "", "alice").unwrap();
+        id = record.id.clone();
+        record.confidence = "legacy-invalid".into();
+        record.original = Some(serde_json::to_value(&record).unwrap());
+        let info = scrolls::model::ImportInfo {
+            repository: "fixture".into(),
+            commit: "fixture".into(),
+            prefix: "docs".into(),
+            files: 1,
+            markdown: 1,
+            untyped: 0,
+            lint_debt: [format!("{id}:confidence")].into(),
+        };
+        let sql = put("records", &id, &record).unwrap()
+            + &put("metadata", "import", &info).unwrap()
+            + &put(
+                "metadata",
+                "import_edges",
+                &Vec::<scrolls::model::Edge>::new(),
+            )
+            .unwrap()
+            + &put("metadata", "schema", &2).unwrap()
+            + "DELETE FROM metadata WHERE id='ontology';";
+        s.transaction(&sql, "legacy import fixture", "test")
+            .unwrap();
+    }
+    f.ok(&["migrate"]);
+    let lint = f.ok(&["lint"]);
+    assert_eq!(lint["errors"], json!([]));
+    assert_eq!(lint["historical_debt"].as_array().unwrap().len(), 1);
+    f.fail(
+        &[
+            "edit",
+            &id,
+            "--expect",
+            "1",
+            "--confidence",
+            "new-invalid",
+            "--body",
+            "",
+        ],
+        "confidence",
+    );
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let mut r = s.graph().unwrap().records[&id].clone();
+        r.confidence = "new-invalid".into();
+        s.transaction(
+            &put("records", &id, &r).unwrap(),
+            "simulate external corruption",
+            "test",
+        )
+        .unwrap();
+    }
+    assert!(!f.call(&["lint"]).0);
 }
 
 // Capture every committed branch and receipt, plus recovery state. Read checkout
@@ -1372,12 +1735,15 @@ fn acceptance_fingerprint(branch: &str, token: Option<&str>) -> (Value, String) 
 
 #[test]
 fn historical_tokenless_receipts_and_both_store_schemas() {
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let f = Fixture::new();
         let root = f.dir.path().join("store");
         if schema == 1 {
             let s = Store::open(&root, &dolt(), false).unwrap();
             s.transaction(&(put("metadata", "schema", &1).unwrap() + "DELETE FROM metadata WHERE id='store_id'; DELETE FROM registry WHERE id IN ('rel:related_work','rel:implemented_by','rel:produced_by');"), "schema 1 fixture", "test").unwrap();
+        }
+        if schema < 3 {
+            f.ok(&["migrate"]);
         }
         let p = f.ok(&[
             "new",
@@ -1433,7 +1799,7 @@ fn historical_tokenless_receipts_and_both_store_schemas() {
             &["review", "accept", next["branch"].as_str().unwrap()],
             "requires --review-token",
         );
-        assert_eq!(f.ok(&["doctor"])["schema_version"], schema);
+        assert_eq!(f.ok(&["doctor"])["schema_version"], 3);
     }
 }
 
@@ -1500,4 +1866,27 @@ fn revision_bound_receipts_survive_review_recovery() {
         ]);
         assert_eq!(accepted, staged);
     }
+}
+
+#[test]
+fn historical_checkout_cannot_bypass_newer_main_writer_fence() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.run(&["checkout", "-b", "historical-format"]).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction(
+            &put("metadata", "schema", &99).unwrap(),
+            "future writer fixture",
+            "test",
+        )
+        .unwrap();
+        s.checkout("historical-format").unwrap();
+    }
+    f.fail(
+        &["new", "note", "--title", "Forbidden", "--body", ""],
+        "unsupported store format 99",
+    );
 }

@@ -1,0 +1,4 @@
+op: all
+args:
+  - {op: compare, field: status, cmp: eq, value: active}
+  - {op: applicability}

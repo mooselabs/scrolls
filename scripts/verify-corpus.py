@@ -105,7 +105,7 @@ assert set(manifest["records"]) == set(graph["records"])
 assert all((out / "rendered/docs" / path).is_file() for path in manifest["records"].values())
 print(f"Pristine export preserves {len(files)} source paths", flush=True)
 index_result = run(
-    [root / "target/release/examples/check_indexes", out / "rendered/docs"], text=True
+    [a.binary.resolve().parent / "examples/check_indexes", out / "rendered/docs"], text=True
 )
 # Exercise a representable imported edit and validate its refreshed indexes.
 selected = next(
@@ -130,7 +130,7 @@ cli(
 shutil.copytree(out / "source", out / "edited", symlinks=True)
 shutil.rmtree(out / "edited/docs")
 cli("render", "--format", "liskov", "--out", out / "edited/docs")
-run([root / "target/release/examples/check_indexes", out / "edited/docs"], text=True)
+run([a.binary.resolve().parent / "examples/check_indexes", out / "edited/docs"], text=True)
 edited_hashes = {
     p: hashlib.sha256((out / "edited/docs" / p).read_bytes()).hexdigest() for p in files
 }
@@ -155,15 +155,26 @@ def data(*args):
     return cli(*args)["data"]
 
 
+def batch(ops, human=False):
+    file = out / "mutations.json"
+    file.write_text(json.dumps(ops))
+    return data(*(["--role", "human"] if human else []), "batch", file)
+
+
 def create(kind, title, body="Local qualification record.", **options):
-    args = ["new", kind, "--title", title, "--body", body]
-    for key, value in options.items():
-        args.extend(["--" + key.replace("_", "-"), value])
-    result = data(*args)
+    ops = [{"op":"new","handle":"doc","kind":kind,"title":title,"body":body}]
+    if "supports" in options:
+        source = options.pop("supports")
+        rev = data("show", source)["record"]["revision"]
+        ops.append({"op":"link","from":source,"rel":"supports","to":"$doc","expect":rev})
+    if "about" in options:
+        ops.append({"op":"link","from":"$doc","rel":"about","to":options.pop("about")})
+    assert not options, options
+    result = batch(ops)
     if result["branch"] != "main":
         review = data("review", result["branch"])
         data("--role", "human", "review", "accept", result["branch"], "--review-token", review["review_token"])
-    return result["id"]
+    return result["handles"]["doc"]
 
 
 native = {}
@@ -177,12 +188,10 @@ for kind in ["knowledge", "primer", "decision"]:
     native[kind] = create(kind, "Native " + kind, body=f"[Evidence]({evidence}#details)", supports=evidence, about=native["entity"])
 for kind in ["doctrine", "collection", "note"]:
     native[kind] = create(kind, "Native " + kind, about=native["entity"])
-q = data("ask", "Local qualification question", "--about", native["entity"], "--context", f"[Knowledge]({native['knowledge']})")
-assert q["branch"] == "main"
-native["question"] = q["id"]
-answer = data("--role", "human", "answer", q["id"], "Accepted local answer", "--expect", "1")
-native["answer"] = answer["id"]
-data("--role", "human", "accept", answer["id"], "--expect", "1", "--expect-question", "2")
+native["question"] = create("question", "Local qualification question", body=f"[Knowledge]({native['knowledge']})", about=native["entity"])
+answer = batch([{"op":"new","kind":"answer","handle":"a","title":"Accepted local answer"},{"op":"link","from":"$a","rel":"answers","to":native["question"],"expect_to":1}], human=True)
+native["answer"] = answer["handles"]["a"]
+batch([{"op":"status","id":native["answer"],"state":"accepted","expect":1},{"op":"status","id":native["question"],"state":"answered","expect":2}], human=True)
 # Add a supplemental assertion owned by an imported record; preserve its bytes.
 reference = data("link", record["id"], "related", native["entity"], "--expect", "2")
 assert reference["branch"] == "main"
@@ -200,7 +209,7 @@ allowed_changed = {selected, "raw/README.md", "knowledge/README.md", "work-notes
 native_changed = {p for p in files if hashlib.sha256((out / "native/docs" / p).read_bytes()).hexdigest() != files[p]}
 assert native_changed <= allowed_changed, native_changed
 assert all(hashlib.sha256((out / "native/docs" / p).read_bytes()).hexdigest() == files[p] for p in files if p.startswith(("backlog/", "questions/")))
-index_native = run([root / "target/release/examples/check_indexes", out / "native/docs"], text=True)
+index_native = run([a.binary.resolve().parent / "examples/check_indexes", out / "native/docs"], text=True)
 supplement = (out / "native/docs/scrolls/README.md").read_text()
 for rid, r in native_graph["records"].items():
     if r["path"] is None:
