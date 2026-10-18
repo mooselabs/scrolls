@@ -955,6 +955,8 @@ fn shared_initialization_refuses_existing_partial_and_noninitial_stores() {
         "CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT); INSERT INTO metadata VALUES ('schema','4')",
         "CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT); INSERT INTO metadata VALUES ('schema','5')",
         "CALL DOLT_BRANCH('extra')",
+        "CALL DOLT_COMMIT('--allow-empty','-m','retained history','--author','Test <test@localhost>'); CALL DOLT_RESET('--hard','HEAD~1')",
+        "CALL DOLT_COMMIT('--allow-empty','-m','retained history','--author','Test <test@localhost>'); CALL DOLT_TAG('prior'); CALL DOLT_RESET('--hard','HEAD~1')",
         "CALL DOLT_COMMIT('--allow-empty','-m','noninitial','--author','Test <test@localhost>')",
     ] {
         let s = Server::empty();

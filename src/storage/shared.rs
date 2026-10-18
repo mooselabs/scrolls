@@ -149,8 +149,19 @@ impl Store {
             "shared_init_refused: additional branches"
         );
         ensure!(
+            self.sql("SELECT tag_name FROM dolt_tags")?.is_empty(),
+            "shared_init_refused: existing tags may retain prior history"
+        );
+        ensure!(
             self.sql("SELECT commit_hash FROM dolt_log")?.len() == 1,
             "shared_init_refused: database has non-initial history"
+        );
+        ensure!(
+            self.sql(
+                "SELECT commit_hash FROM DOLT_REFLOG() WHERE commit_hash <> DOLT_HASHOF('HEAD')"
+            )?
+            .is_empty(),
+            "shared_init_refused: reflog retains prior history"
         );
         Ok(())
     }

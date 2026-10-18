@@ -21,8 +21,8 @@ in document bindings. No local Dolt executable is needed by shared clients.
 
 ## Fresh initialization
 
-The selected database must have no user tables, only `main`, and one initial
-Dolt commit. Plan without writing:
+The selected database must have no user tables, only `main`, no tags, one initial
+Dolt commit and no different commit retained in its reflog. Plan without writing:
 
 ```sh
 scrolls --connection /absolute/machine-local.json --actor alice init --dry-run --schema examples/handbook.yaml --json
@@ -38,7 +38,7 @@ scrolls --connection /absolute/machine-local.json --actor alice --role human --o
 Omit `--schema` in both commands for the bundled ontology. Apply validates the
 empty graph and commits all nine tables, ontology, UUID, shared format 5,
 writer generation 1 and its receipt. It refuses existing local stores, partial
-initialization, additional branches and non-initial history. There is no reset,
+initialization, additional branches, retained tags, reflog history and non-initial history. There is no reset,
 conversion, maintenance migration or repair path. A failed or interrupted
 operation must be inspected; unexplained dirty state is preserved and blocks
 use. Existing store migration still requires separately qualified exclusive
