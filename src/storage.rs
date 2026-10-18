@@ -28,13 +28,14 @@ impl Store {
     /// Open without recovery, branch checkout, configuration writes or initialization.
     pub fn open_readonly(root: &Path, binary: &Path) -> Result<Self> {
         let root = fs::canonicalize(root).context("store missing; run init first")?;
+        let lock = OpenOptions::new().read(true).open(root.join("lock"))?;
+        lock.lock_exclusive()?;
+        // Check recovery state only after the previous writer has released its lock.
         for journal in ["review-journal.json", "migration-journal.json"] {
             if root.join(journal).exists() {
                 bail!("recovery_required: outstanding {journal}; run doctor before planning");
             }
         }
-        let lock = OpenOptions::new().read(true).open(root.join("lock"))?;
-        lock.lock_exclusive()?;
         let s = Self {
             db: root.join("dolt"),
             root,

@@ -2501,3 +2501,33 @@ fn migration_recovery_preserves_foreign_rows_in_new_tables() {
     f.fail(&["doctor"], "unexpected migration table data");
     assert!(root.join("migration-journal.json").exists());
 }
+
+#[test]
+fn readonly_snapshot_checks_recovery_after_acquiring_the_lock() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    let lock = std::fs::File::open(root.join("lock")).unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    std::fs::write(root.join("review-journal.json"), "{}").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader_root = root.clone();
+    let reader = std::thread::spawn(move || {
+        let result = Store::open_readonly(&reader_root, &dolt())
+            .map(drop)
+            .map_err(|e| e.to_string());
+        send.send(result).unwrap();
+    });
+    assert!(matches!(
+        receive.recv_timeout(std::time::Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    // The writer completes recovery before releasing its lock; the reader sees
+    // that completed state, rather than racing its temporary journal.
+    std::fs::remove_file(root.join("review-journal.json")).unwrap();
+    fs2::FileExt::unlock(&lock).unwrap();
+    receive
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    reader.join().unwrap();
+}

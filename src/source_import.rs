@@ -513,6 +513,22 @@ pub fn build(before: &Graph, source: &Source) -> Result<Candidate> {
     for (key, m) in &mut members {
         let rule = p.documents.iter().find(|r| r.id == m.rule).unwrap();
         for assertion in &rule.references {
+            if let Some(rel) = &assertion.relation {
+                let relation = &graph.schema.relations[rel];
+                let allowed = if assertion.direction == "incoming" {
+                    &relation.to
+                } else {
+                    &relation.from
+                };
+                ensure!(
+                    allowed.iter().any(|k| k == "*" || k == &m.baseline.kind),
+                    "schema_mismatch: path={} rule={} field={} relation {rel} forbids kind {} in this direction",
+                    m.path,
+                    m.rule,
+                    assertion.source_relation,
+                    m.baseline.kind
+                );
+            }
             let Some(v) = values[key].get(&assertion.value) else {
                 continue;
             };

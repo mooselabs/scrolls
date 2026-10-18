@@ -77,6 +77,9 @@ fn strict_configuration_and_codecs() {
         "PEP-0008"
     );
     assert!(Profile::parse(&profile::PEP.replace("supersedes", "absent"), &s).is_err());
+    // Known relations must accept the projected kind even without source targets.
+    assert!(Profile::parse(&profile::PEP.replace("supersedes", "answers"), &s).is_err());
+    assert!(Profile::parse(&profile::PEP.replace("supersedes", "produced_by"), &s).is_err());
     assert!(Profile::parse(&profile::PEP.replace("{number:04d}", "{number:999d}"), &s).is_err());
 }
 fn git(root: &Path, args: &[&str]) {

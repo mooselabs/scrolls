@@ -397,6 +397,24 @@ impl Profile {
                         schema.relations.contains_key(rel),
                         "schema_mismatch: unknown relation {rel}"
                     );
+                    let relation = &schema.relations[rel];
+                    ensure!(
+                        !relation.from.is_empty() && !relation.to.is_empty(),
+                        "schema_mismatch: relation {rel} cannot map internal source references"
+                    );
+                    if let Some(kind) = r.record.kind.literal.as_ref().and_then(Value::as_str) {
+                        let allowed = if x.direction == "incoming" {
+                            &relation.to
+                        } else {
+                            &relation.from
+                        };
+                        ensure!(
+                            allowed.iter().any(|k| k == "*" || k == kind),
+                            "schema_mismatch: rule={} field={} relation {rel} forbids kind {kind} in this direction",
+                            r.id,
+                            x.source_relation
+                        );
+                    }
                 }
             }
         }
