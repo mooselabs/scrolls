@@ -1,9 +1,11 @@
 # Shared SQL session foundation
 
-This is a development foundation, not a shared-authoring release. The CLI still
-opens the local `Store`. Shared proposal publication, durable recovery journals,
-writer/schema fencing and the full authoring integration remain prerequisites
-before a shared store can become authoritative.
+This is the transport foundation, not a shared-authoring release. The CLI now
+uses it for the [direct shared authoring preview](shared-authoring.md), including
+fresh initialization and shared writer fencing. Shared proposal publication,
+durable review recovery, maintenance migrations and the remaining readiness
+capabilities are still prerequisites before migration. The preview document
+also describes the pinned old-writer source fixture required by these tests.
 
 The foundation in `src/storage/session.rs` provides one `SqlSession` boundary
 for the existing local store and a MySQL-protocol `SharedSession`. It uses one

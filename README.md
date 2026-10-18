@@ -318,9 +318,14 @@ no authority cutover.
 
 ## Development and verification
 
-From this checkout, after installing the private Dolt binary:
+From this checkout, install the private Dolt and Beads binaries and prepare the
+pinned old-writer fixture before running the complete qualification:
 
 ```fish
+./scripts/install-dolt.sh
+./scripts/install-beads.sh
+git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-0.3.0
+git -C .verification/scrolls-0.3.0 checkout --detach 3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
@@ -330,7 +335,7 @@ python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
 python3 scripts/verify-beads.py --binary target/release/scrolls
 ```
 
-Real-Dolt tests fail if the private binary is missing. CI runs the Rust checks,
+Real-Dolt tests fail if a private binary or the pinned old-writer source is missing. CI runs the Rust checks,
 demonstration, and Beads qualification. Use a fresh demonstration output path.
 Full corpus qualification is a separate local check against the private source:
 
@@ -352,3 +357,12 @@ verified cache. See the qualification reports for exact results and limitations.
 The README's onboarding structure is inspired by the
 [Beads README](https://github.com/steveyegge/beads/blob/main/README.md); the commands
 and support boundaries above describe Scrolls.
+
+## Shared authoring development preview
+
+The unreleased shared backend can initialize a fresh externally provisioned Dolt
+2.2.0 database and publish direct graph changes using a named SQL account.
+See [shared authoring](docs/shared-authoring.md) for the reviewed initialization
+procedure, connection file, supported commands and qualification fixtures.
+Shared review, migrations, imports, caches and repository discovery remain
+unavailable. Local workflows retain their existing behavior.

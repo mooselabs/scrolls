@@ -1,10 +1,12 @@
 //! Local storage and the shared SQL session foundation.
 pub mod session;
+pub mod shared;
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use session::SqlSession;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -23,7 +25,8 @@ pub struct Store {
     pub root: PathBuf,
     pub db: PathBuf,
     binary: PathBuf,
-    _lock: File,
+    _lock: Option<File>,
+    shared: Option<session::SharedSession>,
 }
 impl Store {
     /// Open without recovery, branch checkout, configuration writes or initialization.
@@ -41,7 +44,8 @@ impl Store {
             db: root.join("dolt"),
             root,
             binary: fs::canonicalize(binary)?,
-            _lock: lock,
+            _lock: Some(lock),
+            shared: None,
         };
         let version = s.run(&["version"])?;
         if version.lines().next() != Some(format!("dolt version {DOLT_VERSION}").as_str()) {
@@ -450,7 +454,8 @@ impl Store {
             root: root.clone(),
             db: root.join("dolt"),
             binary,
-            _lock: lock,
+            _lock: Some(lock),
+            shared: None,
         };
         if !s.db.join(".dolt").exists() {
             if !init {
@@ -516,6 +521,10 @@ impl Store {
         Ok(())
     }
     pub fn run(&self, args: &[&str]) -> Result<String> {
+        anyhow::ensure!(
+            !self.is_shared(),
+            "shared_unsupported: local Dolt subprocess"
+        );
         if self.db.join(".dolt/sql-server.info").exists() {
             bail!("unexpected Dolt server; stop it before opening the local store");
         }
@@ -537,6 +546,9 @@ impl Store {
         Ok(String::from_utf8(out.stdout)?)
     }
     pub fn sql(&self, sql: &str) -> Result<Vec<Value>> {
+        if let Some(session) = &self.shared {
+            return session.sql(sql);
+        }
         let mut f = tempfile::NamedTempFile::new()?;
         f.write_all(sql.as_bytes())?;
         let raw = self.run(&[
@@ -569,6 +581,11 @@ impl Store {
         Ok(())
     }
     pub fn checkout(&self, branch: &str) -> Result<()> {
+        if let Some(session) = &self.shared {
+            anyhow::ensure!(branch == "main", "shared_unsupported: proposal branches");
+            self.check_shared_format()?;
+            return session.select_branch(branch);
+        }
         self.clean()?;
         self.run(&["checkout", branch])?;
         let format = self
@@ -661,6 +678,10 @@ impl Store {
         Ok(g)
     }
     pub fn transaction(&self, changes: &str, message: &str, actor: &str) -> Result<()> {
+        if let Some(session) = &self.shared {
+            session.commit(changes, message, actor)?;
+            return Ok(());
+        }
         let sql = format!(
             "START TRANSACTION;\n{changes}\nCALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m',{},'--author',{}); COMMIT;",
             literal(message),
@@ -705,6 +726,17 @@ impl Store {
         Ok(out)
     }
     pub fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
+        if self.is_shared() {
+            let revision = self.revision()?;
+            if let Some(r) = self.one_at::<Value>("operations", op, &revision)? {
+                anyhow::ensure!(
+                    r["args_hash"] == hash,
+                    "--op-id {op} was already used with different arguments or attribution"
+                );
+                return Ok(Some(r["result"].clone()));
+            }
+            return Ok(None);
+        }
         if let Some(r) = crate::beads::Local::load(&self.root)?.operations.get(op) {
             if r["hash"] != hash {
                 bail!("--op-id {op} was already used with different arguments or attribution");
