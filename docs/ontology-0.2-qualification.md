@@ -74,5 +74,17 @@ Integrated `b6215fe` with main `e4faa65`, retaining the README onboarding layout
 revision-bound acceptance, configuration diffs and historical receipt fingerprints.
 The integrated tree passes formatting, warnings-denied Clippy, all 40 Rust/Dolt
 tests, the release build, generic demo and disposable Beads 1.3.0 qualification.
-The pinned Liskov corpus qualification is running against this unchanged tree;
-its completion will be recorded before publication.
+The complete pinned corpus qualification at `d2093e8` passes: all 9,242 paths
+are byte-identical, all six indexes match, 3,407 frozen files remain preserved,
+and 13 native records plus the imported-store demo succeed. Source, pristine,
+edited and native validators have identical exit codes `[1, 1, 1, 1]` and zero
+additional diagnostics. That binary has SHA-256
+`e8c88b670e1c800f0795ff10b6e97b710850db8193c880b1c4b26f702cbf325b`.
+CI for that checkpoint passed in run `39147421136`.
+
+The writer-fence follow-up checks the format again after selecting a branch.
+A historical checkout can no longer let a 0.2 writer switch to newer-format main
+and mutate it. All 41 Rust/Dolt tests, formatting, warnings-denied Clippy and
+the all-target release build pass with this check. The repeated qualification
+reports for this final binary are retained under `.verification/integrated-020/`;
+the corpus report records the tested commit, binary hash and exact diagnostics.

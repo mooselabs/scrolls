@@ -124,6 +124,12 @@ pub fn run(cli: &Cli) -> Result<Value> {
         proposal_name(&store, branch)?;
     }
     store.checkout(branch)?;
+    let selected_format = store
+        .one::<u32>("metadata", "schema")?
+        .context("missing store format")?;
+    if selected_format > 3 {
+        bail!("unsupported store format {selected_format}; use a newer Scrolls writer");
+    }
     if init {
         if branch != "main" {
             bail!("init operates on main")

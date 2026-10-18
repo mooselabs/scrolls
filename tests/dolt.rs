@@ -1867,3 +1867,26 @@ fn revision_bound_receipts_survive_review_recovery() {
         assert_eq!(accepted, staged);
     }
 }
+
+#[test]
+fn historical_checkout_cannot_bypass_newer_main_writer_fence() {
+    let f = Fixture::new();
+    let root = f.dir.path().join("store");
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.run(&["checkout", "-b", "historical-format"]).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction(
+            &put("metadata", "schema", &99).unwrap(),
+            "future writer fixture",
+            "test",
+        )
+        .unwrap();
+        s.checkout("historical-format").unwrap();
+    }
+    f.fail(
+        &["new", "note", "--title", "Forbidden", "--body", ""],
+        "unsupported store format 99",
+    );
+}
