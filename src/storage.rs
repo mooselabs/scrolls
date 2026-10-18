@@ -1,4 +1,5 @@
-//! All Dolt access is serialized, offline and through one pinned private CLI.
+//! Local storage and the shared SQL session foundation.
+pub mod session;
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
