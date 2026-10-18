@@ -755,6 +755,14 @@ impl Store {
         Ok(())
     }
 }
+/// Append immutable rows. Duplicate keys must fail rather than replace a tuple.
+pub fn insert<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
+    Ok(format!(
+        "INSERT INTO {table} (id,payload) VALUES ({},{});\n",
+        literal(id),
+        literal(&serde_json::to_string(value)?)
+    ))
+}
 pub fn put<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
     Ok(format!(
         "REPLACE INTO {table} (id,payload) VALUES ({},{});\n",

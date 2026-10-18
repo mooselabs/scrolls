@@ -45,6 +45,7 @@ pub struct Source {
 #[serde(deny_unknown_fields)]
 pub struct File {
     pub source_id: String,
+    pub size: u64,
     pub file: SourceFile,
     pub classification: String,
 }
@@ -308,6 +309,7 @@ fn files(source: &Source, p: &Profile) -> Result<Vec<File>> {
             };
             out.push(File {
                 source_id: source.source_id.clone(),
+                size,
                 file: SourceFile {
                     path: name,
                     sha256: digest(&bytes),
@@ -693,7 +695,7 @@ pub fn provenance(g: &Graph, id: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 pub fn summary(g: &Graph, files: &[File]) -> Value {
-    json!({"sources":g.import_sources,"members":g.import_members,"files":files.iter().map(|f|json!({"source_id":f.source_id,"path":f.file.path,"sha256":f.file.sha256,"git_oid":f.file.git_oid,"mode":f.file.mode,"classification":f.classification})).collect::<Vec<_>>()})
+    json!({"sources":g.import_sources,"members":g.import_members,"files":files.iter().map(|f|json!({"source_id":f.source_id,"path":f.file.path,"sha256":f.file.sha256,"git_oid":f.file.git_oid,"mode":f.file.mode,"size":f.size,"classification":f.classification})).collect::<Vec<_>>()})
 }
 pub fn write_plan(out: &Path, plan: &Plan) -> Result<()> {
     let parent = out
@@ -709,13 +711,13 @@ pub fn write_plan(out: &Path, plan: &Plan) -> Result<()> {
     Ok(())
 }
 pub fn persist(candidate: &Candidate) -> Result<String> {
-    let mut sql = put(
+    let mut sql = crate::storage::insert(
         "import_sources",
         &candidate.source.source_id,
         &candidate.source,
     )?;
     for f in &candidate.files {
-        sql.push_str(&put("import_files", &f.key(), f)?);
+        sql.push_str(&crate::storage::insert("import_files", &f.key(), f)?);
     }
     for m in candidate
         .graph
@@ -723,7 +725,7 @@ pub fn persist(candidate: &Candidate) -> Result<String> {
         .values()
         .filter(|m| m.source_id == candidate.source.source_id)
     {
-        sql.push_str(&put("import_members", &m.row_key(), m)?);
+        sql.push_str(&crate::storage::insert("import_members", &m.row_key(), m)?);
     }
     Ok(sql)
 }
@@ -1085,7 +1087,9 @@ pub fn health(g: &Graph, files: &[File]) -> Result<Value> {
         let raw = STANDARD.decode(&f.file.bytes)?;
         bytes += raw.len();
         ensure!(
-            digest(&raw) == f.file.sha256 && [0o100644, 0o100755].contains(&f.file.mode),
+            digest(&raw) == f.file.sha256
+                && f.size == raw.len() as u64
+                && [0o100644, 0o100755].contains(&f.file.mode),
             "source_ownership: original checksum/mode mismatch {}",
             f.file.path
         );
@@ -1156,5 +1160,5 @@ fn noop_receipt(cli: &Cli, plan: &Plan, op: &str, hash: &str, result: Value) -> 
 }
 
 fn planned_changes(candidate: &Candidate) -> Value {
-    json!({"documents":candidate.graph.import_members.values().filter(|m|m.source_id==candidate.source.source_id).map(|m|json!({"id":m.record_id,"key":m.key,"path":m.path,"codec":m.codec,"rule":m.rule,"kind":m.baseline.kind,"title":m.baseline.title,"status":m.baseline.status,"owner":m.baseline.owner,"fields":m.baseline.fields,"aliases":m.baseline.aliases,"body_sha256":digest(&m.baseline.body),"references":m.references})).collect::<Vec<_>>(),"files":candidate.files.iter().map(|f|json!({"path":f.file.path,"sha256":f.file.sha256,"git_oid":f.file.git_oid,"mode":f.file.mode,"classification":f.classification})).collect::<Vec<_>>()})
+    json!({"documents":candidate.graph.import_members.values().filter(|m|m.source_id==candidate.source.source_id).map(|m|json!({"id":m.record_id,"key":m.key,"path":m.path,"codec":m.codec,"rule":m.rule,"kind":m.baseline.kind,"title":m.baseline.title,"status":m.baseline.status,"owner":m.baseline.owner,"fields":m.baseline.fields,"aliases":m.baseline.aliases,"body_sha256":digest(&m.baseline.body),"references":m.references})).collect::<Vec<_>>(),"files":candidate.files.iter().map(|f|json!({"path":f.file.path,"sha256":f.file.sha256,"git_oid":f.file.git_oid,"mode":f.file.mode,"size":f.size,"classification":f.classification})).collect::<Vec<_>>()})
 }

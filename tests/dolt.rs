@@ -2531,3 +2531,46 @@ fn readonly_snapshot_checks_recovery_after_acquiring_the_lock() {
         .unwrap();
     reader.join().unwrap();
 }
+
+#[test]
+fn imported_file_key_collision_never_overwrites_another_tuple() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    import_fixture(&repo);
+    let plan = plan_import(&f, &repo, "book", None);
+    let parsed: scrolls::source_import::Plan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let root = f.dir.path().join("store");
+    let key;
+    let foreign = json!({"source_id":"other","file":{"path":"foreign"}});
+    {
+        let s = Store::open(&root, &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let g = s.graph().unwrap();
+        let c = scrolls::source_import::build(&g, &parsed.source).unwrap();
+        key = c.files[0].key();
+        s.transaction(
+            &put("import_files", &key, &foreign).unwrap(),
+            "synthetic collision fixture",
+            "test",
+        )
+        .unwrap();
+    }
+    let plan = plan_import(&f, &repo, "book", None);
+    f.fail(
+        &[
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+            "--op-id",
+            "collision",
+        ],
+        "duplicate",
+    );
+    let s = Store::open(&root, &dolt(), false).unwrap();
+    s.checkout("main").unwrap();
+    assert_eq!(s.one::<Value>("import_files", &key).unwrap(), Some(foreign));
+    assert!(s.graph().unwrap().records.is_empty());
+    assert!(s.one::<Value>("operations", "collision").unwrap().is_none());
+    s.clean().unwrap();
+}
