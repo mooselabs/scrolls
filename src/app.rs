@@ -60,14 +60,20 @@ fn actor(cli: &Cli) -> Result<&str> {
     }
     Ok(a)
 }
-fn receipt(op: &str, hash: &str, actor: &str, command: &Cmd, result: &Value) -> Result<String> {
+pub(crate) fn receipt(
+    op: &str,
+    hash: &str,
+    actor: &str,
+    command: &Cmd,
+    result: &Value,
+) -> Result<String> {
     put(
         "operations",
         op,
         &json!({"op_id":op,"args_hash":hash,"actor":actor,"command":command,"result":result,"committed_at":now()}),
     )
 }
-fn wrap(store: &Store, data: Value, branch: &str) -> Result<Value> {
+pub(crate) fn wrap(store: &Store, data: Value, branch: &str) -> Result<Value> {
     Ok(
         json!({"schema_version":2,"ok":true,"revision":store.revision()?,"branch":branch,"data":data}),
     )
@@ -82,6 +88,8 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
 pub fn run(cli: &Cli) -> Result<Value> {
     if cli.connection.is_some() {
         storage::shared::check_command(cli)?;
+    } else if matches!(cli.command, Cmd::Recover { .. }) {
+        bail!("recover is a shared-store command; use --connection");
     }
     if let Cmd::Import { command } = &cli.command {
         if !matches!(command, ImportCommand::Markdown { .. }) {
@@ -143,7 +151,16 @@ pub fn run(cli: &Cli) -> Result<Value> {
         );
     }
     let store = if let Some(connection) = &cli.connection {
-        Store::open_shared(connection, &cli.store)?
+        let recovery = match &cli.command {
+            Cmd::Recover { operation, .. } => Some(operation.as_str()),
+            _ if cli.command.mutation() && !cli.dry_run => cli.op_id.as_deref(),
+            _ => None,
+        };
+        if let Some(op) = recovery {
+            Store::open_shared_recovery(connection, &cli.store, op)?
+        } else {
+            Store::open_shared(connection, &cli.store)?
+        }
     } else {
         Store::open(&cli.store, &cli.dolt, init)?
     };
@@ -360,10 +377,26 @@ pub fn run(cli: &Cli) -> Result<Value> {
         .op_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if matches!(cli.command, Cmd::Recover { resume: true, .. }) {
+        return storage::shared_review::recover(&store, cli, &op, &hash);
+    }
     if cli.command.mutation() {
         if let Some(result) = store.receipt(&op, &hash)? {
-            return wrap(&store, result, branch);
+            return if store.is_shared() {
+                storage::shared_review::receipt_response(&store, result, branch)
+            } else {
+                wrap(&store, result, branch)
+            };
         }
+        if store.is_shared() && !cli.dry_run {
+            if let Some(result) = storage::shared_review::resume(&store, cli, &before, &op, &hash)?
+            {
+                return storage::shared_review::receipt_response(&store, result, branch);
+            }
+        }
+    }
+    if matches!(cli.command, Cmd::Recover { .. }) {
+        return storage::shared_review::recover(&store, cli, &op, &hash);
     }
     if matches!(cli.command, Cmd::Review { .. }) {
         return review(cli, &store, &before, &op, &hash);
@@ -563,9 +596,6 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 .iter()
                 .any(|id| graph.schema.protected(&graph.records[id], cli.role.name()))
             || (guarded && cli.role == Role::Agent);
-        if store.is_shared() && protected {
-            bail!("shared_unsupported: protected changes require shared review qualification");
-        }
         if !protected && cli.proposal.is_none() {
             crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())?;
         }
@@ -615,8 +645,15 @@ pub fn run(cli: &Cli) -> Result<Value> {
         }
 
         if let Some(p) = proposal {
-            store.run(&["checkout", "-b", &target])?;
             sql.push_str(&put("metadata", &target, &p)?);
+            if store.is_shared() {
+                sql.push_str(&receipt(&op, &hash, who, &cli.command, &result)?);
+                let result = storage::shared_review::publish_proposal(
+                    &store, cli, &p, &sql, &op, &hash, &result,
+                )?;
+                return storage::shared_review::receipt_response(&store, result, &target);
+            }
+            store.run(&["checkout", "-b", &target])?;
         }
         sql.push_str(&receipt(&op, &hash, who, &cli.command, &result)?);
         store.transaction(
@@ -805,6 +842,72 @@ pub fn run(cli: &Cli) -> Result<Value> {
     }
     Ok(response)
 }
+pub(crate) fn validate_merged_review(
+    s: &Store,
+    main_graph: &Graph,
+    who: &str,
+    role: Role,
+) -> Result<()> {
+    let merged = s.graph()?;
+    let debt = s
+        .one::<ImportInfo>("metadata", "import")?
+        .map(|i| i.lint_debt)
+        .unwrap_or_default();
+    let mut requirements = vec![];
+    for row in s.sql("SELECT payload FROM metadata WHERE id LIKE 'guard:%' AND id NOT IN (SELECT id FROM metadata AS OF 'main' WHERE id LIKE 'guard:%')")? {
+        requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(row["payload"].as_str().context("guard payload")?)?);
+    }
+    let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
+    validate_review_candidate(
+        main_graph,
+        &merged,
+        &debt,
+        &requirements,
+        &routing,
+        who,
+        role,
+    )
+}
+
+pub(crate) fn validate_review_candidate(
+    main_graph: &Graph,
+    merged: &Graph,
+    debt: &BTreeSet<String>,
+    requirements: &[crate::mutation::Requirement],
+    routing: &Value,
+    who: &str,
+    role: Role,
+) -> Result<()> {
+    for (id, source) in &merged.import_sources {
+        if !main_graph.import_sources.contains_key(id)
+            && (source.schema_hash != main_graph.schema.revision()
+                || source.schema_hash != merged.schema.revision())
+        {
+            bail!("stale_plan: import schema changed; reject proposal and create a new plan");
+        }
+    }
+    policy::validate_change(main_graph, merged, debt)?;
+    merged.schema.validate()?;
+    for pin in &merged.schema.pins {
+        merged.resolve(pin)?;
+    }
+    main_graph
+        .schema
+        .guards(main_graph, merged, who, role.name())?;
+    merged.schema.guards(main_graph, merged, who, role.name())?;
+    for req in requirements {
+        req.check(who, role.name())?;
+    }
+    let errors = policy::lint_routing(routing);
+    if !errors.is_empty() {
+        bail!(
+            "invalid routing triggers: {}",
+            errors.into_iter().collect::<Vec<_>>().join("; ")
+        );
+    }
+    Ok(())
+}
+
 fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Result<Value> {
     let Cmd::Review {
         action,
@@ -845,7 +948,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             crate::review_token::ReviewToken::new(&name, &base, &proposal_revision).encode()?;
         s.checkout(&name)?;
         let proposed = s.graph()?;
-        let ancestor = s.run(&["merge-base", "main", &name])?.trim().to_string();
+        let ancestor = s.merge_base("main", &name)?;
         let old_rows = s.sql(&format!(
             "SELECT payload FROM records AS OF {}",
             storage::revision_literal(&ancestor)
@@ -863,11 +966,11 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             .filter(|(id, r)| old.get(*id) != Some(*r))
             .map(|(id, r)| json!({"id":id,"before":old.get(id),"after":r}))
             .collect();
-        let diff = s.run(&["diff", "main", &name, "edges"])?;
-        let configuration_diff = s.run(&["diff", "main", &name, "metadata"])?;
+        let diff = s.diff_text("main", &name, "edges")?;
+        let configuration_diff = s.diff_text("main", &name, "metadata")?;
         return wrap(
             s,
-            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff,"configuration_diff":configuration_diff,"imports":crate::source_import::summary(&proposed,&if s.one::<u32>("metadata","schema")?==Some(4){s.import_files()?}else{vec![]})}),
+            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff,"configuration_diff":configuration_diff,"imports":crate::source_import::summary(&proposed,&if s.one::<u32>("metadata","schema")?.is_some_and(|v|v>=4){s.import_files()?}else{vec![]})}),
             &name,
         );
     }
@@ -887,7 +990,16 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             .context("review reject requires --reason")?;
         proposal.status = "rejected".into();
         proposal.reason = Some(reason.into());
-        let result = json!({"proposal":proposal,"op_id":op});
+        let mut result = json!({"proposal":proposal,"op_id":op});
+        if s.is_shared() {
+            result["branch"] = json!(name);
+            if cli.dry_run {
+                s.checkout(&name)?;
+                return wrap(s, json!({"dry_run":true,"result":result}), &name);
+            }
+            let result = storage::shared_review::reject(s, cli, &proposal, op, hash, &result)?;
+            return storage::shared_review::receipt_response(s, result, &name);
+        }
         if !cli.dry_run {
             s.checkout(&name)?;
             let mut sql = put("metadata", &name, &proposal)?;
@@ -914,6 +1026,18 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
     crate::review_token::ReviewToken::decode(token)
         .with_context(|| format!("run scrolls review {name} again and pass its review_token"))?
         .check(&name, &base, &proposal_revision)?;
+    if s.is_shared() {
+        let result = storage::shared_review::accept(
+            s,
+            cli,
+            main_graph,
+            &proposal,
+            (&base, &proposal_revision),
+            op,
+            hash,
+        )?;
+        return wrap(s, result, "main");
+    }
     let temp = format!("review/{}", uuid::Uuid::new_v4().simple());
     s.run(&["checkout", "-b", &temp, "main"])?;
     s.journal_review(&temp, &base)?;
@@ -924,47 +1048,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         if !conflicts.is_empty() {
             bail!("merge conflicts on {name}; main remains at {base}")
         }
-        let merged = s.graph()?;
-        let debt = s
-            .one::<ImportInfo>("metadata", "import")?
-            .map(|i| i.lint_debt)
-            .unwrap_or_default();
-        for (id, source) in &merged.import_sources {
-            if !main_graph.import_sources.contains_key(id)
-                && (source.schema_hash != main_graph.schema.revision()
-                    || source.schema_hash != merged.schema.revision())
-            {
-                bail!("stale_plan: import schema changed; reject proposal and create a new plan");
-            }
-        }
-        policy::validate_change(main_graph, &merged, &debt)?;
-        merged.schema.validate()?;
-        for pin in &merged.schema.pins {
-            merged.resolve(pin)?;
-        }
-        main_graph
-            .schema
-            .guards(main_graph, &merged, who, cli.role.name())?;
-        merged
-            .schema
-            .guards(main_graph, &merged, who, cli.role.name())?;
-        let obligations=s.sql("SELECT payload FROM metadata WHERE id LIKE 'guard:%' AND id NOT IN (SELECT id FROM metadata AS OF 'main' WHERE id LIKE 'guard:%')")?;
-        for row in obligations {
-            let requirements: Vec<crate::mutation::Requirement> =
-                serde_json::from_str(row["payload"].as_str().context("guard payload")?)?;
-            for req in requirements {
-                req.check(who, cli.role.name())?;
-            }
-        }
-
-        let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
-        let errors = policy::lint_routing(&routing);
-        if !errors.is_empty() {
-            bail!(
-                "invalid routing triggers: {}",
-                errors.into_iter().collect::<Vec<_>>().join("; ")
-            );
-        }
+        validate_merged_review(s, main_graph, who, cli.role)?;
         if cli.dry_run {
             return Ok(
                 json!({"dry_run":true,"validated":true,"proposal":name,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token}),

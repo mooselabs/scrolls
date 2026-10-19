@@ -1,9 +1,9 @@
 # Shared SQL session foundation
 
 This is the transport foundation, not a shared-authoring release. The CLI now
-uses it for the [direct shared authoring preview](shared-authoring.md), including
-fresh initialization and shared writer fencing. Shared proposal publication,
-durable review recovery, maintenance migrations and the remaining readiness
+uses it for the [shared authoring and review preview](shared-authoring.md), including
+fresh initialization, shared writer fencing, proposal publication and durable
+review recovery. Maintenance migrations and the remaining readiness
 capabilities are still prerequisites before migration. The preview document
 also describes the pinned old-writer source fixture required by these tests.
 
@@ -78,12 +78,10 @@ qualifies that version.
 
 ## Remaining storage qualification
 
-Wire the shared session into the existing authoring, import and review engine;
-validate complete candidate graphs while holding the lock. Move review recovery
-from client files into durable database state, accept on operation-specific
-branches, and verify main advancement. Then qualify stale revisions, simultaneous
-graph constraints, operation-ID replay and changed inputs, proposal conflicts,
-stale human review tokens, recovery from a different client and unsupported
-writers. Schema migrations require exclusive maintenance and verified backups.
-Passing this foundation does not satisfy those remaining tests or migration
-readiness.
+The authoring/review preview now covers candidate validation, temporary-branch
+acceptance, durable recovery, concurrent graph constraints, operation replay,
+stale review tokens and actual prior-writer rejection. See its qualification
+section for the pinned source fixtures. Shared import and maintenance migrations
+remain unsupported. Schema migrations require exclusive maintenance and verified
+backups. Neither the transport nor the authoring/review qualification establishes
+full migration readiness.

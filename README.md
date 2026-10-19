@@ -361,8 +361,9 @@ and support boundaries above describe Scrolls.
 ## Shared authoring development preview
 
 The unreleased shared backend can initialize a fresh externally provisioned Dolt
-2.2.0 database and publish direct graph changes using a named SQL account.
+2.2.0 database and publish direct or reviewed graph changes using a named SQL
+account, with durable cross-client recovery.
 See [shared authoring](docs/shared-authoring.md) for the reviewed initialization
 procedure, connection file, supported commands and qualification fixtures.
-Shared review, migrations, imports, caches and repository discovery remain
+Shared maintenance migrations, imports, caches and repository discovery remain
 unavailable. Local workflows retain their existing behavior.

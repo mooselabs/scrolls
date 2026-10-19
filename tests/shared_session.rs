@@ -261,6 +261,9 @@ fn waiting_writer_reads_the_base_after_lock_acquisition() {
 /// then drop that response. This simulates lost acknowledgement after publish,
 /// rather than a failure before a write was sent.
 fn lose_commit_ack(target_port: u16) -> (u16, std::thread::JoinHandle<()>) {
+    lose_matching_ack(target_port, "CALL DOLT_COMMIT(".into())
+}
+fn lose_matching_ack(target_port: u16, needle: String) -> (u16, std::thread::JoinHandle<()>) {
     use std::{
         io::{Read, Write},
         net::{Shutdown, TcpStream},
@@ -297,7 +300,7 @@ fn lose_commit_ack(target_port: u16) -> (u16, std::thread::JoinHandle<()>) {
         let upstream = std::thread::spawn(move || {
             while let Ok(bytes) = packet(&mut client_in) {
                 if bytes.get(4) == Some(&3)
-                    && String::from_utf8_lossy(&bytes[5..]).starts_with("CALL DOLT_COMMIT(")
+                    && String::from_utf8_lossy(&bytes[5..]).contains(&needle)
                 {
                     request_discard.store(true, Ordering::Release);
                 }
@@ -660,13 +663,9 @@ fn shared_cli_initialization_replay_isolation_fencing_and_refusals() {
     let before = s.call("a", &["list"], true)["revision"].clone();
     for args in [
         vec!["migrate"],
-        vec!["review", "anything"],
-        vec!["proposals"],
         vec!["beads", "list"],
         vec!["consumed"],
         vec!["import", "profiles", "list"],
-        vec!["schema", "apply", "nonexistent", "--expect", "wrong"],
-        vec!["--proposal", "proposal/other", "list"],
     ] {
         assert!(
             s.call("b", &args, false)
@@ -801,25 +800,27 @@ fn shared_cli_handbook_cycle_race_and_research_policies() {
         );
     }
     let before = s.call("a", &["list"], true)["revision"].clone();
+    let protected = s.call(
+        "b",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "protected",
+            "new",
+            "page",
+            "--title",
+            "Review needed",
+            "--body",
+            "x",
+        ],
+        true,
+    );
     assert!(
-        s.call(
-            "b",
-            &[
-                "--role",
-                "agent",
-                "--op-id",
-                "protected",
-                "new",
-                "page",
-                "--title",
-                "Review needed",
-                "--body",
-                "x"
-            ],
-            false
-        )
-        .to_string()
-        .contains("shared_unsupported")
+        protected["data"]["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("proposal/")
     );
     assert_eq!(before, s.call("a", &["list"], true)["revision"]);
     let mut children = vec![];
@@ -1010,7 +1011,7 @@ fn shared_initialization_lost_ack_reconciles_on_another_client() {
         plan["data"]["ontology_digest"].as_str().unwrap(),
     ];
     let actual_port = s.port;
-    let (port, proxy) = lose_commit_ack(actual_port);
+    let (port, proxy) = lose_matching_ack(actual_port, literal("initialize shared Scrolls"));
     s.port = port;
     assert!(
         s.call("a", &args, false)
@@ -1110,40 +1111,8 @@ fn shared_input_files_replay_from_different_client_paths() {
 fn pinned_030_executable_refuses_shared_format_without_database_changes() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = manifest.join(".verification/scrolls-0.3.0");
-    let pin = Command::new("git")
-        .arg("-C")
-        .arg(&source)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("pinned 0.3.0 checkout required, see docs/shared-authoring.md");
-    assert!(pin.status.success(), "pinned 0.3.0 checkout required");
-    assert_eq!(
-        String::from_utf8_lossy(&pin.stdout).trim(),
-        "3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4"
-    );
-    let clean = Command::new("git")
-        .arg("-C")
-        .arg(&source)
-        .args(["status", "--porcelain"])
-        .output()
-        .unwrap();
-    assert!(
-        clean.status.success() && clean.stdout.is_empty(),
-        "baseline source must be clean"
-    );
-    let build_dir = tempfile::tempdir().unwrap();
+    let build_dir = build_pinned(&source, "3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4");
     let target = build_dir.path();
-    let build = Command::new("cargo")
-        .args(["build", "--locked", "--bin", "scrolls"])
-        .current_dir(&source)
-        .env("CARGO_TARGET_DIR", target)
-        .output()
-        .unwrap();
-    assert!(
-        build.status.success(),
-        "{}",
-        String::from_utf8_lossy(&build.stderr)
-    );
     let mut s = Server::empty();
     let initialized = s.init(None);
     s.stop();
@@ -1190,4 +1159,987 @@ fn pinned_030_executable_refuses_shared_format_without_database_changes() {
             .unwrap()
             .is_empty()
     );
+}
+
+impl Server {
+    fn proposed_page(&self, op: &str, title: &str) -> serde_json::Value {
+        self.call(
+            "author",
+            &[
+                "--role",
+                "agent",
+                "--op-id",
+                op,
+                "new",
+                "page",
+                "--title",
+                title,
+                "--body",
+                "proposal text",
+            ],
+            true,
+        )["data"]
+            .clone()
+    }
+    fn token(&self, branch: &str) -> String {
+        self.call("reviewer", &["review", branch], true)["data"]["review_token"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    fn intent(&self, op: &str) -> serde_json::Value {
+        let id = format!("intent:{}", scrolls::model::digest(op));
+        let text: String = self
+            .raw("scrolls-operations")
+            .query_first(format!(
+                "SELECT payload FROM metadata WHERE id={}",
+                literal(&id)
+            ))
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+}
+#[test]
+fn shared_review_propose_inspect_accept_reject_and_configuration() {
+    let s = Server::empty();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    s.init(Some(
+        manifest.join("examples/handbook.yaml").to_str().unwrap(),
+    ));
+    let p = s.proposed_page("page-proposal", "Page");
+    let branch = p["branch"].as_str().unwrap();
+    let id = p["id"].as_str().unwrap();
+    assert!(
+        s.call("reader", &["list"], true)["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let original = s.call(
+        "other",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "page-proposal",
+            "new",
+            "page",
+            "--title",
+            "Page",
+            "--body",
+            "proposal text",
+        ],
+        true,
+    );
+    assert_eq!(original["data"], p);
+    assert_eq!(original["branch"], branch);
+    let token = s.token(branch);
+    let preview = s.call(
+        "reviewer",
+        &[
+            "--dry-run",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    assert_eq!(preview["data"]["validated"], true);
+    assert!(
+        s.call(
+            "agent",
+            &[
+                "--role",
+                "agent",
+                "--op-id",
+                "bad-accept",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token
+            ],
+            false
+        )
+        .to_string()
+        .contains("human")
+    );
+    let accepted = s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept-page",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    assert_eq!(accepted["data"]["proposal"]["status"], "accepted");
+    assert_eq!(
+        s.call("reader", &["show", id], true)["data"]["record"]["title"],
+        "Page"
+    );
+    assert_eq!(
+        accepted["data"],
+        s.call(
+            "other",
+            &[
+                "--op-id",
+                "accept-page",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token
+            ],
+            true
+        )["data"]
+    );
+    let p = s.proposed_page("rejected-page", "Rejected");
+    let branch = p["branch"].as_str().unwrap();
+    let rejected = s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "reject-page",
+            "review",
+            "reject",
+            branch,
+            "--reason",
+            "not wanted",
+        ],
+        true,
+    );
+    assert_eq!(rejected["data"]["proposal"]["status"], "rejected");
+    assert_eq!(
+        rejected["data"],
+        s.call(
+            "other",
+            &[
+                "--op-id",
+                "reject-page",
+                "review",
+                "reject",
+                branch,
+                "--reason",
+                "not wanted"
+            ],
+            true
+        )["data"]
+    );
+    assert!(
+        s.call(
+            "other",
+            &[
+                "--op-id",
+                "reject-page",
+                "review",
+                "reject",
+                branch,
+                "--reason",
+                "different"
+            ],
+            false
+        )
+        .to_string()
+        .contains("different arguments")
+    );
+    let schema = s.call("reader", &["schema", "show"], true)["data"]["schema_revision"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let changed = s.dir.path().join("schema.yaml");
+    let mut text = fs::read_to_string(manifest.join("examples/handbook.yaml")).unwrap();
+    text.push_str("\n# A reviewed configuration update\n");
+    text = text.replace("A handbook page", "A reviewed handbook page");
+    fs::write(&changed, text).unwrap();
+    let proposal = s.call(
+        "author",
+        &[
+            "--op-id",
+            "schema-change",
+            "schema",
+            "apply",
+            changed.to_str().unwrap(),
+            "--expect",
+            &schema,
+        ],
+        true,
+    );
+    let branch = proposal["data"]["branch"].as_str().unwrap();
+    assert_eq!(
+        s.call("reader", &["schema", "show"], true)["data"]["schema_revision"],
+        schema
+    );
+    let token = s.token(branch);
+    s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "schema-accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    assert_ne!(
+        s.call("reader", &["schema", "show"], true)["data"]["schema_revision"],
+        schema
+    );
+}
+
+impl Server {
+    fn interrupted(&mut self, args: &[&str], needle: String) {
+        let actual = self.port;
+        let (port, proxy) = lose_matching_ack(actual, needle);
+        self.port = port;
+        self.call("lost-client", args, false);
+        proxy.join().unwrap();
+        self.port = actual;
+        fs::remove_dir_all(self.dir.path().join("lost-client")).unwrap();
+    }
+    fn handbook() -> Self {
+        let s = Self::empty();
+        s.init(Some(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/handbook.yaml")
+                .to_str()
+                .unwrap(),
+        ));
+        s
+    }
+    fn main_head(&self) -> String {
+        self.raw("main")
+            .query_first("SELECT DOLT_HASHOF('HEAD')")
+            .unwrap()
+            .unwrap()
+    }
+}
+#[test]
+fn shared_review_recovers_each_acceptance_boundary_without_origin_files() {
+    for boundary in [
+        "CALL DOLT_BRANCH(",
+        "SELECT * FROM dolt_conflicts",
+        "accept-commit",
+        "CALL DOLT_MERGE('--ff-only'",
+    ] {
+        let mut s = Server::handbook();
+        let p = s.proposed_page("propose", "Recover me");
+        let branch = p["branch"].as_str().unwrap();
+        let token = s.token(branch);
+        let before = s.main_head();
+        let needle = if boundary == "accept-commit" {
+            literal(&format!("accept {branch} by alice"))
+        } else {
+            boundary.into()
+        };
+        s.interrupted(
+            &[
+                "--op-id",
+                "accept",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token,
+            ],
+            needle,
+        );
+        let intent = s.intent("accept");
+        assert_eq!(intent["plan"]["base"], before);
+        let r = s.call("second-machine", &["recover", "accept", "--resume"], true);
+        assert_eq!(r["data"]["proposal"]["status"], "accepted");
+        assert_ne!(s.main_head(), before);
+        assert_eq!(
+            r["data"],
+            s.call("third-machine", &["recover", "accept", "--resume"], true)["data"]
+        );
+        s.call("reader", &["doctor"], true);
+    }
+}
+#[test]
+fn shared_review_candidate_is_not_publication_and_stale_recovery_never_refreshes() {
+    let mut s = Server::handbook();
+    let p = s.proposed_page("propose", "Candidate");
+    let branch = p["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    let before = s.main_head();
+    s.interrupted(
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        literal(&format!("accept {branch} by alice")),
+    );
+    assert_eq!(s.main_head(), before);
+    s.call(
+        "other",
+        &[
+            "--op-id",
+            "advance",
+            "new",
+            "page",
+            "--title",
+            "Later",
+            "--body",
+            "unrelated",
+        ],
+        true,
+    );
+    let later = s.main_head();
+    let error = s.call("second", &["recover", "accept", "--resume"], false);
+    assert!(error.to_string().contains("stale"), "{error}");
+    assert_eq!(s.main_head(), later);
+    let inspected = s.call("second", &["recover", "accept"], true);
+    assert_eq!(inspected["data"]["published"], false);
+    s.call(
+        "second",
+        &[
+            "--op-id",
+            "cancel",
+            "recover",
+            "accept",
+            "--abandon",
+            "--reason",
+            "Reinspect against changed main",
+        ],
+        true,
+    );
+    assert!(
+        s.call("second", &["recover", "accept", "--resume"], false)
+            .to_string()
+            .contains("abandoned")
+    );
+    assert_eq!(s.main_head(), later);
+}
+#[test]
+fn shared_review_published_receipt_survives_later_main_advance() {
+    let mut s = Server::handbook();
+    let p = s.proposed_page("propose", "Published");
+    let branch = p["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.interrupted(
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        "CALL DOLT_MERGE('--ff-only'".into(),
+    );
+    s.call(
+        "other",
+        &[
+            "--op-id",
+            "advance",
+            "new",
+            "page",
+            "--title",
+            "Later",
+            "--body",
+            "unrelated",
+        ],
+        true,
+    );
+    let later = s.main_head();
+    assert_eq!(
+        s.call("second", &["recover", "accept", "--resume"], true)["data"]["proposal"]["status"],
+        "accepted"
+    );
+    assert_eq!(s.main_head(), later);
+}
+
+#[test]
+fn shared_review_preserves_staged_only_foreign_data() {
+    let mut s = Server::handbook();
+    let p = s.proposed_page("propose", "Staged protection");
+    let branch = p["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.interrupted(
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        "SELECT * FROM dolt_conflicts".into(),
+    );
+    let intent = s.intent("accept");
+    let temp = intent["plan"]["branch"].as_str().unwrap();
+    let mut raw = s.raw(temp);
+    raw.query_drop("INSERT INTO metadata VALUES ('foreign','{}'); CALL DOLT_ADD('.'); DELETE FROM metadata WHERE id='foreign'").unwrap();
+    let staged: String = raw
+        .query_first("SELECT DOLT_HASHOF_DB('STAGED')")
+        .unwrap()
+        .unwrap();
+    let working: String = raw
+        .query_first("SELECT DOLT_HASHOF_DB('WORKING')")
+        .unwrap()
+        .unwrap();
+    for args in [
+        vec!["recover", "accept", "--resume"],
+        vec![
+            "--op-id",
+            "cancel",
+            "recover",
+            "accept",
+            "--abandon",
+            "--reason",
+            "cannot erase foreign work",
+        ],
+    ] {
+        s.call("second", &args, false);
+        assert_eq!(
+            raw.query_first::<String, _>("SELECT DOLT_HASHOF_DB('STAGED')")
+                .unwrap()
+                .unwrap(),
+            staged
+        );
+        assert_eq!(
+            raw.query_first::<String, _>("SELECT DOLT_HASHOF_DB('WORKING')")
+                .unwrap()
+                .unwrap(),
+            working
+        );
+    }
+}
+#[test]
+fn shared_review_resumes_interrupted_abandonment_control() {
+    let mut s = Server::handbook();
+    let p = s.proposed_page("propose", "Cancel");
+    let branch = p["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.interrupted(
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        "SELECT * FROM dolt_conflicts".into(),
+    );
+    s.interrupted(
+        &[
+            "--op-id",
+            "cancel",
+            "recover",
+            "accept",
+            "--abandon",
+            "--reason",
+            "Owner cancelled",
+        ],
+        literal("record shared operation recovery"),
+    );
+    let result = s.call("second", &["recover", "cancel", "--resume"], true);
+    assert_eq!(result["data"]["abandoned"], "accept");
+    s.call("reader", &["doctor"], true);
+}
+
+fn build_pinned(source: &Path, revision: &str) -> tempfile::TempDir {
+    let pin = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("pinned baseline checkout required, see docs/shared-authoring.md");
+    assert!(pin.status.success(), "pinned baseline checkout required");
+    assert_eq!(String::from_utf8_lossy(&pin.stdout).trim(), revision);
+    let clean = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        clean.status.success() && clean.stdout.is_empty(),
+        "baseline source must be clean"
+    );
+    let build_dir = tempfile::tempdir().unwrap();
+    let target = build_dir.path();
+    let build = Command::new("cargo")
+        .args(["build", "--locked", "--bin", "scrolls"])
+        .current_dir(source)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    build_dir
+}
+
+#[test]
+fn prior_shared_writer_executable_refuses_review_generation() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(".verification/scrolls-shared-v1");
+    let build = build_pinned(&source, "1ef4eeeeff3a41c52beb29131878cad571b0d230");
+    let s = Server::handbook();
+    let before = s.main_head();
+    let client = s.client(
+        "old",
+        &[
+            "--op-id",
+            "must-refuse",
+            "new",
+            "page",
+            "--title",
+            "No",
+            "--body",
+            "x",
+        ],
+    );
+    let out = Command::new(build.path().join("debug/scrolls"))
+        .args(client.get_args())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("unsupported_shared_writer"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(s.main_head(), before);
+    s.call("new", &["doctor"], true);
+}
+#[test]
+fn shared_review_proposal_rejection_recover_and_operation_ids_are_reserved() {
+    let mut s = Server::handbook();
+    let args = [
+        "--role",
+        "agent",
+        "--op-id",
+        "propose",
+        "new",
+        "page",
+        "--title",
+        "Interrupted",
+        "--body",
+        "durable",
+    ];
+    s.interrupted(&args, "CALL DOLT_BRANCH(".into());
+    let changed = s.call(
+        "second",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "propose",
+            "new",
+            "page",
+            "--title",
+            "Different",
+            "--body",
+            "durable",
+        ],
+        false,
+    );
+    assert!(changed.to_string().contains("different arguments"));
+    let p = s.call(
+        "second",
+        &["--role", "agent", "recover", "propose", "--resume"],
+        true,
+    );
+    let branch = p["data"]["branch"].as_str().unwrap();
+    s.interrupted(
+        &[
+            "--op-id", "reject", "review", "reject", branch, "--reason", "No",
+        ],
+        literal(&format!("reject {branch} by alice")),
+    );
+    let r = s.call("third", &["recover", "reject", "--resume"], true);
+    assert_eq!(r["data"]["proposal"]["status"], "rejected");
+    s.call(
+        "third",
+        &[
+            "--op-id",
+            "reject",
+            "new",
+            "page",
+            "--title",
+            "cannot reuse",
+            "--body",
+            "x",
+        ],
+        false,
+    );
+}
+#[test]
+fn shared_partial_initialization_is_never_implicitly_repaired() {
+    let mut s = Server::empty();
+    let p = s.call("a", &["init", "--dry-run"], true);
+    let args = [
+        "init",
+        "--op-id",
+        "init",
+        "--expect-base",
+        p["data"]["base_revision"].as_str().unwrap(),
+        "--expect-schema",
+        p["data"]["ontology_digest"].as_str().unwrap(),
+    ];
+    s.interrupted(&args, "CALL DOLT_COMMIT(".into());
+    let before = s.main_head();
+    s.call("b", &args, false);
+    s.call("b", &["list"], false);
+    assert_eq!(s.main_head(), before);
+}
+
+#[test]
+fn shared_review_concurrent_acceptance_and_graph_cycle_merge_fail_closed() {
+    let s = Server::handbook();
+    let ids: Vec<String> = (0..2)
+        .map(|n| {
+            s.call(
+                "writer",
+                &[
+                    "--op-id",
+                    &format!("page{n}"),
+                    "new",
+                    "page",
+                    "--title",
+                    "Page",
+                    "--body",
+                    "x",
+                ],
+                true,
+            )["data"]["id"]
+                .as_str()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    let proposals: Vec<String> = (0..2)
+        .map(|n| {
+            s.call(
+                "agent",
+                &[
+                    "--role",
+                    "agent",
+                    "--op-id",
+                    &format!("link{n}"),
+                    "link",
+                    &ids[n],
+                    "chapter",
+                    &ids[1 - n],
+                    "--expect",
+                    "1",
+                ],
+                true,
+            )["data"]["branch"]
+                .as_str()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    let tokens: Vec<String> = proposals.iter().map(|p| s.token(p)).collect();
+    let children: Vec<_> = (0..2)
+        .map(|n| {
+            s.client(
+                &format!("reviewer{n}"),
+                &[
+                    "--op-id",
+                    &format!("accept{n}"),
+                    "review",
+                    "accept",
+                    &proposals[n],
+                    "--review-token",
+                    &tokens[n],
+                ],
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+        })
+        .collect();
+    let results: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|o| o.status.success()).count(), 1);
+    let failed = results.iter().position(|o| !o.status.success()).unwrap();
+    assert!(String::from_utf8_lossy(&results[failed].stdout).contains("stale"));
+    let before = s.main_head();
+    let token = s.token(&proposals[failed]);
+    let error = s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "reinspect",
+            "review",
+            "accept",
+            &proposals[failed],
+            "--review-token",
+            &token,
+        ],
+        false,
+    );
+    assert!(error.to_string().contains("cycle"), "{error}");
+    assert_eq!(s.main_head(), before);
+    s.call("reader", &["doctor"], true);
+}
+#[test]
+fn shared_review_research_ontology_and_stale_proposal_token() {
+    let s = Server::empty();
+    s.init(Some(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/research.yaml")
+            .to_str()
+            .unwrap(),
+    ));
+    let file = s.dir.path().join("research.json");
+    fs::write(&file,serde_json::to_vec(&json!([
+      {"op":"new","handle":"trial","kind":"trial","title":"Measurement","fields":{"count":3}},
+      {"op":"new","handle":"claim","kind":"hypothesis","title":"Claim","fields":{"claim":"Measurable"}},
+      {"op":"link","from":"$trial","rel":"corroborates","to":"$claim","why":"measurement"}
+    ])).unwrap()).unwrap();
+    let p = s.call(
+        "researcher",
+        &["--op-id", "research", "batch", file.to_str().unwrap()],
+        true,
+    );
+    let branch = p["data"]["branch"].as_str().unwrap();
+    let id = p["data"]["handles"]["claim"].as_str().unwrap();
+    let token = s.token(branch);
+    s.call(
+        "researcher",
+        &[
+            "--proposal",
+            branch,
+            "--op-id",
+            "revision",
+            "edit",
+            id,
+            "--expect",
+            "1",
+            "--body",
+            "More evidence",
+        ],
+        true,
+    );
+    let before = s.main_head();
+    assert!(
+        s.call(
+            "reviewer",
+            &[
+                "--op-id",
+                "stale",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token
+            ],
+            false
+        )
+        .to_string()
+        .contains("stale")
+    );
+    assert_eq!(s.main_head(), before);
+    let token = s.token(branch);
+    s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    s.call("reader", &["lint"], true);
+}
+
+#[test]
+fn shared_review_preserves_hidden_versioned_trigger_state() {
+    for staged_only in [false, true] {
+        let mut s = Server::handbook();
+        let p = s.proposed_page("propose", "Hidden state");
+        let branch = p["branch"].as_str().unwrap();
+        let token = s.token(branch);
+        s.interrupted(
+            &[
+                "--op-id",
+                "accept",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token,
+            ],
+            "SELECT * FROM dolt_conflicts".into(),
+        );
+        let intent = s.intent("accept");
+        let temp = intent["plan"]["branch"].as_str().unwrap();
+        let mut raw = s.raw(temp);
+        raw.query_drop("CREATE TRIGGER foreign_trigger BEFORE INSERT ON records FOR EACH ROW SET NEW.payload = NEW.payload").unwrap();
+        if staged_only {
+            raw.query_drop("CALL DOLT_ADD('.'); DROP TRIGGER foreign_trigger")
+                .unwrap();
+        }
+        let staged: String = raw
+            .query_first("SELECT DOLT_HASHOF_DB('STAGED')")
+            .unwrap()
+            .unwrap();
+        let working: String = raw
+            .query_first("SELECT DOLT_HASHOF_DB('WORKING')")
+            .unwrap()
+            .unwrap();
+        for args in [
+            vec!["recover", "accept", "--resume"],
+            vec![
+                "--op-id",
+                "cancel",
+                "recover",
+                "accept",
+                "--abandon",
+                "--reason",
+                "Preserve foreign state",
+            ],
+        ] {
+            let error = s.call("second", &args, false);
+            assert!(error.to_string().contains("dirty_state"), "{error}");
+            assert_eq!(
+                raw.query_first::<String, _>("SELECT DOLT_HASHOF_DB('STAGED')")
+                    .unwrap()
+                    .unwrap(),
+                staged
+            );
+            assert_eq!(
+                raw.query_first::<String, _>("SELECT DOLT_HASHOF_DB('WORKING')")
+                    .unwrap()
+                    .unwrap(),
+                working
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_review_default_ontology_conflicting_proposals_preserve_main() {
+    let s = Server::empty();
+    s.init(None);
+    let e = s.call(
+        "a",
+        &[
+            "--op-id", "evidence", "new", "evidence", "--title", "Observed", "--body", "facts",
+        ],
+        true,
+    );
+    let file = s.dir.path().join("supported.json");
+    fs::write(
+        &file,
+        serde_json::to_vec(&json!([
+          {"op":"new","handle":"doc","kind":"knowledge","title":"Knowledge","body":"supported"},
+          {"op":"link","from":e["data"]["id"],"rel":"supports","to":"$doc","expect":1}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let p = s.call(
+        "a",
+        &["--op-id", "knowledge", "batch", file.to_str().unwrap()],
+        true,
+    );
+    let branch = p["data"]["branch"].as_str().unwrap();
+    let id = p["data"]["handles"]["doc"].as_str().unwrap();
+    s.call(
+        "b",
+        &[
+            "--op-id",
+            "initial-review",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &s.token(branch),
+        ],
+        true,
+    );
+    let branches: Vec<String> = ["one", "two"]
+        .iter()
+        .map(|body| {
+            s.call(
+                "a",
+                &["--op-id", body, "edit", id, "--expect", "1", "--body", body],
+                true,
+            )["data"]["branch"]
+                .as_str()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    s.call(
+        "b",
+        &[
+            "--op-id",
+            "review-one",
+            "review",
+            "accept",
+            &branches[0],
+            "--review-token",
+            &s.token(&branches[0]),
+        ],
+        true,
+    );
+    let before = s.main_head();
+    let error = s.call(
+        "b",
+        &[
+            "--op-id",
+            "review-two",
+            "review",
+            "accept",
+            &branches[1],
+            "--review-token",
+            &s.token(&branches[1]),
+        ],
+        false,
+    );
+    assert!(error.to_string().contains("merge_conflict"), "{error}");
+    assert_eq!(s.main_head(), before);
+    s.call("b", &["doctor"], true);
+}
+
+#[test]
+fn shared_committed_row_identity_mismatch_is_refused() {
+    let s = Server::handbook();
+    s.call(
+        "a",
+        &[
+            "--op-id", "page", "new", "page", "--title", "Page", "--body", "x",
+        ],
+        true,
+    );
+    let mut raw = s.raw("main");
+    raw.query_drop("UPDATE records SET id='wrong'; CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','foreign identity mismatch','--author','Raw <raw@localhost>')").unwrap();
+    let before = s.main_head();
+    let error = s.call("b", &["list"], false);
+    assert!(error.to_string().contains("stored_row_identity"), "{error}");
+    assert_eq!(s.main_head(), before);
 }

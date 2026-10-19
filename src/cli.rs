@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 #[derive(Parser, Debug, Serialize)]
 #[command(
@@ -32,7 +32,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Cmd,
 }
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq)]
 pub enum Role {
     Human,
     Agent,
@@ -98,6 +98,16 @@ pub enum Cmd {
         at: Option<String>,
     },
     Doctor,
+    /// Inspect, resume, or explicitly abandon an owned interrupted shared operation.
+    Recover {
+        operation: String,
+        #[arg(long)]
+        abandon: bool,
+        #[arg(long, conflicts_with = "abandon")]
+        resume: bool,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Upgrade store metadata and relation registry explicitly.
     Migrate,
     Beads {
@@ -320,6 +330,10 @@ impl Cmd {
                 | Self::Answer { .. }
                 | Self::Accept { .. }
         ) || matches!(self,Self::Review{action,..} if action=="accept"||action=="reject")
+            || matches!(
+                self,
+                Self::Recover { abandon: true, .. } | Self::Recover { resume: true, .. }
+            )
     }
 }
 

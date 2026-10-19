@@ -4,7 +4,7 @@ use super::{
     session::{Connection, SharedSession},
 };
 use crate::{
-    cli::{Cli, Cmd, Role, SchemaCommand},
+    cli::{Cli, Cmd, Role},
     model::digest,
     schema::Schema,
 };
@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-const TABLES: &[(&str, usize)] = &[
+pub(super) const TABLES: &[(&str, usize)] = &[
     ("import_sources", 128),
     ("import_files", 128),
     ("import_members", 128),
@@ -38,31 +38,33 @@ struct Settings {
     user: String,
     password: String,
 }
-fn connect(path: &Path) -> Result<SharedSession> {
+fn connect(path: &Path, recovery: bool) -> Result<SharedSession> {
     let bytes = fs::read(path).context("cannot read machine-local connection file")?;
     // Parsing errors may quote supplied values. Never echo a credential file.
     let settings: Settings = serde_json::from_slice(&bytes).map_err(|_| {
         anyhow::anyhow!("invalid connection JSON: expected host, port, database, user, password")
     })?;
-    SharedSession::connect(
-        &Connection {
-            host: settings.host,
-            port: settings.port,
-            database: settings.database,
-            user: settings.user,
-            password: settings.password,
-            connect_timeout: Duration::from_secs(5),
-            io_timeout: Duration::from_secs(30),
-            lock_timeout: Duration::from_secs(10),
-        },
-        "main",
-    )
+    let config = Connection {
+        host: settings.host,
+        port: settings.port,
+        database: settings.database,
+        user: settings.user,
+        password: settings.password,
+        connect_timeout: Duration::from_secs(5),
+        io_timeout: Duration::from_secs(30),
+        lock_timeout: Duration::from_secs(10),
+    };
+    if recovery {
+        SharedSession::connect_locked(&config, "main")
+    } else {
+        SharedSession::connect(&config, "main")
+    }
 }
 
 pub fn check_command(cli: &Cli) -> Result<()> {
     ensure!(
-        cli.proposal.is_none(),
-        "shared_unsupported: proposal branches"
+        !(matches!(cli.command, Cmd::Recover { .. }) && cli.proposal.is_some()),
+        "recovery operates on main; omit --proposal"
     );
     ensure!(
         !matches!(
@@ -71,16 +73,14 @@ pub fn check_command(cli: &Cli) -> Result<()> {
                 | Cmd::Import { .. }
                 | Cmd::Beads { .. }
                 | Cmd::Consumed { .. }
-                | Cmd::Review { .. }
-                | Cmd::Proposals
                 | Cmd::Context { bead: Some(_), .. }
-                | Cmd::Schema {
-                    command: SchemaCommand::Apply { .. }
-                }
         ),
-        "shared_unsupported: review, migration, import, Beads and audit paths require further qualification"
+        "shared_unsupported: migration, import, Beads and audit paths require further qualification"
     );
-    if cli.command.mutation() && !cli.dry_run {
+    if cli.command.mutation()
+        && !cli.dry_run
+        && !matches!(cli.command, Cmd::Recover { resume: true, .. })
+    {
         let op = cli
             .op_id
             .as_deref()
@@ -99,7 +99,7 @@ impl Store {
             db: PathBuf::new(),
             binary: PathBuf::new(),
             _lock: None,
-            shared: Some(connect(path)?),
+            shared: Some(connect(path, false)?),
         })
     }
     pub fn is_shared(&self) -> bool {
@@ -110,7 +110,20 @@ impl Store {
         s.check_shared_format()?;
         Ok(s)
     }
-    fn table_names(&self) -> Result<std::collections::BTreeSet<String>> {
+    pub(crate) fn open_shared_recovery(path: &Path, root: &Path, op: &str) -> Result<Self> {
+        let s = Self {
+            root: root.into(),
+            db: PathBuf::new(),
+            binary: PathBuf::new(),
+            _lock: None,
+            shared: Some(connect(path, true)?),
+        };
+        super::session::SqlSession::clean(s.shared.as_ref().unwrap())?;
+        s.check_shared_format()?;
+        super::shared_review::check_dirt(&s, op)?;
+        Ok(s)
+    }
+    pub(super) fn table_names(&self) -> Result<std::collections::BTreeSet<String>> {
         self.sql("SHOW TABLES")?
             .iter()
             .map(|row| {
@@ -130,13 +143,59 @@ impl Store {
         );
         ensure!(
             self.one::<u32>("metadata", "schema")? == Some(5)
-                && self.one::<u32>("metadata", "shared_writer")? == Some(1),
-            "unsupported_shared_writer: this client requires shared format 5, writer 1; no automatic migration"
+                && self.one::<u32>("metadata", "shared_writer")? == Some(2),
+            "unsupported_shared_writer: this client requires shared format 5, writer 2; no automatic migration"
         );
         let uuid: String = self
             .one("metadata", "store_id")?
             .context("missing shared store identity")?;
         uuid::Uuid::parse_str(&uuid).context("invalid shared store identity")?;
+        ensure!(
+            self.one::<bool>("metadata", "shared_ready")? == Some(true),
+            "shared_init_refused: incomplete initialization; preserve it for maintenance"
+        );
+        ensure!(
+            self.branches()?
+                .contains(&super::shared_review::JOURNAL.to_string()),
+            "shared_recovery_missing: durable operation branch is absent"
+        );
+        ensure!(
+            self.one_at::<String>("metadata", "store_id", super::shared_review::JOURNAL)?
+                == Some(uuid)
+                && self.one_at::<u32>(
+                    "metadata",
+                    "recovery_format",
+                    super::shared_review::JOURNAL
+                )? == Some(1),
+            "shared_recovery_missing: invalid durable operation identity"
+        );
+        self.check_versioned_inventory("HEAD")?;
+        self.check_versioned_inventory(super::shared_review::JOURNAL)?;
+        Ok(())
+    }
+    pub(super) fn check_versioned_inventory(&self, revision: &str) -> Result<()> {
+        let base: String = self
+            .one_at("metadata", "storage_base", "main")?
+            .context("missing shared storage baseline")?;
+        ensure!(
+            base.len() == 32 && base.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "invalid shared storage baseline"
+        );
+        for row in self.sql(&format!(
+            "SELECT * FROM DOLT_DIFF_SUMMARY({}, {})",
+            super::literal(&base),
+            super::literal(revision)
+        ))? {
+            for key in ["from_table_name", "to_table_name"] {
+                let name = row[key]
+                    .as_str()
+                    .context("versioned inventory table name")?;
+                ensure!(
+                    name.is_empty() || TABLES.iter().any(|(t, _)| *t == name),
+                    "dirty_state: unexpected versioned table {name}; preserve it"
+                );
+            }
+        }
         Ok(())
     }
     fn pristine(&self) -> Result<()> {
@@ -199,7 +258,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     if cli.dry_run {
         return Ok(
             json!({"schema_version":2,"ok":true,"revision":base,"branch":"main",
-            "data":{"dry_run":true,"base_revision":base,"ontology_digest":ontology_digest,"format":5,"writer":1}}),
+            "data":{"dry_run":true,"base_revision":base,"ontology_digest":ontology_digest,"format":5,"writer":2}}),
         );
     }
     ensure!(
@@ -223,7 +282,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     }
     let store_id = uuid::Uuid::new_v4().to_string();
     sql.push_str(&put("metadata", "schema", &5)?);
-    sql.push_str(&put("metadata", "shared_writer", &1)?);
+    sql.push_str(&put("metadata", "shared_writer", &2)?);
     sql.push_str(&put("metadata", "store_id", &store_id)?);
     sql.push_str(&put("metadata", "ontology", schema)?);
     let result =
@@ -232,8 +291,28 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
         .actor
         .as_deref()
         .context("initialization requires actor")?;
-    sql.push_str(&super::insert("operations", op, &json!({"op_id":op,"args_hash":hash,"actor":actor,"result":result,"committed_at":crate::model::now()}))?);
-    s.transaction(&sql, "initialize shared Scrolls", actor)?;
+    sql.push_str(&put("metadata", "storage_base", &base)?);
+    sql.push_str(&put("metadata", "shared_ready", &false)?);
+    s.transaction(&sql, "initialize shared layout", actor)?;
+    let layout = s.revision()?;
+    s.sql(&format!(
+        "CALL DOLT_BRANCH({}, 'main')",
+        super::literal(super::shared_review::JOURNAL)
+    ))?;
+    s.select_shared(super::shared_review::JOURNAL)?;
+    s.transaction(
+        &put("metadata", "recovery_format", &1)?,
+        "initialize durable operations",
+        actor,
+    )?;
+    s.select_shared("main")?;
+    ensure!(
+        s.revision()? == layout,
+        "shared_init_refused: initialization base changed"
+    );
+    let mut final_sql = put("metadata", "shared_ready", &true)?;
+    final_sql.push_str(&super::insert("operations", op, &json!({"op_id":op,"args_hash":hash,"actor":actor,"result":result,"committed_at":crate::model::now()}))?);
+    s.transaction(&final_sql, "initialize shared Scrolls", actor)?;
     s.check_shared_format()?;
     Ok(json!({"schema_version":2,"ok":true,"revision":s.revision()?,"branch":"main","data":result}))
 }
