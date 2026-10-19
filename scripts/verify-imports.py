@@ -28,12 +28,13 @@ def run(args, *, cwd=None, env=None):
 @contextlib.contextmanager
 def shared_server(out):
     """Never accept an external endpoint: this fixture owns its entire service."""
-    assert run([DOLT, "version"]).decode().strip() == "dolt version 2.2.0"
     database = "capture_" + uuid.uuid4().hex
     directory = out / "server" / database
     directory.mkdir(parents=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith("DOLT_")}
     env.update(DOLT_ROOT_PATH=str(out / "server-home"), DOLT_DISABLE_EVENT_FLUSH="1")
+    # Dolt appends its update notice to stdout; the first line is its version.
+    assert run([DOLT, "version"], env=env).decode().splitlines()[:1] == ["dolt version 2.2.0"], "Dolt 2.2.0 required"
     run([DOLT, "init", "--name", "Qualification", "--email", "fixture@localhost"], cwd=directory, env=env)
     initial = json.loads(run([DOLT, "sql", "-r", "json", "-q", "SELECT DOLT_HASHOF('HEAD') AS revision"], cwd=directory, env=env))["rows"][0]["revision"]
     # Account state belongs to this disposable directory, outside versioned rows.
