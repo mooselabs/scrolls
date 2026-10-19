@@ -1,0 +1,2410 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Scrolls read API",
+    "version": "v0",
+    "description": "Loopback-only, read-only knowledge API. Numeric loopback bind only; remote access requires a tunnel. Host must be localhost, canonical loopback or the bound IP at the actual listening port. Requests carrying Origin are refused; no CORS. Every success except /healthz requires a current locked backend read; no stale success. Local format 4 and existing shared format 5/writer 3 only. No migration, recovery, audit appends, Beads I/O, mutation, file export or arbitrary SQL. Query bodies are limited to 65536 bytes. Unknown query parameters and duplicate scalar parameters are rejected. Error codes and messages are stable and sanitized."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:{port}",
+      "variables": {
+        "port": {
+          "default": "8080",
+          "description": "Actual port from startup record; example only."
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/v0/context": {
+      "get": {
+        "summary": "Discover server",
+        "operationId": "discover_server",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Discovery"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/schema": {
+      "get": {
+        "summary": "Read active ontology",
+        "operationId": "read_active_ontology",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Schema"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/records": {
+      "get": {
+        "summary": "List or search records",
+        "operationId": "list_or_search_records",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "owner",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "field",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": "Repeated field=KEY=JSON filters; owner=me binds the configured server actor."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor. Repeat the same request parameters; snapshot changes return 409 snapshot_changed."
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Page"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/records/{id}": {
+      "get": {
+        "summary": "Read document",
+        "operationId": "read_document",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Native ID, alias or percent-encoded scrolls://STORE/ID URI. Proposal paths accept the suffix or full proposal/NAME."
+          },
+          {
+            "name": "provenance",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Document"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/records/{id}/context": {
+      "get": {
+        "summary": "Read bounded document context",
+        "operationId": "read_bounded_document_context",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Native ID, alias or percent-encoded scrolls://STORE/ID URI. Proposal paths accept the suffix or full proposal/NAME."
+          },
+          {
+            "name": "budget",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 16000
+            },
+            "description": "Hard compact-JSON items-array budget. Insufficient mandatory document budget returns 400."
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Packet"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/records/{id}/walk": {
+      "get": {
+        "summary": "Traverse graph",
+        "operationId": "traverse_graph",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Native ID, alias or percent-encoded scrolls://STORE/ID URI. Proposal paths accept the suffix or full proposal/NAME."
+          },
+          {
+            "name": "direction",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "incoming",
+                "outgoing",
+                "both"
+              ],
+              "default": "both"
+            }
+          },
+          {
+            "name": "rel",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100,
+              "default": 2
+            }
+          },
+          {
+            "name": "full",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Walk"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/prime": {
+      "get": {
+        "summary": "Read orientation guide and pins",
+        "operationId": "read_orientation_guide_and_pins",
+        "parameters": [
+          {
+            "name": "budget",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 16000
+            },
+            "description": "Soft budget; full guide, instructions and pins are always returned with over_budget_bytes."
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Packet"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/query": {
+      "post": {
+        "summary": "Evaluate structured selection",
+        "operationId": "evaluate_structured_selection",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Selection"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Query"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v0/proposals": {
+      "get": {
+        "summary": "List proposal metadata",
+        "operationId": "list_proposal_metadata",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Proposal"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/proposals/{id}": {
+      "get": {
+        "summary": "Inspect proposal",
+        "operationId": "inspect_proposal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Native ID, alias or percent-encoded scrolls://STORE/ID URI. Proposal paths accept the suffix or full proposal/NAME."
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/ProposalDetail"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/history": {
+      "get": {
+        "summary": "Read store or record history",
+        "operationId": "read_store_or_record_history",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional native record ID or alias."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor. Repeat the same request parameters; snapshot changes return 409 snapshot_changed."
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Page"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v0/openapi.json": {
+      "get": {
+        "summary": "Read OpenAPI specification",
+        "operationId": "read_openapi_specification",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Check process liveness",
+        "operationId": "check_process_liveness",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "ok"
+                  ]
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Check backend readiness",
+        "operationId": "check_backend_readiness",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "ready": {
+                          "const": true
+                        }
+                      },
+                      "required": [
+                        "ready"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "ok",
+          "error"
+        ],
+        "properties": {
+          "schema_version": {
+            "const": 2
+          },
+          "ok": {
+            "const": false
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Record": {
+        "type": "object",
+        "description": "Existing Scrolls record envelope; fields follow the active ontology. All record revisions are numeric.",
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "body",
+          "status",
+          "owner",
+          "revision",
+          "fields",
+          "aliases"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "fields": {
+            "type": "object"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Reference": {
+        "type": "object",
+        "description": "Immediate/traversal reference, including direction and relation when applicable; external references may have null metadata.",
+        "required": [
+          "id",
+          "summary_only"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "revision": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary_only": {
+            "const": true
+          }
+        }
+      },
+      "Document": {
+        "type": "object",
+        "required": [
+          "uri",
+          "record",
+          "references",
+          "edges",
+          "related_work",
+          "provenance"
+        ],
+        "properties": {
+          "uri": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record": {
+            "$ref": "#/components/schemas/Record"
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Reference"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "related_work": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "provenance": {
+            "description": "Source, profile, commit, path and membership metadata when requested; null for native documents or when omitted.",
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      },
+      "Page": {
+        "type": "object",
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {}
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque request/snapshot/last-item binding. Repeat the same filters and limit. Restart on snapshot_changed."
+          }
+        }
+      },
+      "Packet": {
+        "type": "object",
+        "required": [
+          "items",
+          "omitted",
+          "used_bytes",
+          "budget_bytes",
+          "over_budget_bytes",
+          "budget_scope"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "omitted": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "used_bytes": {
+            "type": "integer"
+          },
+          "budget_bytes": {
+            "type": "integer"
+          },
+          "over_budget_bytes": {
+            "type": "integer"
+          },
+          "budget_scope": {
+            "type": "string"
+          }
+        }
+      },
+      "Proposal": {
+        "type": "object",
+        "required": [
+          "branch",
+          "base",
+          "actor",
+          "status"
+        ],
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "base": {
+            "type": "string"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "accepted",
+              "rejected"
+            ]
+          },
+          "revision": {
+            "type": "string",
+            "description": "Added by the HTTP proposal collection; proposal commit revision."
+          }
+        }
+      },
+      "ProposalDetail": {
+        "type": "object",
+        "required": [
+          "proposal",
+          "main_revision",
+          "proposal_revision",
+          "merge_base",
+          "records",
+          "graph_diff",
+          "configuration_diff",
+          "imports",
+          "review_token"
+        ],
+        "properties": {
+          "proposal": {
+            "$ref": "#/components/schemas/Proposal"
+          },
+          "main_revision": {
+            "type": "string"
+          },
+          "proposal_revision": {
+            "type": "string"
+          },
+          "merge_base": {
+            "type": "string"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "before",
+                "after"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "before": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Record"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "after": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Record"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "graph_diff": {
+            "type": "string"
+          },
+          "configuration_diff": {
+            "type": "string"
+          },
+          "imports": {
+            "type": "object"
+          },
+          "review_token": {
+            "type": "string",
+            "description": "Same revision-bound inspection token as CLI. No HTTP acceptance endpoint exists."
+          }
+        }
+      },
+      "Query": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expression"
+        ],
+        "properties": {
+          "expression": {
+            "type": "object",
+            "description": "Existing Scrolls declarative expression: all, any, not, compare, exists, relation, path_glob, applicability or date_plus. No SQL or filenames.",
+            "required": [
+              "op"
+            ],
+            "properties": {
+              "op": {
+                "enum": [
+                  "all",
+                  "any",
+                  "not",
+                  "compare",
+                  "exists",
+                  "relation",
+                  "path_glob",
+                  "applicability",
+                  "date_plus"
+                ]
+              }
+            }
+          },
+          "actor": {
+            "type": "string",
+            "description": "Overrides the server actor binding for this query; cooperative attribution, not authentication."
+          },
+          "paths": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "string"
+            }
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Evaluation time; defaults to current UTC."
+          }
+        }
+      },
+      "Discovery": {
+        "type": "object",
+        "required": [
+          "api_version",
+          "operations",
+          "read_only",
+          "store_id",
+          "branch"
+        ],
+        "properties": {
+          "api_version": {
+            "const": "v0"
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "read_only": {
+            "const": true
+          },
+          "store_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "branch": {
+            "type": "string"
+          }
+        }
+      },
+      "Schema": {
+        "type": "object",
+        "required": [
+          "schema",
+          "schema_revision"
+        ],
+        "properties": {
+          "schema": {
+            "type": "object",
+            "description": "Full configured Scrolls ontology."
+          },
+          "schema_revision": {
+            "type": "string"
+          }
+        }
+      },
+      "Walk": {
+        "type": "object",
+        "required": [
+          "items",
+          "edges"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/Record"
+                },
+                {
+                  "$ref": "#/components/schemas/Reference"
+                }
+              ]
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "Selection": {
+        "type": "object",
+        "required": [
+          "items",
+          "diagnostics",
+          "bindings"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Reference"
+            }
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "bindings": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error400": {
+        "description": "Malformed request, invalid predicate/filter/budget, rejected Host or Origin.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error404": {
+        "description": "Unknown record, alias, proposal or route.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error405": {
+        "description": "Unsupported HTTP method.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error409": {
+        "description": "snapshot_changed or store_state_conflict; restart pagination or perform explicit maintenance.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error413": {
+        "description": "Request body exceeds 65536 bytes.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error500": {
+        "description": "Unexpected server failure; sanitized message.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Error503": {
+        "description": "backend_unavailable or busy. Admission and local-lock waits each bounded to five seconds; shared waits use connection budgets.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

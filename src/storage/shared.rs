@@ -186,7 +186,7 @@ impl Store {
         self.check_versioned_inventory(super::shared_review::JOURNAL)?;
         Ok(())
     }
-    pub(super) fn check_versioned_inventory(&self, revision: &str) -> Result<()> {
+    pub(crate) fn check_versioned_inventory(&self, revision: &str) -> Result<()> {
         let base: String = self
             .one_at("metadata", "storage_base", "main")?
             .context("missing shared storage baseline")?;

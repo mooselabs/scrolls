@@ -23,6 +23,7 @@ jobs:
           repository: mooselabs/scrolls
           ref: a4bf897811abbb19657a824b5eb3470a2733ce16
           path: .verification/scrolls-shared-previous
+      # Includes real local/shared Dolt HTTP, security, recovery and shutdown tests.
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release --all-targets
       - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo

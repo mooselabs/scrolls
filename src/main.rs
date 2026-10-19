@@ -18,8 +18,15 @@ fn main() {
             e.exit()
         }
     };
-    match scrolls::app::run(&cli) {
+    match if let scrolls::cli::Cmd::Serve { bind } = cli.command {
+        scrolls::http::serve(&cli, bind).map(|()| serde_json::Value::Null)
+    } else {
+        scrolls::app::run(&cli)
+    } {
         Ok(mut v) => {
+            if v.is_null() {
+                return;
+            }
             let lint_failed = matches!(cli.command, scrolls::cli::Cmd::Lint)
                 && v["data"]["errors"]
                     .as_array()

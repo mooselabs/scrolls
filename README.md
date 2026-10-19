@@ -109,6 +109,16 @@ to inspect and evolve it. See the [migration guide](docs/migration-0.2.md).
 - **Beads connections:** find knowledge attached to a bead, explicitly refresh
   cached work details, and publish backlinks into Beads metadata.
 
+## Read-only HTTP access
+
+`scrolls --store ./knowledge serve --bind 127.0.0.1:0 --json` exposes knowledge
+reads to local clients. It also supports existing `--connection` shared stores
+and `--proposal` selection. The server reports its actual address, refuses
+uninitialized/dirty/interrupted stores, and performs no recovery or consumption
+logging. `/healthz` reports process liveness; `/readyz` performs a real backend
+read. Remote use requires a tunnel. See the [HTTP API guide](docs/http-api.md)
+and [OpenAPI contract](docs/openapi.json).
+
 ## Essential commands
 
 `ID`, `REV`, `BRANCH`, and `PATH` below are placeholders. Use `show` to obtain a
@@ -326,6 +336,8 @@ pinned old-writer fixture before running the complete qualification:
 ./scripts/install-beads.sh
 git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-0.3.0
 git -C .verification/scrolls-0.3.0 checkout --detach 3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4
+git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-shared-previous
+git -C .verification/scrolls-shared-previous checkout --detach a4bf897811abbb19657a824b5eb3470a2733ce16
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
@@ -335,7 +347,8 @@ python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
 python3 scripts/verify-beads.py --binary target/release/scrolls
 ```
 
-Real-Dolt tests fail if a private binary or the pinned old-writer source is missing. CI runs the Rust checks,
+Real-Dolt tests, including the loopback HTTP suite (`cargo test --locked --test http`),
+fail if a private binary or the pinned old-writer source is missing. CI runs the Rust checks,
 demonstration, and Beads qualification. Use a fresh demonstration output path.
 Full corpus qualification is a separate local check against the private source:
 

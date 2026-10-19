@@ -1320,3 +1320,30 @@ pub(crate) fn recover(s: &Store, cli: &Cli, op: &str, hash: &str) -> Result<Valu
     let result = finish_abandon(s, control)?;
     receipt_response(s, result, JOURNAL)
 }
+
+/// Ordinary HTTP reads refuse unfinished durable operations; inspection does not
+/// reconcile, repair or update the operation journal.
+pub(crate) fn check_readable(s: &Store) -> Result<()> {
+    for row in s.sql(&format!(
+        "SELECT payload FROM metadata AS OF {} WHERE id LIKE 'intent:%'",
+        super::revision_literal(JOURNAL)
+    ))? {
+        let intent: Intent = serde_json::from_str(
+            row["payload"]
+                .as_str()
+                .context("invalid operation payload")?,
+        )?;
+        let readable = match &intent.stage {
+            Stage::Complete { .. } | Stage::Abandoned { .. } => true,
+            // Successful acceptance retains the durable candidate pointer.
+            // Prove incorporation into main; the pointer alone is insufficient.
+            Stage::Candidate { .. } if published(s, &intent)? => {
+                verify_receipt(s, &intent.op_id, &intent.args_hash)?;
+                true
+            }
+            _ => false,
+        };
+        ensure!(readable, "recovery_required: unfinished shared operation");
+    }
+    Ok(())
+}
