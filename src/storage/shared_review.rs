@@ -105,6 +105,10 @@ impl Snapshot {
         Ok(out)
     }
 }
+/// Reuse the publication engine's full keyed-row/schema fingerprint for backup proof.
+pub(super) fn snapshot_fingerprint(s: &Store, revision: &str) -> Result<String> {
+    Snapshot::read(s, Some(revision))?.hash()
+}
 fn merge(a: &Snapshot, ours: &Snapshot, theirs: &Snapshot) -> Result<Snapshot> {
     ensure!(
         a.schemas == ours.schemas && a.schemas == theirs.schemas,

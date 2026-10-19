@@ -34,8 +34,9 @@ pub trait SqlSession {
                 && self
                     .sql("SELECT DOLT_HASHOF_DB('HEAD') = DOLT_HASHOF_DB('WORKING') AND DOLT_HASHOF_DB('HEAD') = DOLT_HASHOF_DB('STAGED') AS clean")?
                     .first()
-                    .map(|v| &v["clean"])
-                    == Some(&json!(1)),
+                    // The local CLI emits Boolean expressions as JSON booleans;
+                    // MySQL text protocol encodes the same predicate as TINYINT.
+                    .is_some_and(|v| v["clean"] == json!(1) || v["clean"] == json!(true)),
             "dirty_state: unexplained Dolt working set; inspect without discarding it"
         );
         Ok(())

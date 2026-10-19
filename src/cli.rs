@@ -98,6 +98,11 @@ pub enum Cmd {
         at: Option<String>,
     },
     Doctor,
+    /// Create a verified shared database backup, or restore one into a fresh local directory.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Inspect, resume, or explicitly abandon an owned interrupted shared operation.
     Recover {
         operation: String,
@@ -414,6 +419,19 @@ pub enum PlanCommand {
         profile: Option<String>,
         #[arg(long, conflicts_with = "profile", required_unless_present = "profile")]
         profile_file: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Debug, Serialize, Subcommand)]
+pub enum BackupCommand {
+    Create {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Restore {
+        backup: PathBuf,
         #[arg(long)]
         out: PathBuf,
     },

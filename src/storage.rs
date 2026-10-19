@@ -1,4 +1,6 @@
 //! Local storage and the shared SQL session foundation.
+pub mod backup;
+mod inspection;
 pub mod session;
 pub mod shared;
 pub mod shared_review;
@@ -28,6 +30,7 @@ pub struct Store {
     binary: PathBuf,
     _lock: Option<File>,
     shared: Option<session::SharedSession>,
+    inspection: Option<Box<std::cell::RefCell<inspection::Session>>>,
 }
 impl Store {
     /// Open without recovery, branch checkout, configuration writes or initialization.
@@ -47,6 +50,7 @@ impl Store {
             binary: fs::canonicalize(binary)?,
             _lock: Some(lock),
             shared: None,
+            inspection: None,
         };
         let version = s.run(&["version"])?;
         if version.lines().next() != Some(format!("dolt version {DOLT_VERSION}").as_str()) {
@@ -471,6 +475,7 @@ impl Store {
             binary,
             _lock: Some(lock),
             shared: None,
+            inspection: None,
         };
         if !s.db.join(".dolt").exists() {
             if !init {
@@ -543,7 +548,12 @@ impl Store {
         if self.db.join(".dolt/sql-server.info").exists() {
             bail!("unexpected Dolt server; stop it before opening the local store");
         }
-        let out = Command::new(&self.binary)
+        anyhow::ensure!(
+            self.inspection.is_none(),
+            "backup_inspection_readonly: separate subprocess refused"
+        );
+        let mut command = Command::new(&self.binary);
+        let out = command
             .args(args)
             .current_dir(&self.db)
             .env("DOLT_ROOT_PATH", self.root.join("dolt-home"))
@@ -561,6 +571,9 @@ impl Store {
         Ok(String::from_utf8(out.stdout)?)
     }
     pub fn sql(&self, sql: &str) -> Result<Vec<Value>> {
+        if let Some(session) = &self.inspection {
+            return session.borrow_mut().query(sql);
+        }
         if let Some(session) = &self.shared {
             return session.sql(sql);
         }
