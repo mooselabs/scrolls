@@ -1869,6 +1869,130 @@
           }
         }
       }
+    },
+    "/v0/graph": {
+      "get": {
+        "summary": "Read the complete graph snapshot",
+        "operationId": "read_graph",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Comma-separated entity tags or *; weak comparison is supported."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current backend read succeeded. Session/lock released before sending.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "schema_version",
+                    "ok",
+                    "store_id",
+                    "branch",
+                    "revision",
+                    "schema_revision",
+                    "data"
+                  ],
+                  "properties": {
+                    "schema_version": {
+                      "const": 2
+                    },
+                    "ok": {
+                      "const": true
+                    },
+                    "store_id": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "branch": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "string",
+                      "description": "Selected immutable Dolt revision."
+                    },
+                    "schema_revision": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Graph"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "If-None-Match matched after a successful current backend read. No response body.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "private, no-cache"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Strong SHA-256 ETag of the complete response bytes."
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error413"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "description": "Complete records keyed by ID and relationships keyed by their existing graph keys, including external endpoints. No pagination or filters. Record original payloads, import metadata and source-file bytes are excluded. The existing read session is released before transmission."
+      }
     }
   },
   "components": {
@@ -2330,6 +2454,67 @@
           },
           "bindings": {
             "type": "object"
+          }
+        }
+      },
+      "Graph": {
+        "type": "object",
+        "required": [
+          "records",
+          "edges"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "records": {
+            "type": "object",
+            "additionalProperties": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/Record"
+                },
+                {
+                  "not": {
+                    "required": [
+                      "original"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "edges": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": [
+                "from",
+                "rel",
+                "to",
+                "why",
+                "actor",
+                "created"
+              ],
+              "properties": {
+                "from": {
+                  "type": "string"
+                },
+                "rel": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "why": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "created": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }

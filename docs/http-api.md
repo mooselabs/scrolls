@@ -21,6 +21,7 @@ Use the printed address in these examples:
 ```fish
 set endpoint http://127.0.0.1:8080
 curl "$endpoint/v0/context"
+curl "$endpoint/v0/graph"
 curl "$endpoint/v0/records?kind=evidence&limit=50"
 curl "$endpoint/v0/records/ALIAS?provenance=true"
 curl "$endpoint/v0/records/ID/context?budget=16000"
@@ -93,5 +94,16 @@ records/proposals 404, snapshot/state conflicts 409, oversized bodies 413,
 backend/admission failures 503 and unexpected failures 500. Request logs contain
 only method, route template, status and duration, without IDs, bodies or credentials.
 
-Fabriscope integration and documentation/work authority cutover remain separate
-changes. This server requires no storage migration or live service changes.
+`GET /v0/graph` (discovery operation `graph`) returns a complete snapshot in the
+same envelope. `data.records` is keyed by record ID; `data.edges` retains the
+existing graph keys and every relationship, including external Beads targets.
+Records include bodies, fields, paths, aliases and revisions; `original` is
+omitted. Import-original payloads, import metadata and source-file bytes are
+not included. Empty stores return two empty objects. There is no pagination or
+filtering. The graph uses the server-selected branch and schema.
+
+Fabriscope can attach with `--scrolls-url http://127.0.0.1:PORT` or start a private
+server with `--scrolls STORE`. It requires discovery capability `graph`, with no
+render fallback. Conditional requests still read and validate the backend, so
+Fabriscope revalidates at a 30-second interval. No storage migration, installed
+service change or documentation/work authority cutover is required.

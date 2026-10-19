@@ -6,6 +6,7 @@ use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 
 pub enum Operation<'a> {
     Schema,
+    Graph,
     Records {
         filters: &'a Filters,
         terms: Option<&'a str>,
@@ -61,6 +62,23 @@ impl View<'_> {
     pub fn execute(&self, operation: Operation<'_>) -> Result<Value> {
         let g = self.graph;
         match operation {
+            Operation::Graph => {
+                // Keep graph keys and all ordinary record fields, but never
+                // transmit captured originals or source-file payloads.
+                let records = g
+                    .records
+                    .iter()
+                    .map(|(id, record)| {
+                        let mut value = serde_json::to_value(record)?;
+                        value
+                            .as_object_mut()
+                            .expect("record object")
+                            .remove("original");
+                        Ok((id.clone(), value))
+                    })
+                    .collect::<Result<serde_json::Map<String, Value>>>()?;
+                Ok(json!({"records": records, "edges": g.edges}))
+            }
             Operation::Schema => {
                 Ok(json!({"schema":g.schema,"schema_revision":g.schema.revision()}))
             }

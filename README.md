@@ -381,3 +381,11 @@ See [shared authoring](docs/shared-authoring.md) for the reviewed initialization
 procedure, connection file, supported commands and qualification fixtures.
 Shared maintenance migrations, editable adoption, caches and repository discovery remain
 unavailable. Local workflows retain their existing behavior.
+
+### Complete HTTP graph snapshots
+
+`GET /v0/graph` serves all documents and relationships in one revision-bound
+read, without captured originals or source-file bytes. Fabriscope uses this
+endpoint through a private `scrolls serve` or `--scrolls-url`. See the
+[HTTP guide](docs/http-api.md) for conditional reads, discovery and loopback
+security. This additive endpoint needs no store migration.

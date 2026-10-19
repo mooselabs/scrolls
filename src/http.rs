@@ -27,6 +27,7 @@ pub const BODY_LIMIT: usize = 65_536;
 const OPERATIONS: &[&str] = &[
     "context",
     "schema",
+    "graph",
     "records",
     "document",
     "document_context",
@@ -208,6 +209,7 @@ enum Route {
     Ready,
     Discovery,
     Schema,
+    Graph,
     Records,
     Document,
     Context,
@@ -225,6 +227,7 @@ impl Route {
             Self::Health => "/healthz",
             Self::Ready => "/readyz",
             Self::Discovery => "/v0/context",
+            Self::Graph => "/v0/graph",
             Self::Schema => "/v0/schema",
             Self::Records => "/v0/records",
             Self::Document => "/v0/records/{id}",
@@ -244,6 +247,7 @@ fn route(path: &str) -> Result<(Route, Option<String>)> {
         "/healthz" => Some(Route::Health),
         "/readyz" => Some(Route::Ready),
         "/v0/context" => Some(Route::Discovery),
+        "/v0/graph" => Some(Route::Graph),
         "/v0/schema" => Some(Route::Schema),
         "/v0/records" => Some(Route::Records),
         "/v0/prime" => Some(Route::Prime),
@@ -594,6 +598,10 @@ fn execute(
         Route::Discovery => {
             p.allowed(&[])?;
             json!({"api_version":"v0","operations":OPERATIONS,"read_only":true,"store_id":s.store_id,"branch":s.branch})
+        }
+        Route::Graph => {
+            p.allowed(&[])?;
+            read(Operation::Graph)?
         }
         Route::Schema => {
             p.allowed(&[])?;

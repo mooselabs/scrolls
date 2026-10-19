@@ -435,6 +435,15 @@ fn exercise(shared: bool) {
         .to_string();
     f.ok(&["review", "accept", schema_branch, "--review-token", &token]);
 
+    let external = "beads://00000000-0000-4000-8000-000000000001/demo-1";
+    f.ok(&["link", &other, "related_work", external, "--expect", "1"]);
+    let export = f.dir.path().join("render");
+    f.ok(&["render", "--out", export.to_str().unwrap()]);
+    let mut rendered: Value =
+        serde_json::from_slice(&fs::read(export.join("scrolls/graph.json")).unwrap()).unwrap();
+    for record in rendered["records"].as_object_mut().unwrap().values_mut() {
+        record.as_object_mut().unwrap().remove("original");
+    }
     // CLI comparison also leaves an audit; capture the baseline after it.
     let show = f.ok(&["show", &id, "--provenance"]);
     let context = f.ok(&["context", &id]);
@@ -448,6 +457,37 @@ fn exercise(shared: bool) {
     let proposal_http = f.serve(&["--proposal", branch]);
     let v = http.get("/v0/context");
     assert_eq!(v["data"]["read_only"], true);
+    assert!(
+        v["data"]["operations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("graph"))
+    );
+    let graph = http.get("/v0/graph");
+    assert_eq!(
+        graph["data"],
+        json!({"records":rendered["records"], "edges":rendered["edges"]})
+    );
+    for key in ["store_id", "branch", "revision", "schema_revision"] {
+        assert_eq!(graph[key], v[key]);
+    }
+    assert!(
+        graph["data"]["records"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|r| r.get("original").is_none())
+    );
+    let selected = proposal_http.get("/v0/graph");
+    assert_eq!(selected["branch"], branch);
+    assert_eq!(
+        selected["data"]["records"][prop["id"].as_str().unwrap()]["title"],
+        "Proposed"
+    );
+    let graph_etag = http.request("GET", "/v0/graph", &[], &[]).headers["etag"].clone();
+    let unchanged = http.request("GET", "/v0/graph", &[("If-None-Match", &graph_etag)], &[]);
+    assert_eq!(unchanged.status, 304);
+    assert!(unchanged.bytes.is_empty());
     assert_eq!(v["branch"], "main");
     assert_eq!(http.get("/v0/schema")["data"], schema);
     assert_eq!(
@@ -632,8 +672,24 @@ fn exercise(shared: bool) {
     );
     assert_eq!(changed.status, 200);
     assert_ne!(changed.headers["etag"], etag);
+    let graph_changed = http.request("GET", "/v0/graph", &[("If-None-Match", &graph_etag)], &[]);
+    assert_eq!(graph_changed.status, 200);
+    assert_eq!(
+        graph_changed.value["data"]["records"][&id]["title"],
+        "Updated"
+    );
     if shared {
         f.stop_backend();
+        assert_eq!(
+            http.request(
+                "GET",
+                "/v0/graph",
+                &[("If-None-Match", &graph_changed.headers["etag"])],
+                &[]
+            )
+            .status,
+            503
+        );
         assert_eq!(http.request("GET", "/readyz", &[], &[]).status, 503);
         assert_eq!(
             http.request(
@@ -647,6 +703,16 @@ fn exercise(shared: bool) {
         );
         assert_eq!(http.request("GET", "/healthz", &[], &[]).status, 200);
         f.start_backend();
+        assert_eq!(
+            http.request(
+                "GET",
+                "/v0/graph",
+                &[("If-None-Match", &graph_changed.headers["etag"])],
+                &[]
+            )
+            .status,
+            304
+        );
         assert_eq!(http.get("/readyz")["data"]["ready"], true);
     }
 }
@@ -677,6 +743,8 @@ fn browser_security_limits_and_shutdown() {
         for (path, headers, status) in [
             ("/healthz", vec![("Origin", "http://localhost")], 400),
             ("/healthz", vec![("Host", "evil.example")], 400),
+            ("/v0/graph?limit=1", vec![], 400),
+            ("/v0/graph", vec![("Origin", "http://localhost")], 400),
             ("/v0/records?limit=201", vec![], 400),
             ("/v0/records?limit=0", vec![], 400),
             ("/v0/records?limit=1&limit=2", vec![], 400),
@@ -1008,5 +1076,61 @@ fn admission_timeout_and_graceful_drain_of_inflight_read() {
         }
         assert!(start.elapsed() < Duration::from_secs(10));
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn graph_empty_custom_schema_and_slow_client_release() {
+    for shared in [false, true] {
+        let f = Fixture::new(shared, true);
+        let h = f.serve(&[]);
+        assert_eq!(h.get("/v0/graph")["data"], json!({"records":{},"edges":{}}));
+        // A response much larger than the socket buffers remains in flight
+        // while the independent CLI writer commits.
+        let path = f.dir.path().join("large.json");
+        fs::write(
+            &path,
+            json!([{"op":"new","kind":"page","title":"Large","body":"x".repeat(16 * 1024 * 1024)}])
+                .to_string(),
+        )
+        .unwrap();
+        f.ok(&["batch", path.to_str().unwrap()]);
+        let mut slow = TcpStream::connect(h.address).unwrap();
+        slow.set_read_timeout(Some(Duration::from_secs(40)))
+            .unwrap();
+        write!(
+            slow,
+            "GET /v0/graph HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            h.address
+        )
+        .unwrap();
+        let mut reader = BufReader::new(slow);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("200"), "{line}");
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let before = Instant::now();
+        f.seed("page");
+        assert!(
+            before.elapsed() < Duration::from_secs(30),
+            "slow transmission blocked writer"
+        );
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).unwrap();
+        let graph: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(graph["data"]["records"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            h.get("/v0/graph")["data"]["records"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
