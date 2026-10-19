@@ -13,6 +13,11 @@ jobs:
       - run: scripts/install-beads.sh
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - uses: actions/checkout@v4
+        with:
+          repository: mooselabs/scrolls
+          ref: 3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4
+          path: .verification/scrolls-0.3.0
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release --all-targets
       - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo

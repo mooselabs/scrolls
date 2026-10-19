@@ -10,6 +10,9 @@ use std::path::PathBuf;
 pub struct Cli {
     #[arg(long, global = true, default_value = ".scrolls")]
     pub store: PathBuf,
+    /// Machine-local JSON connection file. Credentials never belong in repository bindings.
+    #[arg(long, global = true)]
+    pub connection: Option<PathBuf>,
     #[arg(long, global = true, default_value = ".tools/dolt")]
     pub dolt: PathBuf,
     #[arg(long, global = true)]
@@ -72,6 +75,12 @@ pub enum Cmd {
     Init {
         #[arg(long)]
         schema: Option<PathBuf>,
+        /// Shared initialization: reviewed empty database revision from --dry-run.
+        #[arg(long)]
+        expect_base: Option<String>,
+        /// Shared initialization: reviewed ontology digest from --dry-run.
+        #[arg(long)]
+        expect_schema: Option<String>,
     },
     Schema {
         #[command(subcommand)]

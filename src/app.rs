@@ -12,13 +12,13 @@ use std::{
     io::{IsTerminal, Read, Write},
     process::Command,
 };
-fn body(args: &Body, initial: &str, edit: bool) -> Result<String> {
+fn body(args: &Body, initial: &str, edit: bool) -> Result<(String, bool)> {
     if let Some(b) = &args.body {
-        return Ok(b.clone());
+        return Ok((b.clone(), true));
     }
     if let Some(path) = &args.body_file {
         if path.as_os_str() != "-" {
-            return Ok(fs::read_to_string(path)?);
+            return Ok((fs::read_to_string(path)?, true));
         }
     }
     if args.editor || (edit && std::io::stdin().is_terminal()) {
@@ -39,16 +39,16 @@ fn body(args: &Body, initial: &str, edit: bool) -> Result<String> {
         {
             bail!("editor failed; no write committed")
         }
-        return Ok(fs::read_to_string(file.path())?);
+        return Ok((fs::read_to_string(file.path())?, true));
     }
     if !std::io::stdin().is_terminal() {
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text)?;
         if !text.is_empty() || args.body_file.is_some() {
-            return Ok(text);
+            return Ok((text, true));
         }
     }
-    Ok(initial.into())
+    Ok((initial.into(), false))
 }
 fn actor(cli: &Cli) -> Result<&str> {
     let a = cli
@@ -80,6 +80,9 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
     }
 }
 pub fn run(cli: &Cli) -> Result<Value> {
+    if cli.connection.is_some() {
+        storage::shared::check_command(cli)?;
+    }
     if let Cmd::Import { command } = &cli.command {
         if !matches!(command, ImportCommand::Markdown { .. }) {
             return crate::source_import::run(cli, command);
@@ -99,7 +102,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             "document-specific commands were removed in 0.2.0; use new/status/link with batch for coupled changes, or query --file; see docs/migration-0.2.md"
         );
     }
-    let initial_schema = if let Cmd::Init { schema } = &cli.command {
+    let initial_schema = if let Cmd::Init { schema, .. } = &cli.command {
         let mut s = schema
             .as_ref()
             .map(|p| {
@@ -118,12 +121,32 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if cli.command.mutation() {
         actor(cli)?;
     }
+    if let Some(connection) = &cli.connection {
+        if init {
+            return storage::shared::initialize(cli, connection, initial_schema.as_ref().unwrap());
+        }
+    }
+    if let Cmd::Init {
+        expect_base,
+        expect_schema,
+        ..
+    } = &cli.command
+    {
+        anyhow::ensure!(
+            expect_base.is_none() && expect_schema.is_none(),
+            "initialization expectations require --connection"
+        );
+    }
     if init && cli.dry_run {
         return Ok(
             json!({"schema_version":2,"ok":true,"data":{"dry_run":true,"store":cli.store,"dolt_version":storage::DOLT_VERSION}}),
         );
     }
-    let store = Store::open(&cli.store, &cli.dolt, init)?;
+    let store = if let Some(connection) = &cli.connection {
+        Store::open_shared(connection, &cli.store)?
+    } else {
+        Store::open(&cli.store, &cli.dolt, init)?
+    };
     let branch = cli.proposal.as_deref().unwrap_or("main");
     if cli.proposal.is_some() {
         proposal_name(&store, branch)?;
@@ -132,7 +155,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     let selected_format = store
         .one::<u32>("metadata", "schema")?
         .context("missing store format")?;
-    if selected_format > 4 {
+    if selected_format > if store.is_shared() { 5 } else { 4 } {
         bail!("unsupported store format {selected_format}; use a newer Scrolls writer");
     }
     if init {
@@ -166,7 +189,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative local roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
             branch,
         );
     }
@@ -256,7 +279,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             "store format {schema} is read-only; resolve pending proposals, then run scrolls migrate"
         );
     }
-    let local = crate::beads::Local::load(&store.root)?;
+    let local = if store.is_shared() {
+        crate::beads::Local::default()
+    } else {
+        crate::beads::Local::load(&store.root)?
+    };
     let before = store.graph()?;
     if let Cmd::Beads { command } = &cli.command {
         if schema < 2 {
@@ -281,11 +308,14 @@ pub fn run(cli: &Cli) -> Result<Value> {
         .one::<Value>("metadata", "routing")?
         .unwrap_or(json!({}));
     let mut body_value = None;
+    let mut body_supplied = true;
     match &cli.command {
-        Cmd::New(n) => body_value = Some(body(&n.body, "", false)?),
+        Cmd::New(n) => body_value = Some(body(&n.body, "", false)?.0),
         Cmd::Edit { id, body: b, .. } => {
             let id = graph.resolve(id)?;
-            body_value = Some(body(b, &graph.records[&id].body, true)?);
+            let (value, supplied) = body(b, &graph.records[&id].body, true)?;
+            body_value = Some(value);
+            body_supplied = supplied;
         }
         _ => {}
     }
@@ -305,9 +335,25 @@ pub fn run(cli: &Cli) -> Result<Value> {
         _ => None,
     };
     // Fingerprint effective bodies, not only stdin/file paths. Output flags and op-id are not arguments.
-    let mut fingerprint = json!({"command":cli.command,"body":body_value,"actor":cli.actor,"role":cli.role,"proposal":cli.proposal,"source_commit":imported.as_ref().map(|i|&i.info.commit)});
+    let mut fingerprint = json!({"command":cli.command,"body":if store.is_shared() && !body_supplied {None} else {body_value.as_ref()},"actor":cli.actor,"role":cli.role,"proposal":cli.proposal,"source_commit":imported.as_ref().map(|i|&i.info.commit)});
     if let Some(content) = &file_content {
         fingerprint["file_content"] = json!(content);
+    }
+    if store.is_shared() {
+        // Machine-local input locations are not operation identity. Their exact
+        // bytes are already included above; a second client can supply its copy.
+        fn normalize_paths(value: &mut Value) {
+            if let Some(object) = value.as_object_mut() {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "body_file" | "file") && !value.is_null() {
+                        *value = json!("<input-content>");
+                    } else {
+                        normalize_paths(value);
+                    }
+                }
+            }
+        }
+        normalize_paths(&mut fingerprint["command"]);
     }
     let hash = digest(serde_json::to_vec(&fingerprint)?);
     let op = cli
@@ -517,6 +563,9 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 .iter()
                 .any(|id| graph.schema.protected(&graph.records[id], cli.role.name()))
             || (guarded && cli.role == Role::Agent);
+        if store.is_shared() && protected {
+            bail!("shared_unsupported: protected changes require shared review qualification");
+        }
         if !protected && cli.proposal.is_none() {
             crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())?;
         }
@@ -580,7 +629,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
     let revision = store.revision()?;
     let mut consumed = vec![];
     let data = match &cli.command {
-        Cmd::List { filters } => json!(query::select(&graph, filters, None, usize::MAX, who)?),
+        Cmd::List { filters } => {
+            let rows = query::select(&graph, filters, None, usize::MAX, who)?;
+            if store.is_shared() {
+                consumed = rows.iter().map(|r| r.id.clone()).collect();
+            }
+            json!(rows)
+        }
         Cmd::Schema { command } => match command {
             SchemaCommand::Show => {
                 json!({"schema":graph.schema,"schema_revision":graph.schema.revision()})
@@ -725,7 +780,17 @@ pub fn run(cli: &Cli) -> Result<Value> {
         )?,
         _ => bail!("unsupported command"),
     };
-    if !consumed.is_empty() {
+    if store.is_shared()
+        && matches!(
+            cli.command,
+            Cmd::Walk { .. } | Cmd::Query { .. } | Cmd::Render { .. } | Cmd::Lint
+        )
+    {
+        // These operations evaluate the complete graph. Report that conservative
+        // input set rather than claiming an empty consumption set.
+        consumed = graph.records.keys().cloned().collect();
+    }
+    if !consumed.is_empty() && !store.is_shared() {
         store.audit(
             &cli.session,
             who,
@@ -734,7 +799,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &consumed,
         )?;
     }
-    wrap(&store, data, branch)
+    let mut response = wrap(&store, data, branch)?;
+    if store.is_shared() {
+        response["consumed"] = json!({"store_id":store.one::<String>("metadata", "store_id")?, "revision":revision, "schema_revision":graph.schema.revision(), "records":consumed.iter().map(|id| (id, graph.records[id].revision)).collect::<std::collections::BTreeMap<_,_>>()});
+    }
+    Ok(response)
 }
 fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Result<Value> {
     let Cmd::Review {

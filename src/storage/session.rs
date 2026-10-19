@@ -1,5 +1,5 @@
 //! Transport boundary for a single serialized operation. Shared sessions are
-//! deliberately not wired into the CLI until publication/recovery is qualified.
+//! used by local and direct shared authoring; shared review remains unavailable.
 use super::{DOLT_VERSION, Store, literal};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::{Conn, OptsBuilder, consts::ColumnType, prelude::Queryable};

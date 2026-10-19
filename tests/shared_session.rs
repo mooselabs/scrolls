@@ -39,6 +39,12 @@ impl Server {
         );
     }
     fn new() -> Self {
+        Self::create(false)
+    }
+    fn empty() -> Self {
+        Self::create(true)
+    }
+    fn create(empty: bool) -> Self {
         let mut s = Self {
             dir: tempfile::tempdir().unwrap(),
             child: None,
@@ -52,7 +58,9 @@ impl Server {
             "--email",
             "test@localhost",
         ]);
-        s.cli(&["sql", "-q", "CREATE TABLE records (id INT PRIMARY KEY, payload TEXT); CREATE TABLE operations (id VARCHAR(128) PRIMARY KEY, payload TEXT); CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','fixture','--author','Test <test@localhost>'); CALL DOLT_BRANCH('proposal/test');"]);
+        if !empty {
+            s.cli(&["sql", "-q", "CREATE TABLE records (id INT PRIMARY KEY, payload TEXT); CREATE TABLE operations (id VARCHAR(128) PRIMARY KEY, payload TEXT); CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','fixture','--author','Test <test@localhost>'); CALL DOLT_BRANCH('proposal/test');"]);
+        }
         s.start();
         let mut root = s.raw("main");
         root.query_drop("CREATE USER alice IDENTIFIED BY 'test-only'; GRANT ALL ON *.* TO alice")
@@ -512,4 +520,674 @@ fn killed_client_releases_lock_and_uncommitted_rows() {
     let recovered = SharedSession::connect(&config, "main").unwrap();
     assert!(recovered.sql("SELECT * FROM records").unwrap().is_empty());
     recovered.clean().unwrap();
+}
+
+impl Server {
+    fn client(&self, client: &str, args: &[&str]) -> Command {
+        let root = self.dir.path().join(client);
+        fs::create_dir_all(&root).unwrap();
+        let connection = root.join("connection.json");
+        fs::write(&connection, serde_json::to_vec(&json!({"host":"127.0.0.1","port":self.port,"database":"knowledge","user":"alice","password":"test-only"})).unwrap()).unwrap();
+        let mut c = Command::new(env!("CARGO_BIN_EXE_scrolls"));
+        if !args.contains(&"--actor") {
+            c.args(["--actor", "alice"]);
+        }
+        if !args.contains(&"--role") {
+            c.args(["--role", "human"]);
+        }
+        c.arg("--json")
+            .arg("--connection")
+            .arg(connection)
+            .arg("--store")
+            .arg(root)
+            .args(args)
+            .stdin(Stdio::null());
+        c
+    }
+    fn call(&self, client: &str, args: &[&str], expected: bool) -> serde_json::Value {
+        let out = self.client(client, args).output().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
+            panic!(
+                "{} {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        assert_eq!(out.status.success(), expected, "{args:?}: {value}");
+        value
+    }
+    fn init(&self, schema: Option<&str>) -> serde_json::Value {
+        let mut args = vec!["init"];
+        if let Some(path) = schema {
+            args.extend(["--schema", path]);
+        }
+        let mut plan_args = args.clone();
+        plan_args.push("--dry-run");
+        let plan = self.call("a", &plan_args, true);
+        args.extend([
+            "--op-id",
+            "initialization",
+            "--expect-base",
+            plan["data"]["base_revision"].as_str().unwrap(),
+            "--expect-schema",
+            plan["data"]["ontology_digest"].as_str().unwrap(),
+        ]);
+        let initialized = self.call("a", &args, true);
+        assert_eq!(initialized, self.call("b", &args, true));
+        initialized
+    }
+}
+
+#[test]
+fn shared_cli_initialization_replay_isolation_fencing_and_refusals() {
+    let s = Server::empty();
+    let base: String = s
+        .raw("main")
+        .query_first("SELECT DOLT_HASHOF('HEAD')")
+        .unwrap()
+        .unwrap();
+    let plan = s.call("a", &["init", "--dry-run"], true);
+    assert_eq!(plan["revision"], base);
+    let bad = s.call(
+        "a",
+        &[
+            "init",
+            "--op-id",
+            "init",
+            "--expect-base",
+            "stale",
+            "--expect-schema",
+            "stale",
+        ],
+        false,
+    );
+    assert!(bad.to_string().contains("shared_init_plan_stale"));
+    assert!(
+        s.raw("main")
+            .query::<String, _>("SHOW TABLES")
+            .unwrap()
+            .is_empty()
+    );
+    let initialized = s.init(None);
+    assert_ne!(initialized["revision"], base);
+    fs::write(s.dir.path().join("a/beads.json"), "not JSON").unwrap();
+    fs::write(
+        s.dir.path().join("b/beads.json"),
+        r#"{"operations":{"new-source":{"hash":"collision","result":{}}}}"#,
+    )
+    .unwrap();
+    let args = [
+        "--op-id",
+        "new-source",
+        "new",
+        "evidence",
+        "--title",
+        "Source",
+        "--body",
+        "fact 🌍 ' ; DROP TABLE records;",
+    ];
+    let written = s.call("a", &args, true);
+    assert_eq!(written, s.call("b", &args, true));
+    let mismatch = s.call(
+        "b",
+        &[
+            "--op-id",
+            "new-source",
+            "--actor",
+            "mallory",
+            "new",
+            "evidence",
+            "--title",
+            "Source",
+            "--body",
+            "changed",
+        ],
+        false,
+    );
+    assert!(mismatch.to_string().contains("different arguments"));
+    let id = written["data"]["id"].as_str().unwrap();
+    let read = s.call("b", &["show", id], true);
+    assert_eq!(read["consumed"]["records"][id], 1);
+    assert!(!s.dir.path().join("b/consumed.jsonl").exists());
+    let stale = s.call(
+        "b",
+        &[
+            "--op-id", "stale", "edit", id, "--expect", "0", "--body", "wrong",
+        ],
+        false,
+    );
+    assert!(stale.to_string().contains("revision"));
+    let before = s.call("a", &["list"], true)["revision"].clone();
+    for args in [
+        vec!["migrate"],
+        vec!["review", "anything"],
+        vec!["proposals"],
+        vec!["beads", "list"],
+        vec!["consumed"],
+        vec!["import", "profiles", "list"],
+        vec!["schema", "apply", "nonexistent", "--expect", "wrong"],
+        vec!["--proposal", "proposal/other", "list"],
+    ] {
+        assert!(
+            s.call("b", &args, false)
+                .to_string()
+                .contains("shared_unsupported")
+        );
+    }
+    assert_eq!(before, s.call("a", &["list"], true)["revision"]);
+    let mut raw = s.raw("main");
+    raw.query_drop(format!("UPDATE metadata SET payload='99' WHERE id={}; CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','future writer','--author','Test <test@localhost>')",literal("shared_writer"))).unwrap();
+    assert!(
+        s.call("a", &["list"], false)
+            .to_string()
+            .contains("unsupported_shared_writer")
+    );
+}
+
+#[test]
+fn shared_cli_concurrent_revision_and_graph_races() {
+    let s = Server::empty();
+    s.init(None);
+    let mut children = vec![];
+    for n in 0..4 {
+        children.push(
+            s.client(
+                &format!("client{n}"),
+                &[
+                    "--op-id",
+                    &format!("op{n}"),
+                    "new",
+                    "note",
+                    "--title",
+                    "parallel",
+                    "--body",
+                    "content",
+                ],
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        );
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert_eq!(
+        s.call("a", &["list"], true)["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let created = s.call(
+        "a",
+        &[
+            "--op-id",
+            "edit-target",
+            "new",
+            "note",
+            "--title",
+            "target",
+            "--body",
+            "original",
+        ],
+        true,
+    );
+    let id = created["data"]["id"].as_str().unwrap();
+    let mut children = vec![];
+    for n in 0..2 {
+        children.push(
+            s.client(
+                &format!("editor{n}"),
+                &[
+                    "--op-id",
+                    &format!("edit{n}"),
+                    "edit",
+                    id,
+                    "--expect",
+                    "1",
+                    "--body",
+                    &format!("new {n}"),
+                ],
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        );
+    }
+    let results: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|o| o.status.success()).count(), 1);
+    assert_eq!(
+        s.call("a", &["show", id], true)["data"]["record"]["revision"],
+        2
+    );
+}
+
+#[test]
+fn shared_cli_handbook_cycle_race_and_research_policies() {
+    let s = Server::empty();
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    s.init(Some(
+        manifest.join("examples/handbook.yaml").to_str().unwrap(),
+    ));
+    let mut ids = vec![];
+    for n in 0..2 {
+        ids.push(
+            s.call(
+                "a",
+                &[
+                    "--op-id",
+                    &format!("page{n}"),
+                    "new",
+                    "page",
+                    "--title",
+                    "Page",
+                    "--body",
+                    "text",
+                ],
+                true,
+            )["data"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let before = s.call("a", &["list"], true)["revision"].clone();
+    assert!(
+        s.call(
+            "b",
+            &[
+                "--role",
+                "agent",
+                "--op-id",
+                "protected",
+                "new",
+                "page",
+                "--title",
+                "Review needed",
+                "--body",
+                "x"
+            ],
+            false
+        )
+        .to_string()
+        .contains("shared_unsupported")
+    );
+    assert_eq!(before, s.call("a", &["list"], true)["revision"]);
+    let mut children = vec![];
+    for n in 0..2 {
+        children.push(
+            s.client(
+                &format!("linker{n}"),
+                &[
+                    "--op-id",
+                    &format!("link{n}"),
+                    "link",
+                    &ids[n],
+                    "chapter",
+                    &ids[1 - n],
+                    "--expect",
+                    "1",
+                ],
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        );
+    }
+    let results: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(results.iter().filter(|o| o.status.success()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .filter(|o| !o.status.success())
+            .any(|o| String::from_utf8_lossy(&o.stdout).contains("cycle"))
+    );
+    s.call("a", &["lint"], true);
+    let r = Server::empty();
+    r.init(Some(
+        manifest.join("examples/research.yaml").to_str().unwrap(),
+    ));
+    let trial = r.call(
+        "a",
+        &[
+            "--op-id", "trial", "new", "trial", "--title", "Trial", "--body", "observed",
+            "--field", "count=0",
+        ],
+        true,
+    );
+    let id = trial["data"]["id"].as_str().unwrap();
+    assert_eq!(
+        r.call("a", &["show", id], true)["data"]["record"]["fields"]["count"],
+        0
+    );
+    r.call(
+        "a",
+        &[
+            "--op-id",
+            "invalid",
+            "new",
+            "trial",
+            "--title",
+            "Missing field",
+            "--body",
+            "x",
+        ],
+        false,
+    );
+    r.call("a", &["lint"], true);
+}
+
+#[test]
+fn shared_cli_lost_ack_and_implicit_edit_body_replay_after_later_write() {
+    let mut s = Server::empty();
+    s.init(None);
+    let args = [
+        "--op-id", "lost-new", "new", "note", "--title", "Source", "--body", "first",
+    ];
+    let actual_port = s.port;
+    let (port, proxy) = lose_commit_ack(actual_port);
+    s.port = port;
+    let failed = s.call("a", &args, false);
+    assert!(
+        failed.to_string().contains("indeterminate_commit"),
+        "{failed}"
+    );
+    proxy.join().unwrap();
+    s.port = actual_port;
+    let recovered = s.call("b", &args, true);
+    let id = recovered["data"]["id"].as_str().unwrap();
+    assert_eq!(s.call("b", &["list"], true)["consumed"]["records"][id], 1);
+    assert_eq!(
+        s.call("b", &["walk", id], true)["consumed"]["records"][id],
+        1
+    );
+    let title = [
+        "--op-id",
+        "title-only",
+        "edit",
+        id,
+        "--expect",
+        "1",
+        "--title",
+        "Updated",
+    ];
+    let first = s.call("a", &title, true);
+    s.call(
+        "b",
+        &[
+            "--op-id",
+            "later",
+            "edit",
+            id,
+            "--expect",
+            "2",
+            "--body",
+            "later body",
+        ],
+        true,
+    );
+    assert_eq!(first["data"], s.call("b", &title, true)["data"]);
+    assert_eq!(
+        s.call("b", &["show", id], true)["data"]["record"]["body"],
+        "later body"
+    );
+    s.stop();
+    s.start();
+    assert_eq!(first["data"], s.call("b", &title, true)["data"]);
+}
+
+#[test]
+fn shared_initialization_refuses_existing_partial_and_noninitial_stores() {
+    for sql in [
+        "CREATE TABLE custom (id INT PRIMARY KEY)",
+        "CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT); INSERT INTO metadata VALUES ('schema','4')",
+        "CREATE TABLE metadata (id VARCHAR(128) PRIMARY KEY, payload LONGTEXT); INSERT INTO metadata VALUES ('schema','5')",
+        "CALL DOLT_BRANCH('extra')",
+        "CALL DOLT_COMMIT('--allow-empty','-m','retained history','--author','Test <test@localhost>'); CALL DOLT_RESET('--hard','HEAD~1')",
+        "CALL DOLT_COMMIT('--allow-empty','-m','retained history','--author','Test <test@localhost>'); CALL DOLT_TAG('prior'); CALL DOLT_RESET('--hard','HEAD~1')",
+        "CALL DOLT_COMMIT('--allow-empty','-m','noninitial','--author','Test <test@localhost>')",
+    ] {
+        let s = Server::empty();
+        let mut raw = s.raw("main");
+        raw.query_drop(sql).unwrap();
+        if sql.starts_with("CREATE") {
+            raw.query_drop("CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','fixture','--author','Test <test@localhost>')").unwrap();
+        }
+        let before: String = raw
+            .query_first("SELECT DOLT_HASHOF('HEAD')")
+            .unwrap()
+            .unwrap();
+        s.call("a", &["init", "--dry-run"], false);
+        s.call(
+            "a",
+            &[
+                "init",
+                "--op-id",
+                "bad",
+                "--expect-base",
+                &before,
+                "--expect-schema",
+                "bad",
+            ],
+            false,
+        );
+        assert_eq!(
+            Some(before),
+            raw.query_first::<String, _>("SELECT DOLT_HASHOF('HEAD')")
+                .unwrap()
+        );
+        assert!(
+            raw.query::<String, _>("SELECT table_name FROM dolt_status")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn shared_initialization_lost_ack_reconciles_on_another_client() {
+    let mut s = Server::empty();
+    let plan = s.call("a", &["init", "--dry-run"], true);
+    let args = [
+        "init",
+        "--op-id",
+        "lost-init",
+        "--expect-base",
+        plan["data"]["base_revision"].as_str().unwrap(),
+        "--expect-schema",
+        plan["data"]["ontology_digest"].as_str().unwrap(),
+    ];
+    let actual_port = s.port;
+    let (port, proxy) = lose_commit_ack(actual_port);
+    s.port = port;
+    assert!(
+        s.call("a", &args, false)
+            .to_string()
+            .contains("indeterminate_commit")
+    );
+    proxy.join().unwrap();
+    s.port = actual_port;
+    let recovered = s.call("b", &args, true);
+    assert_ne!(recovered["revision"], plan["revision"]);
+    s.call("b", &["doctor"], true);
+}
+
+#[test]
+fn shared_input_files_replay_from_different_client_paths() {
+    let s = Server::empty();
+    s.init(None);
+    let a = s.dir.path().join("first.json");
+    let b = s.dir.path().join("elsewhere.json");
+    let batch = json!([{"op":"new","kind":"note","title":"portable","body":"same bytes"}]);
+    for file in [&a, &b] {
+        fs::write(file, serde_json::to_vec(&batch).unwrap()).unwrap();
+    }
+    let first = s.call(
+        "a",
+        &["--op-id", "portable-batch", "batch", a.to_str().unwrap()],
+        true,
+    );
+    fs::remove_file(&a).unwrap();
+    assert_eq!(
+        first,
+        s.call(
+            "b",
+            &["--op-id", "portable-batch", "batch", b.to_str().unwrap()],
+            true
+        )
+    );
+    let body_a = s.dir.path().join("body-a.md");
+    let body_b = s.dir.path().join("body-b.md");
+    for file in [&body_a, &body_b] {
+        fs::write(file, "portable body").unwrap();
+    }
+    let first = s.call(
+        "a",
+        &[
+            "--op-id",
+            "portable-body",
+            "new",
+            "note",
+            "--title",
+            "Body",
+            "--body-file",
+            body_a.to_str().unwrap(),
+        ],
+        true,
+    );
+    fs::remove_file(&body_a).unwrap();
+    assert_eq!(
+        first,
+        s.call(
+            "b",
+            &[
+                "--op-id",
+                "portable-body",
+                "new",
+                "note",
+                "--title",
+                "Body",
+                "--body-file",
+                body_b.to_str().unwrap()
+            ],
+            true
+        )
+    );
+    fs::write(&body_b, "changed input").unwrap();
+    assert!(
+        s.call(
+            "b",
+            &[
+                "--op-id",
+                "portable-body",
+                "new",
+                "note",
+                "--title",
+                "Body",
+                "--body-file",
+                body_b.to_str().unwrap()
+            ],
+            false
+        )
+        .to_string()
+        .contains("different arguments")
+    );
+}
+
+#[test]
+fn pinned_030_executable_refuses_shared_format_without_database_changes() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest.join(".verification/scrolls-0.3.0");
+    let pin = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("pinned 0.3.0 checkout required, see docs/shared-authoring.md");
+    assert!(pin.status.success(), "pinned 0.3.0 checkout required");
+    assert_eq!(
+        String::from_utf8_lossy(&pin.stdout).trim(),
+        "3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4"
+    );
+    let clean = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        clean.status.success() && clean.stdout.is_empty(),
+        "baseline source must be clean"
+    );
+    let build_dir = tempfile::tempdir().unwrap();
+    let target = build_dir.path();
+    let build = Command::new("cargo")
+        .args(["build", "--locked", "--bin", "scrolls"])
+        .current_dir(&source)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mut s = Server::empty();
+    let initialized = s.init(None);
+    s.stop();
+    // SIGKILL can leave the server marker. It is not the writer fence being tested.
+    let marker = s.dir.path().join("knowledge/.dolt/sql-server.info");
+    if marker.exists() {
+        fs::remove_file(marker).unwrap();
+    }
+    let root = s.dir.path().join("old-client");
+    fs::create_dir(&root).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(s.dir.path().join("knowledge"), root.join("dolt")).unwrap();
+    #[cfg(not(unix))]
+    panic!("qualification requires Unix symlink support");
+    let out = Command::new(target.join("debug/scrolls"))
+        .args([
+            "--json",
+            "--actor",
+            "old",
+            "--role",
+            "human",
+            "--op-id",
+            "must-refuse",
+            "--store",
+        ])
+        .arg(root)
+        .arg("--dolt")
+        .arg(Server::binary())
+        .args(["new", "note", "--title", "must not write", "--body", "x"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let output = String::from_utf8_lossy(&out.stdout);
+    assert!(output.contains("unsupported store schema"), "{output}");
+    assert!(!output.contains("unexpected Dolt server"));
+    s.start();
+    assert_eq!(
+        initialized["revision"],
+        s.call("a", &["list"], true)["revision"]
+    );
+    assert!(
+        s.raw("main")
+            .query::<String, _>("SELECT table_name FROM dolt_status")
+            .unwrap()
+            .is_empty()
+    );
 }
