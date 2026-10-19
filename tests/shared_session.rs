@@ -68,6 +68,9 @@ impl Server {
         s
     }
     fn start(&mut self) {
+        // Serialize the ephemeral-port handoff across fixture servers.
+        static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _starting = STARTING.lock().unwrap();
         self.port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -91,6 +94,10 @@ impl Server {
         );
         let start = Instant::now();
         while Conn::new(self.opts("main")).is_err() {
+            assert!(
+                self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "owned fixture server exited during startup"
+            );
             assert!(
                 start.elapsed() < Duration::from_secs(15),
                 "server failed: {}",
@@ -556,6 +563,33 @@ impl Server {
                 String::from_utf8_lossy(&out.stderr)
             )
         });
+        if expected && !out.status.success() && args.starts_with(&["backup", "create"]) {
+            if let Some(index) = args.iter().position(|arg| *arg == "--out") {
+                let log = Path::new(args[index + 1]).join("verification/verification-error.txt");
+                if let Ok(bytes) =
+                    fs::read(Path::new(args[index + 1]).join("verification/file-change.json"))
+                {
+                    let proof: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    for (name, stamp) in proof["after"].as_object().unwrap() {
+                        if proof["before"][name] != *stamp {
+                            eprintln!(
+                                "private fixture file change: {name}: {:?} → {stamp}",
+                                proof["before"][name]
+                            );
+                        }
+                    }
+                }
+
+                if let Ok(detail) = fs::read_to_string(
+                    Path::new(args[index + 1]).join("verification/ref-error.json"),
+                ) {
+                    eprintln!("private fixture ref failure: {detail}");
+                }
+                if let Ok(detail) = fs::read_to_string(log) {
+                    eprintln!("private fixture verification failure: {detail}");
+                }
+            }
+        }
         assert_eq!(out.status.success(), expected, "{args:?}: {value}");
         value
     }
@@ -3017,5 +3051,966 @@ fn shared_import_acceptance_recovers_original_token_and_assets() {
             fs::read(export.join("sources/book/asset.bin")).unwrap(),
             [0, 255, 1]
         );
+    }
+}
+
+#[test]
+fn shared_backup_create_and_restore_preserve_store_identity() {
+    let s = Server::empty();
+    s.init(Some("examples/handbook.yaml"));
+    let note = s.call(
+        "a",
+        &[
+            "--op-id",
+            "backup-note",
+            "new",
+            "page",
+            "--title",
+            "Preserved",
+            "--body",
+            "private-backup-body-marker-7c2e",
+        ],
+        true,
+    );
+    let before = s.main_head();
+    let backup = s.dir.path().join("backup");
+    let made = s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    assert_eq!(s.main_head(), before);
+    assert_eq!(made["data"]["verified"], true);
+    assert_eq!(made["data"]["database_only"], true);
+    assert_eq!(made["data"]["source_revision"], before);
+    let restored = s.dir.path().join("restored");
+    let result = Command::new(env!("CARGO_BIN_EXE_scrolls"))
+        .arg("--json")
+        .arg("--dolt")
+        .arg(Server::binary())
+        .args(["backup", "restore"])
+        .arg(&backup)
+        .arg("--out")
+        .arg(&restored)
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(result.status.success(), "{value}");
+    assert_eq!(value["data"]["store_id"], made["data"]["store_id"]);
+    assert_eq!(value["data"]["restored"], true);
+    assert_eq!(value["data"]["source_revision"], before);
+    assert!(restored.join("database/.dolt").is_dir());
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup.join("verified.json")).unwrap()).unwrap();
+    let copy: serde_json::Value =
+        serde_json::from_slice(&fs::read(restored.join("verified.json")).unwrap()).unwrap();
+    for directory in [
+        &backup,
+        &restored,
+        &backup.join("verification"),
+        &backup.join("recheck-verification"),
+    ] {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains("private-backup-body-marker-7c2e"),
+                    "diagnostic leaked body: {:?}",
+                    entry.path()
+                );
+            }
+        }
+    }
+    assert_eq!(original["kind"], "database-backup");
+    assert_eq!(copy["kind"], "database-restore");
+    assert_eq!(copy["source_backup_digest"], original["digest"]);
+    assert_eq!(copy["snapshot"], original["snapshot"]);
+    assert_eq!(
+        s.call("b", &["show", note["data"]["id"].as_str().unwrap()], true)["data"]["record"]["body"],
+        "private-backup-body-marker-7c2e"
+    );
+}
+
+#[test]
+fn local_clean_predicate_accepts_native_boolean_but_refuses_dirty_state() {
+    let root = tempfile::tempdir().unwrap();
+    let local =
+        scrolls::storage::Store::open(&root.path().join("store"), &Server::binary(), true).unwrap();
+    SqlSession::clean(&local).unwrap();
+    local
+        .sql("CREATE TABLE unknown_state (id INT PRIMARY KEY)")
+        .unwrap();
+    assert!(
+        SqlSession::clean(&local)
+            .unwrap_err()
+            .to_string()
+            .contains("dirty_state")
+    );
+}
+
+/// Real protocol transport with one controlled request-side fault callback.
+fn backup_query_proxy<F>(target: u16, mut callback: F) -> (u16, std::thread::JoinHandle<()>)
+where
+    F: FnMut(&str) -> Option<String> + Send + 'static,
+{
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpStream},
+    };
+    fn packet(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header)?;
+        let len =
+            usize::from(header[0]) | usize::from(header[1]) << 8 | usize::from(header[2]) << 16;
+        let mut bytes = vec![0; len + 4];
+        bytes[..4].copy_from_slice(&header);
+        stream.read_exact(&mut bytes[4..])?;
+        Ok(bytes)
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut server = TcpStream::connect(("127.0.0.1", target)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        let mut input = client.try_clone().unwrap();
+        let mut output = server.try_clone().unwrap();
+        let upstream = std::thread::spawn(move || {
+            while let Ok(mut bytes) = packet(&mut input) {
+                if bytes.get(4) == Some(&3) {
+                    if let Some(sql) = callback(&String::from_utf8_lossy(&bytes[5..])) {
+                        let len = sql.len() + 1;
+                        assert!(len < 0xff_ffff);
+                        let sequence = bytes[3];
+                        bytes = vec![
+                            (len & 255) as u8,
+                            ((len >> 8) & 255) as u8,
+                            ((len >> 16) & 255) as u8,
+                            sequence,
+                            3,
+                        ];
+                        bytes.extend_from_slice(sql.as_bytes());
+                    }
+                }
+                if output.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+            let _ = output.shutdown(Shutdown::Both);
+        });
+        while let Ok(bytes) = packet(&mut server) {
+            if client.write_all(&bytes).is_err() {
+                break;
+            }
+        }
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = server.shutdown(Shutdown::Both);
+        upstream.join().unwrap();
+    });
+    (port, handle)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shared_backup_attestation_and_parent_replacement_fail_without_redirected_writes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    for mode in [
+        "missing",
+        "wrong",
+        "other-filesystem",
+        "parent-before",
+        "parent-during",
+        "parent-directory-before",
+        "parent-directory-during",
+    ] {
+        let mut s = Server::empty();
+        s.init(None);
+        let before = s.main_head();
+        let actual = s.port;
+        let out = s.dir.path().join("backup");
+        let moved = s.dir.path().join("moved");
+        let foreign = s.dir.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("marker"), "must survive").unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let seen = fired.clone();
+        let (output, renamed, replacement) = (out.clone(), moved.clone(), foreign.clone());
+        let absent = s.dir.path().join("not-shared/host-nonce");
+        let (port, proxy) = backup_query_proxy(actual, move |sql| {
+            let backup = sql.starts_with("CALL DOLT_BACKUP(");
+            if backup {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            let matches = if mode.ends_with("during") {
+                backup
+            } else {
+                sql.contains("HEX(LOAD_FILE(")
+            };
+            if matches && !seen.swap(true, Ordering::SeqCst) {
+                match mode {
+                    "missing" => fs::remove_file(output.join("host-nonce")).unwrap(),
+                    "wrong" => fs::write(output.join("host-nonce"), "wrong nonce").unwrap(),
+                    "other-filesystem" => {
+                        return Some(format!(
+                            "SELECT HEX(LOAD_FILE({})) AS proof",
+                            literal(absent.to_str().unwrap())
+                        ));
+                    }
+                    _ => {
+                        fs::rename(&output, &renamed).unwrap();
+                        if mode.contains("directory") {
+                            fs::create_dir(&output).unwrap();
+                        } else {
+                            std::os::unix::fs::symlink(&replacement, &output).unwrap();
+                        }
+                    }
+                }
+            }
+            None
+        });
+        s.port = port;
+        let result = s.call(
+            "client",
+            &["backup", "create", "--out", out.to_str().unwrap()],
+            false,
+        );
+        proxy.join().unwrap();
+        s.port = actual;
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "fault was never reached: {result}"
+        );
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            usize::from(mode.ends_with("during"))
+        );
+        assert_eq!(
+            result["error"]["diagnostic"]["code"],
+            if mode.starts_with("parent") {
+                "backup_destination_changed"
+            } else {
+                "backup_host_mismatch"
+            }
+        );
+        assert_eq!(s.main_head(), before);
+        assert!(!out.join("verified.json").exists());
+        assert!(!moved.join("verified.json").exists());
+        assert_eq!(
+            fs::read_to_string(foreign.join("marker")).unwrap(),
+            "must survive"
+        );
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
+        if mode.ends_with("during") {
+            assert!(
+                moved.join("snapshot/manifest").is_file(),
+                "server must write only to the held directory"
+            );
+        }
+        if mode == "other-filesystem" {
+            assert!(
+                out.join("host-nonce").exists(),
+                "local file exists; the loopback server sees a different filesystem"
+            );
+        }
+    }
+}
+
+fn restore_backup_artifact(backup: &Path, output: &Path, success: bool) -> serde_json::Value {
+    let result = Command::new(env!("CARGO_BIN_EXE_scrolls"))
+        .arg("--json")
+        .arg("--dolt")
+        .arg(Server::binary())
+        .args(["backup", "restore"])
+        .arg(backup)
+        .arg("--out")
+        .arg(output)
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(result.status.success(), success, "{value}");
+    value
+}
+fn server_from_restored(output: &Path) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    fs::rename(output.join("database"), dir.path().join("knowledge")).unwrap();
+    let mut server = Server {
+        dir,
+        child: None,
+        port: 0,
+    };
+    server.start();
+    let mut admin = server.raw("main");
+    let absent: u64 = admin
+        .query_first("SELECT COUNT(*) FROM mysql.user WHERE User='alice'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        absent, 0,
+        "database-only backup must not claim to restore the original SQL account"
+    );
+    // Explicit, disposable provisioning is separate from the restore operation.
+    admin
+        .query_drop("CREATE USER alice IDENTIFIED BY 'test-only'; GRANT ALL ON *.* TO alice")
+        .unwrap();
+    drop(admin);
+    server
+}
+
+#[test]
+fn shared_backup_roundtrip_refs_assets_receipts_and_clean_interrupted_intent() {
+    let mut s = Server::handbook();
+    let repo = import_source(&s);
+    let expected: Vec<_> = ["README.md", "chapters/one.md", "asset.bin", "run.sh"]
+        .into_iter()
+        .map(|name| (name, fs::read(repo.join(name)).unwrap()))
+        .collect();
+    let plan = s.import_plan(&repo, "human", true, "book");
+    let imported = s.call(
+        "a",
+        &[
+            "--op-id",
+            "capture",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    let pending = s.proposed_page("review-later", "Pending review");
+    let body = s.dir.path().join("origin-body.md");
+    fs::write(&body, "recover exact body").unwrap();
+    s.interrupted(
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "recover-after-restore",
+            "new",
+            "page",
+            "--title",
+            "Recover",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+        "CALL DOLT_BRANCH(".into(),
+    );
+    let mut raw = s.raw("main");
+    raw.query_drop("CALL DOLT_TAG('-m','first annotation','--author','Fixture <fixture@localhost>','snapshot-a','main'); CALL DOLT_TAG('-m','second annotation','--author','Fixture <fixture@localhost>','snapshot-b','main')").unwrap();
+    let remote = s.dir.path().join("remote");
+    raw.query_drop(format!(
+        "CALL DOLT_REMOTE('add','fixture',{}); CALL DOLT_PUSH('fixture','main')",
+        literal(&format!("file://{}", remote.display()))
+    ))
+    .unwrap();
+    let remote_count: u64 = raw
+        .query_first("SELECT COUNT(*) FROM dolt_remote_branches")
+        .unwrap()
+        .unwrap();
+    assert!(remote_count > 0);
+    let original_tags: Vec<(String, String, String)> = raw
+        .query("SELECT tag_name,tag_hash,message FROM dolt_tags ORDER BY tag_name")
+        .unwrap();
+    drop(raw);
+    let before = s.main_head();
+    let backup = s.dir.path().join("backup");
+    s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup.join("verified.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["snapshot"]["tags"]["snapshot-a"]["commit"],
+        manifest["snapshot"]["tags"]["snapshot-b"]["commit"]
+    );
+    assert_ne!(
+        manifest["snapshot"]["tags"]["snapshot-a"]["metadata_digest"],
+        manifest["snapshot"]["tags"]["snapshot-b"]["metadata_digest"]
+    );
+    assert!(
+        !manifest["snapshot"]["remote_refs"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let output = s.dir.path().join("restored");
+    restore_backup_artifact(&backup, &output, true);
+    s.stop();
+    let restored = server_from_restored(&output);
+    fs::remove_dir_all(s.dir.path()).unwrap();
+    assert_eq!(restored.main_head(), before);
+    let tags: Vec<(String, String, String)> = restored
+        .raw("main")
+        .query("SELECT tag_name,tag_hash,message FROM dolt_tags ORDER BY tag_name")
+        .unwrap();
+    assert_eq!(tags, original_tags);
+    let after_remote_count: u64 = restored
+        .raw("main")
+        .query_first("SELECT COUNT(*) FROM dolt_remote_branches")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_remote_count, remote_count);
+    let export = restored.dir.path().join("export");
+    restored.call(
+        "reader",
+        &["render", "--out", export.to_str().unwrap()],
+        true,
+    );
+    for (name, bytes) in expected {
+        assert_eq!(
+            fs::read(export.join("sources/book").join(name)).unwrap(),
+            bytes
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            fs::metadata(export.join("sources/book/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+    let receipt: String = restored
+        .raw("main")
+        .query_first("SELECT payload FROM operations WHERE id='capture'")
+        .unwrap()
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(receipt["result"], imported["data"]);
+    let recovered = restored.call(
+        "new-client",
+        &[
+            "--role",
+            "agent",
+            "recover",
+            "recover-after-restore",
+            "--resume",
+        ],
+        true,
+    );
+    let branch = recovered["data"]["branch"].as_str().unwrap();
+    let token = restored.token(branch);
+    restored.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept-restored",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    let original_branch = pending["branch"].as_str().unwrap();
+    assert!(
+        restored.call("reviewer", &["review", original_branch], true)["data"]["review_token"]
+            .is_string()
+    );
+    assert_ne!(restored.main_head(), before);
+}
+
+#[test]
+fn shared_backup_research_configuration_retains_zero_and_false() {
+    let s = Server::empty();
+    s.init(Some("examples/research.yaml"));
+    let trial = s.call(
+        "a",
+        &[
+            "--op-id",
+            "trial",
+            "new",
+            "trial",
+            "--title",
+            "Zero result",
+            "--body",
+            "observed",
+            "--field",
+            "count=0",
+            "--field",
+            "replicated=false",
+        ],
+        true,
+    );
+    let backup = s.dir.path().join("backup");
+    s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let output = s.dir.path().join("restored");
+    restore_backup_artifact(&backup, &output, true);
+    let restored = server_from_restored(&output);
+    let row = restored.call(
+        "reader",
+        &["show", trial["data"]["id"].as_str().unwrap()],
+        true,
+    );
+    assert_eq!(row["data"]["record"]["fields"]["count"], 0);
+    assert_eq!(row["data"]["record"]["fields"]["replicated"], false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shared_backup_refuses_corruption_incomplete_artifacts_and_collisions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let s = Server::empty();
+    s.init(None);
+    let backup = s.dir.path().join("backup");
+    s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let marker = fs::read(backup.join("verified.json")).unwrap();
+    let inventory: serde_json::Value = serde_json::from_slice(&marker).unwrap();
+    let file = backup.join("snapshot").join(
+        inventory["files"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap(),
+    );
+    let original = fs::read(&file).unwrap();
+    let permissions = fs::metadata(&file).unwrap().permissions();
+    let out = s.dir.path().join("must-not-exist");
+    for fault in [
+        "bytes",
+        "mode",
+        "missing",
+        "symlink",
+        "special",
+        "extra",
+        "manifest",
+        "incomplete",
+    ] {
+        match fault {
+            "bytes" => fs::write(&file, b"corrupt").unwrap(),
+            "mode" => fs::set_permissions(
+                &file,
+                fs::Permissions::from_mode(permissions.mode() ^ 0o100),
+            )
+            .unwrap(),
+            "missing" => fs::remove_file(&file).unwrap(),
+            "symlink" => {
+                fs::remove_file(&file).unwrap();
+                symlink(backup.join("verified.json"), &file).unwrap();
+            }
+            "special" => {
+                fs::remove_file(&file).unwrap();
+                assert!(
+                    Command::new("mkfifo")
+                        .arg(&file)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            "extra" => fs::write(backup.join("snapshot/unknown"), "extra").unwrap(),
+            "manifest" => fs::write(backup.join("verified.json"), b"{}").unwrap(),
+            _ => fs::remove_file(backup.join("verified.json")).unwrap(),
+        }
+        let error = restore_backup_artifact(&backup, &out, false);
+        assert!(!out.exists(), "{fault}: {error}");
+        if fs::symlink_metadata(&file).is_ok() {
+            fs::remove_file(&file).unwrap();
+        }
+        fs::write(&file, &original).unwrap();
+        fs::set_permissions(&file, permissions.clone()).unwrap();
+        if backup.join("snapshot/unknown").exists() {
+            fs::remove_file(backup.join("snapshot/unknown")).unwrap();
+        }
+        fs::write(backup.join("verified.json"), &marker).unwrap();
+    }
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), "untouched").unwrap();
+    restore_backup_artifact(&backup, &out, false);
+    s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    assert_eq!(fs::read_to_string(out.join("keep")).unwrap(), "untouched");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    let moved = s.dir.path().join("relocated-backup");
+    fs::rename(&backup, &moved).unwrap();
+    restore_backup_artifact(&moved, &s.dir.path().join("valid-restored"), true);
+}
+
+#[test]
+fn shared_backup_rejects_dirty_source_and_holds_publication_lock() {
+    let s = Server::empty();
+    s.init(None);
+    let out = s.dir.path().join("backup");
+    let held = s.shared("main");
+    let result = s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    assert_eq!(result["error"]["diagnostic"]["code"], "backup_lock_timeout");
+    assert!(!out.exists());
+    drop(held);
+    let mut raw = s.raw("main");
+    raw.query_drop("CREATE TABLE foreign_state (id INT PRIMARY KEY)")
+        .unwrap();
+    let result = s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    assert_eq!(result["error"]["diagnostic"]["code"], "backup_source_dirty");
+    assert!(!out.exists());
+    let tables: Vec<String> = raw.query("SHOW TABLES").unwrap();
+    assert!(tables.contains(&"foreign_state".into()));
+}
+
+#[test]
+fn shared_backup_lost_ack_leaves_unverified_copy_and_releases_lock() {
+    let mut s = Server::empty();
+    s.init(None);
+    let before = s.main_head();
+    let actual = s.port;
+    let (port, proxy) = lose_matching_ack(actual, "CALL DOLT_BACKUP(".into());
+    s.port = port;
+    let out = s.dir.path().join("interrupted");
+    s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    proxy.join().unwrap();
+    s.port = actual;
+    assert!(out.join("snapshot/manifest").exists());
+    assert!(!out.join("verified.json").exists());
+    assert_eq!(s.main_head(), before);
+    s.call(
+        "b",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    s.call(
+        "b",
+        &[
+            "backup",
+            "create",
+            "--out",
+            s.dir.path().join("retry").to_str().unwrap(),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn shared_backup_detects_source_change_after_copy() {
+    let mut s = Server::empty();
+    s.init(None);
+    let actual = s.port;
+    let opts = s.opts("main");
+    let (port, proxy) = backup_query_proxy(actual, move |sql| {
+        if sql.starts_with("CALL DOLT_BACKUP(") {
+            let mut raw = Conn::new(opts.clone()).unwrap();
+            raw.query_drop("CALL DOLT_TAG('-m','concurrent change','--author','Fixture <fixture@localhost>','new-tag','main')").unwrap();
+        }
+        None
+    });
+    s.port = port;
+    let out = s.dir.path().join("changed");
+    let error = s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    proxy.join().unwrap();
+    s.port = actual;
+    assert_eq!(
+        error["error"]["diagnostic"]["code"],
+        "backup_restore_mismatch"
+    );
+    assert!(!out.join("verified.json").exists());
+    let tags: Vec<String> = s
+        .raw("main")
+        .query("SELECT tag_name FROM dolt_tags")
+        .unwrap();
+    assert_eq!(tags, vec!["new-tag"]);
+}
+
+#[test]
+fn shared_backup_refuses_artifact_changed_after_restore_verification() {
+    let mut s = Server::empty();
+    s.init(None);
+    let actual = s.port;
+    let out = s.dir.path().join("backup");
+    let artifact = out.join("snapshot/manifest");
+    let mut copied = false;
+    let (port, proxy) = backup_query_proxy(actual, move |sql| {
+        if sql.starts_with("CALL DOLT_BACKUP(") {
+            copied = true;
+        } else if copied && sql == "SELECT * FROM dolt_stashes" {
+            // Source is rechecked only after the actual native restore completed.
+            fs::write(&artifact, "corrupt after restore").unwrap();
+            copied = false;
+        }
+        None
+    });
+    s.port = port;
+    let error = s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    proxy.join().unwrap();
+    s.port = actual;
+    assert_eq!(error["error"]["diagnostic"]["code"], "backup_changed");
+    assert!(!out.join("verified.json").exists());
+}
+
+#[test]
+fn shared_backup_refuses_unqualified_stashes_and_native_tool_versions() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut s = Server::empty();
+    s.init(None);
+    let tool = s.dir.path().join("wrong-dolt");
+    fs::write(&tool, "#!/bin/sh\nprintf 'dolt version 2.3.0\\n'\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = s.dir.path().join("wrong-version");
+    let error = s.call(
+        "a",
+        &[
+            "--dolt",
+            tool.to_str().unwrap(),
+            "backup",
+            "create",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert_eq!(error["error"]["diagnostic"]["code"], "backup_tool_version");
+    assert!(!out.join("verified.json").exists());
+    s.stop();
+    s.cli(&["sql", "-q", "CREATE TABLE saved_work (id INT PRIMARY KEY)"]);
+    s.cli(&["stash", "push", "--include-untracked"]);
+    s.start();
+    let out = s.dir.path().join("has-stash");
+    let error = s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    assert_eq!(
+        error["error"]["diagnostic"]["code"],
+        "backup_unsupported_refs"
+    );
+    assert!(!out.exists());
+    let count: u64 = s
+        .raw("main")
+        .query_first("SELECT COUNT(*) FROM dolt_stashes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn shared_backup_walks_multilevel_native_reference_maps() {
+    let s = Server::empty();
+    s.init(None);
+    let mut raw = s.raw("main");
+    for index in 0..80 {
+        raw.query_drop(format!("CALL DOLT_BRANCH('archive-{index:03}','main')"))
+            .unwrap();
+    }
+    drop(raw);
+    let backup = s.dir.path().join("many-refs");
+    s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let proof: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup.join("verified.json")).unwrap()).unwrap();
+    let refs = proof["dataset_refs"].as_object().unwrap();
+    assert_eq!(proof["snapshot"]["branches"].as_object().unwrap().len(), 82);
+    for index in 0..80 {
+        assert!(refs.contains_key(&format!("refs/heads/archive-{index:03}")));
+    }
+    assert!(refs.contains_key("refs/internal/create"));
+    assert!(
+        proof["dataset_map_nodes"].as_u64().unwrap() > 1,
+        "fixture must traverse a multilevel map"
+    );
+    restore_backup_artifact(&backup, &s.dir.path().join("restored-many-refs"), true);
+}
+
+#[test]
+fn shared_backup_refuses_unqualified_native_ref_categories() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::empty();
+    s.init(None);
+    let before = s.main_head();
+    // Inject a native inspection result at the tool boundary. These categories
+    // are not exposed by the SQL branches/tags/remotes tables.
+    for category in ["workspaces", "internal", "statistics", "tuples"] {
+        let wrapper = s.dir.path().join(format!("inspect-{category}"));
+        let program = format!(
+            r#"#!/usr/bin/env python3
+import subprocess,sys
+if sys.argv[1] != 'show': sys.exit(subprocess.call([{binary}]+sys.argv[1:]))
+output=subprocess.check_output([{binary}]+sys.argv[1:])
+if sys.argv[1]=='show' and output.startswith(b'SerialMessage StoreRoot{{AddressMap {{'):
+ output=output.replace(b'\n', b'\n\t\trefs/{category}/unexpected: #{before}\n',1)
+sys.stdout.buffer.write(output)
+"#,
+            binary = serde_json::to_string(Server::binary().to_str().unwrap()).unwrap()
+        );
+        fs::write(&wrapper, program).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let out = s.dir.path().join(format!("ref-{category}"));
+        let error = s.call(
+            "a",
+            &[
+                "--dolt",
+                wrapper.to_str().unwrap(),
+                "backup",
+                "create",
+                "--out",
+                out.to_str().unwrap(),
+            ],
+            false,
+        );
+        assert_eq!(
+            error["error"]["diagnostic"]["code"], "backup_unsupported_refs",
+            "{category}: {error}"
+        );
+        assert!(!out.join("verified.json").exists());
+        assert_eq!(s.main_head(), before);
+    }
+}
+
+#[test]
+fn shared_backup_refuses_native_interactive_rebase_even_after_clean_commit() {
+    let s = Server::empty();
+    s.init(None);
+    s.call(
+        "a",
+        &[
+            "--op-id",
+            "rebase-note",
+            "new",
+            "note",
+            "--title",
+            "Rebase input",
+            "--body",
+            "body",
+        ],
+        true,
+    );
+    let mut raw = s.raw("main");
+    raw.query_drop("CALL DOLT_REBASE('-i','HEAD~1')").unwrap();
+    let active: String = raw.query_first("SELECT active_branch()").unwrap().unwrap();
+    assert!(active.starts_with("dolt_rebase_"));
+    raw.query_drop("CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','preserved rebase state','--author','Fixture <fixture@localhost>')").unwrap();
+    let dirty: u64 = raw
+        .query_first("SELECT COUNT(*) FROM dolt_status")
+        .unwrap()
+        .unwrap();
+    assert_eq!(dirty, 0);
+    let out = s.dir.path().join("rebase-refused");
+    s.call(
+        "a",
+        &["backup", "create", "--out", out.to_str().unwrap()],
+        false,
+    );
+    assert!(!out.join("verified.json").exists());
+    let branches: Vec<String> = raw.query("SELECT name FROM dolt_branches").unwrap();
+    assert!(branches.contains(&active));
+}
+
+#[test]
+fn shared_backup_restore_refuses_chunks_changed_after_inspection() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Server::empty();
+    s.init(None);
+    let backup = s.dir.path().join("backup");
+    s.call(
+        "a",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let wrapper = s.dir.path().join("change-after-inspection");
+    let program = format!(
+        r#"#!/usr/bin/env python3
+import subprocess,sys,pathlib
+result=subprocess.run([{binary}]+sys.argv[1:])
+if result.returncode==0 and sys.argv[1]=='sql':
+ directory=pathlib.Path.cwd()
+ chunk=next(p for p in (directory/'.dolt/noms').iterdir() if p.is_file() and len(p.name)==32)
+ with chunk.open('ab') as stream: stream.write(b'changed after verification')
+ (directory.parent/'mutation-proof').write_text('injected')
+sys.exit(result.returncode)
+"#,
+        binary = serde_json::to_string(Server::binary().to_str().unwrap()).unwrap()
+    );
+    fs::write(&wrapper, program).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = s.dir.path().join("changed-restored");
+    let result = Command::new(env!("CARGO_BIN_EXE_scrolls"))
+        .arg("--json")
+        .arg("--dolt")
+        .arg(&wrapper)
+        .args(["backup", "restore"])
+        .arg(&backup)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(!result.status.success(), "{error}");
+    assert_eq!(error["error"]["diagnostic"]["code"], "backup_changed");
+    assert!(out.join("mutation-proof").exists());
+    assert!(!out.join("verified.json").exists());
+}
+
+#[test]
+fn shared_connection_io_budget_is_explicit_bounded_and_redacted() {
+    let s = Server::empty();
+    s.init(None);
+    for (value, valid) in [
+        (json!(11), true),
+        (json!(600), true),
+        (json!(0), false),
+        (json!(10), false),
+        (json!(601), false),
+        (json!("private-budget-marker"), false),
+    ] {
+        let mut command = s.client("budget", &["doctor"]);
+        let path = s.dir.path().join("budget/connection.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["io_timeout_seconds"] = value;
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let output = command.output().unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.success(), valid, "{response}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-budget-marker"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-budget-marker"));
     }
 }

@@ -37,6 +37,11 @@ struct Settings {
     database: String,
     user: String,
     password: String,
+    #[serde(default = "default_io_timeout_seconds")]
+    io_timeout_seconds: u64,
+}
+fn default_io_timeout_seconds() -> u64 {
+    30
 }
 fn connect(path: &Path, recovery: bool) -> Result<SharedSession> {
     let bytes = fs::read(path).context("cannot read machine-local connection file")?;
@@ -44,6 +49,10 @@ fn connect(path: &Path, recovery: bool) -> Result<SharedSession> {
     let settings: Settings = serde_json::from_slice(&bytes).map_err(|_| {
         anyhow::anyhow!("invalid connection JSON: expected host, port, database, user, password")
     })?;
+    ensure!(
+        (11..=600).contains(&settings.io_timeout_seconds),
+        "invalid connection IO budget: io_timeout_seconds must be 11–600"
+    );
     let config = Connection {
         host: settings.host,
         port: settings.port,
@@ -51,7 +60,7 @@ fn connect(path: &Path, recovery: bool) -> Result<SharedSession> {
         user: settings.user,
         password: settings.password,
         connect_timeout: Duration::from_secs(5),
-        io_timeout: Duration::from_secs(30),
+        io_timeout: Duration::from_secs(settings.io_timeout_seconds),
         lock_timeout: Duration::from_secs(10),
     };
     if recovery {
@@ -102,6 +111,7 @@ impl Store {
             binary: PathBuf::new(),
             _lock: None,
             shared: Some(connect(path, false)?),
+            inspection: None,
         })
     }
     pub fn is_shared(&self) -> bool {
@@ -119,6 +129,7 @@ impl Store {
             binary: PathBuf::new(),
             _lock: None,
             shared: Some(connect(path, true)?),
+            inspection: None,
         };
         super::session::SqlSession::clean(s.shared.as_ref().unwrap())?;
         s.check_shared_format()?;

@@ -86,6 +86,9 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
     }
 }
 pub fn run(cli: &Cli) -> Result<Value> {
+    if let Cmd::Backup { command } = &cli.command {
+        return storage::backup::run(cli, command);
+    }
     if cli.connection.is_some() {
         storage::shared::check_command(cli)?;
     } else if matches!(cli.command, Cmd::Recover { .. }) {

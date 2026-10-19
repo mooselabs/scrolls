@@ -43,7 +43,7 @@ def shared_server(out):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     connection = out / "connection.json"
-    connection.write_text(json.dumps({"host": "127.0.0.1", "port": port, "database": database, "user": "fixture", "password": "test-only"}))
+    connection.write_text(json.dumps({"host": "127.0.0.1", "port": port, "database": database, "user": "fixture", "password": "test-only", "io_timeout_seconds": 300}))
     connection.chmod(0o600)
     with (out / "server.log").open("wb") as log:
         server = subprocess.Popen([str(DOLT), "sql-server", "--host", "127.0.0.1", "--port", str(port)], cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
@@ -128,13 +128,28 @@ def qualify(repo, binary, out, connection=None, expected_initial=None):
         assert bool(file.stat().st_mode & 0o111) == (mode == "100755"), path
         checks.append([path.decode(), mode, oid, hashlib.sha256(raw).hexdigest()])
     assert len(checks) == coverage["files"], "oracle must check every included source file"
+    backup_proof = None
+    if connection is not None:
+        backup = out / "backup"
+        start = time.monotonic()
+        made = call("backup", "create", "--out", backup)
+        timings["backup_create_verify"] = time.monotonic() - start
+        start = time.monotonic()
+        restored = json.loads(run([binary, "--json", "--dolt", DOLT, "backup", "restore", backup, "--out", out / "restored"]))["data"]
+        timings["backup_restore_verify"] = time.monotonic() - start
+        assert made["verified"] and restored["verified"]
+        assert made["database_only"] and restored["database_only"]
+        assert made["snapshot_digest"] == restored["snapshot_digest"]
+        assert made["proof_digest"] == restored["source_backup_digest"]
+        assert made["store_id"] == restored["store_id"]
+        backup_proof = {k: made[k] for k in ["snapshot_digest", "proof_digest", "store_id", "source_revision", "excluded", "database_only"]}
     report = {"backend": "local" if connection is None else "shared", "source_commit": PIN,
               "tested_commit": run(["git", "-C", ROOT, "rev-parse", "HEAD"]).decode().strip(),
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "coverage": coverage,
               "candidate_digest": result["candidate_digest"],
               "source_inventory_digest": hashlib.sha256(json.dumps(checks, separators=(",", ":")).encode()).hexdigest(),
               "byte_mismatches": 0, "mode_mismatches": 0, "timings_seconds": timings,
-              "shared_query_bytes": doctor.get("shared_query_bytes"), "source_bytes": doctor["import_health"]["bytes"]}
+              "backup": backup_proof, "shared_io_timeout_seconds": 300 if connection is not None else None, "shared_query_bytes": doctor.get("shared_query_bytes"), "source_bytes": doctor["import_health"]["bytes"]}
     (out / "backend-report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2), flush=True)
     return report

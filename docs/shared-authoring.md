@@ -229,3 +229,16 @@ and a second client directory. It compares all 820 paths, bytes and modes and
 744 documents across both stores, records timings and the transport budget,
 and shuts down its owned server. It never accepts a live endpoint. Reference
 coverage remains declared metadata only, not body links or RST roles.
+
+Verified database-only backup creation and disposable restoration are available
+through `backup create` and `backup restore`. See [shared backups](shared-backups.md)
+for host attestation, proof contents, refusal behavior and the separate account
+and service-configuration restoration requirement.
+
+Machine-local connection JSON optionally accepts `io_timeout_seconds` (11–600,
+default 30). This bounds each socket read/write and must exceed the fixed
+10-second publication-lock acquisition budget. Bulk qualification explicitly
+uses 300 seconds: the PEP transaction can exceed 30 seconds on a busy host.
+A timeout is not success; preserve the original operation ID and reconcile its
+receipt before retrying. The setting does not change locks, byte limits,
+transaction atomicity, stale-revision checks or review tokens.
