@@ -668,18 +668,33 @@ pub fn run(cli: &Cli) -> Result<Value> {
     }
     let revision = store.revision()?;
     let mut consumed = vec![];
+    let store_id: Option<String> = store.one("metadata", "store_id")?;
+    let reads = crate::read::View {
+        graph: &graph,
+        routing: &routing,
+        local: &local,
+        store_id: store_id.as_deref(),
+        actor: who,
+    };
     let data = match &cli.command {
         Cmd::List { filters } => {
-            let rows = query::select(&graph, filters, None, usize::MAX, who)?;
+            let rows = reads.execute(crate::read::Operation::Records {
+                filters,
+                terms: None,
+                limit: usize::MAX,
+            })?;
             if store.is_shared() {
-                consumed = rows.iter().map(|r| r.id.clone()).collect();
+                consumed = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                    .collect();
             }
-            json!(rows)
+            rows
         }
         Cmd::Schema { command } => match command {
-            SchemaCommand::Show => {
-                json!({"schema":graph.schema,"schema_revision":graph.schema.revision()})
-            }
+            SchemaCommand::Show => reads.execute(crate::read::Operation::Schema)?,
             SchemaCommand::Export => json!({"yaml":serde_yaml::to_string(&graph.schema)?}),
             SchemaCommand::Validate { file } => {
                 let mut configured = crate::schema::Schema::parse(&fs::read_to_string(file)?)?;
@@ -691,39 +706,40 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
             SchemaCommand::Apply { .. } => unreachable!(),
         },
-        Cmd::Query { file, path, at } => query::evaluate(
-            &graph,
-            &routing,
-            &fs::read_to_string(file)?,
-            who,
-            path,
-            at.as_deref(),
-        )?,
+        Cmd::Query { file, path, at } => {
+            let expression: query::Expr = serde_yaml::from_str(&fs::read_to_string(file)?)?;
+            reads.execute(crate::read::Operation::Query {
+                expression: &expression,
+                actor: who,
+                paths: path,
+                at: at.as_deref(),
+            })?
+        }
         Cmd::Show { id, provenance } => {
-            let name = if let Some(rest) = id.strip_prefix("scrolls://") {
-                let (uuid, record) = rest.split_once('/').context("invalid Scrolls URI")?;
-                let current: String = store
-                    .one("metadata", "store_id")?
-                    .context("run scrolls migrate first")?;
-                if uuid != current {
-                    bail!("Scrolls store identity mismatch; select the matching --store");
-                }
-                record
-            } else {
-                id
-            };
-            let id = graph.resolve(name)?;
+            let id = reads.resolve(id)?;
             consumed.push(id.clone());
-            json!({"uri":store.one::<String>("metadata","store_id")?.map(|s|crate::work_ref::document_uri(&s,&id)),"record":graph.records[&id],"references":query::references(&graph,&id),"edges":graph.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::beads::related(&graph,&id,&local),"provenance":if *provenance {crate::source_import::provenance(&graph,&id)} else {Value::Null}})
+            reads.execute(crate::read::Operation::Document {
+                id: &id,
+                provenance: *provenance,
+            })?
         }
         Cmd::Search {
             terms,
             limit,
             filters,
         } => {
-            let rows = query::select(&graph, filters, Some(terms), *limit, who)?;
-            consumed = rows.iter().map(|r| r.id.clone()).collect();
-            json!(rows)
+            let rows = reads.execute(crate::read::Operation::Records {
+                filters,
+                terms: Some(terms),
+                limit: *limit,
+            })?;
+            consumed = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r["id"].as_str().map(str::to_owned))
+                .collect();
+            rows
         }
         Cmd::Walk {
             id,
@@ -731,24 +747,22 @@ pub fn run(cli: &Cli) -> Result<Value> {
             depth,
             direction,
             full,
-        } => query::traverse(
-            &graph,
-            &graph.resolve(id)?,
-            rel.as_deref(),
-            *depth,
-            *direction,
-            *full,
-        )?,
+        } => reads.execute(crate::read::Operation::Walk {
+            id,
+            rel: rel.as_deref(),
+            depth: *depth,
+            direction: *direction,
+            full: *full,
+        })?,
         Cmd::Context { id, bead, budget } => {
             let packet = if let Some(reference) = bead {
                 let reference = local.resolve(reference)?.uri();
                 query::bead_packet(&graph, &reference, &local, *budget)?
             } else {
-                query::context(
-                    &graph,
-                    &graph.resolve(id.as_deref().context("missing context ID")?)?,
-                    *budget,
-                )?
+                reads.execute(crate::read::Operation::Context {
+                    id: id.as_deref().context("missing context ID")?,
+                    budget: *budget,
+                })?
             };
             consumed = packet["items"]
                 .as_array()
@@ -759,18 +773,14 @@ pub fn run(cli: &Cli) -> Result<Value> {
             packet
         }
         Cmd::Prime { budget } => {
-            let packet = query::prime(&graph, *budget)?;
+            let packet = reads.execute(crate::read::Operation::Prime { budget: *budget })?;
             consumed = graph.schema.pins.clone();
             packet
         }
         Cmd::Proposals => json!(store.proposals()?),
         Cmd::History { id } => {
-            if let Some(id) = id {
-                let id = graph.resolve(id)?;
-                json!(store.sql(&format!("SELECT commit_hash,committer,commit_date,payload FROM dolt_history_records WHERE id={} ORDER BY commit_date,commit_hash",storage::literal(&id)))?)
-            } else {
-                json!(store.sql("SELECT * FROM dolt_log ORDER BY date,commit_hash")?)
-            }
+            let id = id.as_deref().map(|id| graph.resolve(id)).transpose()?;
+            json!(crate::read::history(&store, &revision, id.as_deref())?)
         }
         Cmd::Lint => {
             let mut lint = policy::lint(&graph);
@@ -946,37 +956,10 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         .find(|p| p.branch == name)
         .context("proposal metadata missing")?;
     if !deciding {
-        let base = s.head("main")?;
-        let proposal_revision = s.head(&name)?;
-        let token =
-            crate::review_token::ReviewToken::new(&name, &base, &proposal_revision).encode()?;
-        s.checkout(&name)?;
-        let proposed = s.graph()?;
-        let ancestor = s.merge_base("main", &name)?;
-        let old_rows = s.sql(&format!(
-            "SELECT payload FROM records AS OF {}",
-            storage::revision_literal(&ancestor)
-        ))?;
-        let old: std::collections::BTreeMap<String, Record> = old_rows
-            .iter()
-            .map(|v| {
-                let r: Record = serde_json::from_str(v["payload"].as_str().unwrap())?;
-                Ok((r.id.clone(), r))
-            })
-            .collect::<Result<_>>()?;
-        let changes: Vec<_> = proposed
-            .records
-            .iter()
-            .filter(|(id, r)| old.get(*id) != Some(*r))
-            .map(|(id, r)| json!({"id":id,"before":old.get(id),"after":r}))
-            .collect();
-        let diff = s.diff_text("main", &name, "edges")?;
-        let configuration_diff = s.diff_text("main", &name, "metadata")?;
-        return wrap(
-            s,
-            json!({"proposal":proposal,"main_revision":base,"proposal_revision":proposal_revision,"review_token":token,"merge_base":ancestor,"records":changes,"graph_diff":diff,"configuration_diff":configuration_diff,"imports":crate::source_import::summary(&proposed,&if s.one::<u32>("metadata","schema")?.is_some_and(|v|v>=4){s.import_files()?}else{vec![]})}),
-            &name,
-        );
+        let data = crate::read::proposal_detail(s, &name)?;
+        let mut response = wrap(s, data.clone(), &name)?;
+        response["revision"] = data["proposal_revision"].clone();
+        return Ok(response);
     }
     if cli.proposal.is_some() {
         bail!("review decisions run from main; omit --proposal")

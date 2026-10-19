@@ -72,6 +72,11 @@ pub struct New {
 }
 #[derive(Debug, Serialize, Subcommand)]
 pub enum Cmd {
+    /// Serve knowledge reads over loopback HTTP. Never writes or repairs a store.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: std::net::SocketAddr,
+    },
     Init {
         #[arg(long)]
         schema: Option<PathBuf>,

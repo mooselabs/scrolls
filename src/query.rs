@@ -506,7 +506,20 @@ pub fn evaluate(
     at: Option<&str>,
 ) -> Result<Value> {
     let expr: Expr = serde_yaml::from_str(text)?;
-    validate_expression(&expr, &g.schema)?;
+    evaluate_expression(g, routing, &expr, actor, paths, at)
+}
+
+/// Evaluate a parsed expression from either CLI YAML or HTTP JSON, retaining
+/// each transport's strict duplicate/unknown-field parsing behavior.
+pub fn evaluate_expression(
+    g: &Graph,
+    routing: &Value,
+    expr: &Expr,
+    actor: &str,
+    paths: &[String],
+    at: Option<&str>,
+) -> Result<Value> {
+    validate_expression(expr, &g.schema)?;
     let at = at
         .map(|s| chrono::DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&chrono::Utc)))
         .transpose()?
@@ -520,7 +533,7 @@ pub fn evaluate(
     let mut diagnostics = BTreeSet::new();
     let mut items = vec![];
     for r in g.records.values() {
-        if matches(&expr, g, r, &b, &mut diagnostics)? {
+        if matches(expr, g, r, &b, &mut diagnostics)? {
             items.push(reference(r));
         }
     }

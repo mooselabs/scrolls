@@ -35,9 +35,31 @@ pub struct Store {
 impl Store {
     /// Open without recovery, branch checkout, configuration writes or initialization.
     pub fn open_readonly(root: &Path, binary: &Path) -> Result<Self> {
+        Self::open_readonly_wait(root, binary, None)
+    }
+    /// Same read-only opener with bounded lock admission for the HTTP server.
+    pub fn open_readonly_wait(
+        root: &Path,
+        binary: &Path,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Self> {
         let root = fs::canonicalize(root).context("store missing; run init first")?;
         let lock = OpenOptions::new().read(true).open(root.join("lock"))?;
-        lock.lock_exclusive()?;
+        if let Some(timeout) = timeout {
+            let start = std::time::Instant::now();
+            loop {
+                match lock.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        anyhow::ensure!(start.elapsed() < timeout, "read_lock_timeout");
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        } else {
+            lock.lock_exclusive()?;
+        }
         // Check recovery state only after the previous writer has released its lock.
         for journal in ["review-journal.json", "migration-journal.json"] {
             if root.join(journal).exists() {
@@ -56,7 +78,7 @@ impl Store {
         if version.lines().next() != Some(format!("dolt version {DOLT_VERSION}").as_str()) {
             bail!("Dolt {DOLT_VERSION} required");
         }
-        s.clean()?;
+        session::SqlSession::clean(&s)?;
         // Inspect all branch working sets; a dirty inactive branch is not a snapshot.
         if !s
             .sql("SELECT * FROM dolt_branches WHERE dirty = 1")?

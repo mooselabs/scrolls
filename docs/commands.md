@@ -1,12 +1,13 @@
 # Scrolls 0.3 command reference
 
-Global flags: `--store DIR`, `--dolt FILE`, `--json`, `--actor NAME`,
+Global flags: `--connection FILE`, `--store DIR`, `--dolt FILE`, `--json`, `--actor NAME`,
 `--role human|agent`, `--proposal BRANCH`, `--op-id ID`, `--dry-run`, `--session ID`.
 Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 `revision`, `branch`, and `data` (or `error`). Beads backlink payloads remain v1.
 
 | Command | Contract |
 |---|---|
+| `serve [--bind 127.0.0.1:0]` | Read-only loopback HTTP; local or shared snapshot reads, JSON startup address. See [HTTP API](http-api.md). |
 | `init [--schema FILE]` | Create a format 4 store using a supplied or bundled ontology. |
 | `schema show` | Active typed configuration and schema revision. |
 | `schema export` | YAML on stdout, suitable for editing (also with `--json`). |
