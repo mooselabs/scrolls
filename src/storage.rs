@@ -1,6 +1,7 @@
 //! Local storage and the shared SQL session foundation.
 pub mod session;
 pub mod shared;
+pub mod shared_review;
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -109,7 +110,12 @@ impl Store {
                     serde_json::from_str(row["payload"].as_str().context("import payload")?)?;
                 anyhow::ensure!(
                     row["id"] == key(&value),
-                    "source_ownership: invalid keyed import row in {table}"
+                    "{}: invalid keyed row in {table}",
+                    if table.starts_with("import_") {
+                        "source_ownership"
+                    } else {
+                        "stored_row_identity"
+                    }
                 );
                 Ok(value)
             })
@@ -128,7 +134,7 @@ impl Store {
                 .one_at("metadata", "ontology", rev)?
                 .unwrap_or_default(),
             records: self
-                .rows_at::<Record>("records", rev)?
+                .import_rows::<Record>("records", Some(rev), |r| r.id.clone())?
                 .into_iter()
                 .map(|mut r| {
                     r.normalize_metadata();
@@ -136,7 +142,7 @@ impl Store {
                 })
                 .collect(),
             edges: self
-                .rows_at::<Edge>("edges", rev)?
+                .import_rows::<Edge>("edges", Some(rev), Edge::key)?
                 .into_iter()
                 .map(|e| (e.key(), e))
                 .collect(),
@@ -582,9 +588,19 @@ impl Store {
     }
     pub fn checkout(&self, branch: &str) -> Result<()> {
         if let Some(session) = &self.shared {
-            anyhow::ensure!(branch == "main", "shared_unsupported: proposal branches");
-            self.check_shared_format()?;
-            return session.select_branch(branch);
+            anyhow::ensure!(
+                branch == "main" || branch.starts_with("proposal/"),
+                "shared_unsupported: select public proposal branches only"
+            );
+            session.select_branch(branch)?;
+            session.clean()?;
+            self.check_versioned_inventory("HEAD")?;
+            anyhow::ensure!(
+                self.one::<u32>("metadata", "schema")? == Some(5)
+                    && self.one::<u32>("metadata", "shared_writer")? == Some(2),
+                "unsupported shared branch format"
+            );
+            return Ok(());
         }
         self.clean()?;
         self.run(&["checkout", branch])?;
@@ -604,6 +620,50 @@ impl Store {
                 .context("missing Dolt revision")?
                 .into(),
         )
+    }
+    pub fn merge_base(&self, from: &str, to: &str) -> Result<String> {
+        if !self.is_shared() {
+            return Ok(self.run(&["merge-base", from, to])?.trim().into());
+        }
+        self.sql(&format!(
+            "SELECT DOLT_MERGE_BASE({}, {}) AS revision",
+            literal(from),
+            literal(to)
+        ))?
+        .first()
+        .and_then(|r| r["revision"].as_str())
+        .map(str::to_owned)
+        .context("missing merge base")
+    }
+    pub fn diff_text(&self, from: &str, to: &str, table: &str) -> Result<String> {
+        if !self.is_shared() {
+            return self.run(&["diff", from, to, table]);
+        }
+        Ok(serde_json::to_string_pretty(&self.sql(&format!(
+            "SELECT * FROM DOLT_DIFF({}, {}, {})",
+            literal(from),
+            literal(to),
+            literal(table)
+        ))?)?)
+    }
+    pub(crate) fn select_shared(&self, branch: &str) -> Result<()> {
+        self.shared
+            .as_ref()
+            .context("shared operation required")?
+            .select_branch(branch)
+    }
+    pub(crate) fn commit_shared_checked(
+        &self,
+        changes: &str,
+        message: &str,
+        actor: &str,
+        owned: bool,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        self.shared
+            .as_ref()
+            .context("shared operation required")?
+            .commit_checked(changes, message, actor, owned, validate)
     }
     pub fn head(&self, branch: &str) -> Result<String> {
         Ok(self.sql(&format!(
@@ -642,7 +702,7 @@ impl Store {
         let mut g = Graph {
             schema: self.one("metadata", "ontology")?.unwrap_or_default(),
             records: self
-                .rows::<Record>("records")?
+                .import_rows::<Record>("records", None, |r| r.id.clone())?
                 .into_iter()
                 .map(|mut r| {
                     r.normalize_metadata();
@@ -650,7 +710,7 @@ impl Store {
                 })
                 .collect(),
             edges: self
-                .rows::<Edge>("edges")?
+                .import_rows::<Edge>("edges", None, Edge::key)?
                 .into_iter()
                 .map(|e| (e.key(), e))
                 .collect(),
@@ -727,17 +787,16 @@ impl Store {
     }
     pub fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
         if self.is_shared() {
-            let revision = self.revision()?;
-            if let Some(r) = self.one_at::<Value>("operations", op, &revision)? {
-                anyhow::ensure!(
-                    r["args_hash"] == hash,
-                    "--op-id {op} was already used with different arguments or attribution"
-                );
-                return Ok(Some(r["result"].clone()));
-            }
-            return Ok(None);
+            shared_review::check_identity(self, op, hash)?;
         }
-        if let Some(r) = crate::beads::Local::load(&self.root)?.operations.get(op) {
+        if let Some(r) = (if self.is_shared() {
+            crate::beads::Local::default()
+        } else {
+            crate::beads::Local::load(&self.root)?
+        })
+        .operations
+        .get(op)
+        {
             if r["hash"] != hash {
                 bail!("--op-id {op} was already used with different arguments or attribution");
             }
@@ -747,7 +806,11 @@ impl Store {
         let queries: Vec<_> = self
             .branches()?
             .iter()
-            .filter(|b| b.as_str() == "main" || b.starts_with("proposal/"))
+            .filter(|b| {
+                b.as_str() == "main"
+                    || b.starts_with("proposal/")
+                    || (self.is_shared() && b.as_str() == shared_review::JOURNAL)
+            })
             .map(|b| {
                 format!(
                     "SELECT payload FROM operations AS OF {} WHERE id={}",
@@ -764,6 +827,9 @@ impl Store {
                 bail!("--op-id {op} was already used with different arguments or attribution");
             }
             result = Some(r["result"].clone());
+        }
+        if self.is_shared() && result.is_some() {
+            shared_review::verify_receipt(self, op, hash)?;
         }
         Ok(result)
     }

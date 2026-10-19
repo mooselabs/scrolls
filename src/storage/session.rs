@@ -22,7 +22,17 @@ pub trait SqlSession {
 
     fn clean(&self) -> Result<()> {
         ensure!(
-            self.sql("SELECT * FROM dolt_status")?.is_empty(),
+            self.sql("SELECT * FROM dolt_ignore")?.is_empty(),
+            "unsupported_dolt_ignore: Scrolls requires every store table to be versioned"
+        );
+        ensure!(
+            self.sql("SELECT * FROM dolt_status")?.is_empty()
+                && self.sql("SELECT * FROM dolt_merge_status WHERE is_merging = 1")?.is_empty()
+                && self
+                    .sql("SELECT DOLT_HASHOF_DB('HEAD') = DOLT_HASHOF_DB('WORKING') AND DOLT_HASHOF_DB('HEAD') = DOLT_HASHOF_DB('STAGED') AS clean")?
+                    .first()
+                    .map(|v| &v["clean"])
+                    == Some(&json!(1)),
             "dirty_state: unexplained Dolt working set; inspect without discarding it"
         );
         Ok(())
@@ -90,6 +100,19 @@ impl SharedSession {
     /// Locks before selecting/reading the candidate base. Even read-only callers
     /// of this low-level foundation serialize; snapshot caches come later.
     pub fn connect(config: &Connection, branch: &str) -> Result<Self> {
+        let s = Self::connect_locked(config, branch)?;
+        s.clean()?;
+        ensure!(
+            s.sql("SELECT name FROM dolt_branches WHERE dirty = 1")?
+                .is_empty(),
+            "dirty_state: an unexplained branch working set requires maintenance"
+        );
+        Ok(s)
+    }
+
+    /// The Store's recovery admission checks committed ownership before it can
+    /// inspect an interrupted temporary working set. Never bypass that check.
+    pub(crate) fn connect_locked(config: &Connection, branch: &str) -> Result<Self> {
         identifier(&config.database)?;
         branch_name(branch)?;
         config.host.parse::<std::net::IpAddr>()
@@ -144,12 +167,6 @@ impl SharedSession {
         s.sql("ROLLBACK")?;
         s.sql("SET autocommit = 1")?;
         s.select_branch(branch)?;
-        s.clean()?;
-        ensure!(
-            s.sql("SELECT name FROM dolt_branches WHERE dirty = 1")?
-                .is_empty(),
-            "dirty_state: an unexplained branch working set requires maintenance"
-        );
         Ok(s)
     }
 
@@ -169,10 +186,24 @@ impl SharedSession {
     /// against HEAD. On error, the caller must reconcile the same operation ID
     /// through a new session; this method never retries an uncertain commit.
     pub fn commit(&self, changes: &str, message: &str, actor: &str) -> Result<String> {
-        self.clean()?;
+        self.commit_checked(changes, message, actor, false, || Ok(()))
+    }
+
+    pub(crate) fn commit_checked(
+        &self,
+        changes: &str,
+        message: &str,
+        actor: &str,
+        owned_working_set: bool,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        if !owned_working_set {
+            self.clean()?;
+        }
         self.sql("START TRANSACTION")?;
         let result = (|| {
             self.sql(changes)?;
+            validate()?;
             self.sql("CALL DOLT_ADD('.')")?;
             let committed = self.sql(&format!(
                 "CALL DOLT_COMMIT('-m', {}, '--author', {})",

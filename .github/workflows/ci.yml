@@ -18,6 +18,11 @@ jobs:
           repository: mooselabs/scrolls
           ref: 3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4
           path: .verification/scrolls-0.3.0
+      - uses: actions/checkout@v4
+        with:
+          repository: mooselabs/scrolls
+          ref: 1ef4eeeeff3a41c52beb29131878cad571b0d230
+          path: .verification/scrolls-shared-v1
       - run: cargo test --locked --all-targets
       - run: cargo build --locked --release --all-targets
       - run: python3 scripts/demo.py --binary target/release/scrolls --out /tmp/scrolls-demo
