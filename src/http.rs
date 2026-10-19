@@ -77,6 +77,18 @@ impl Error {
     fn backend(error: anyhow::Error) -> Self {
         // Existing storage diagnostics are internal only; never echo SQL,
         // credentials, filesystem paths, document text or raw driver errors.
+        // Keep typed transport identity even when account names in a driver
+        // message happen to resemble a store-state diagnostic.
+        if error
+            .chain()
+            .any(|cause| cause.is::<mysql::Error>() || cause.is::<std::io::Error>())
+        {
+            return Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend_unavailable",
+                "Store backend unavailable",
+            );
+        }
         let text = format!("{error:#}");
         if text.contains("read_lock_timeout") || text.contains("publication_lock_timeout") {
             return Self::busy();
@@ -162,6 +174,15 @@ fn security(headers: &HeaderMap, address: SocketAddr) -> Result<()> {
         .ok_or_else(Error::invalid)?;
     if hosts.next().is_some() {
         return Err(Error::invalid());
+    }
+    // Authority accepts URI userinfo, but a Host header must contain only
+    // the listener host and port. Never normalize away a supplied prefix.
+    if host.contains('@') {
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            "host_rejected",
+            "Host must match the loopback listener",
+        ));
     }
     let authority: axum::http::uri::Authority = host.parse().map_err(|_| Error::invalid())?;
     let name = authority.host().trim_matches(['[', ']']);
@@ -405,13 +426,7 @@ async fn respond(
     )
     .await
     .map_err(|_| Error::invalid())?
-    .map_err(|_| {
-        Error::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "Request body exceeds 65536 bytes",
-        )
-    })?;
+    .map_err(body_error)?;
     if get && !body.is_empty() {
         return Err(Error::invalid());
     }
@@ -727,4 +742,50 @@ fn execute(
         }
     };
     Ok(s.envelope(data))
+}
+
+fn body_error(error: axum::Error) -> Error {
+    use std::error::Error as _;
+    if error
+        .source()
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+    {
+        Error::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "Request body exceeds 65536 bytes",
+        )
+    } else {
+        Error::invalid()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn body_errors_distinguish_limit_from_malformed_transport() {
+        let oversized = to_bytes(Body::from("too large"), 1).await.unwrap_err();
+        assert_eq!(body_error(oversized).status, StatusCode::PAYLOAD_TOO_LARGE);
+        let malformed = axum::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "private body detail",
+        ));
+        let response = body_error(malformed);
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(!response.message.contains("private"));
+    }
+    #[test]
+    fn typed_backend_failures_do_not_depend_on_account_names() {
+        let error = mysql::Error::MySqlError(mysql::MySqlError {
+            state: "28000".into(),
+            code: 1045,
+            message: "Access denied for schema_identity_user".into(),
+        });
+        let response =
+            Error::backend(anyhow::Error::new(error).context("shared Dolt connection failed"));
+        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.code, "backend_unavailable");
+        assert!(!response.message.contains("schema_identity_user"));
+    }
 }

@@ -690,6 +690,10 @@ fn browser_security_limits_and_shutdown() {
             assert_eq!(r.headers["cache-control"], "private, no-cache");
             assert!(!r.headers.contains_key("access-control-allow-origin"));
         }
+        let userinfo_host = format!("name@{}", h.address);
+        let rejected = h.request("GET", "/healthz", &[("Host", &userinfo_host)], &[]);
+        assert_eq!(rejected.status, 400);
+        assert_eq!(rejected.value["error"]["code"], "host_rejected");
         assert_eq!(
             h.request("DELETE", &format!("/v0/records/{id}"), &[], &[])
                 .status,
