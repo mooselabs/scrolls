@@ -1,4 +1,4 @@
-# Shared authoring and review development preview
+# Shared authoring, review and imports development preview
 
 This unreleased unit connects the existing graph engine to the pinned Dolt
 2.2.0 SQL session. It is not a migration-ready release. Local operation remains
@@ -37,7 +37,7 @@ scrolls --connection /absolute/machine-local.json --actor alice --role human --o
 
 Omit `--schema` in both commands for the bundled ontology. Apply validates the
 empty graph and creates all nine tables, ontology, UUID, shared format 5 and
-writer generation 2. It commits a non-ready layout, creates the versioned
+writer generation 3. It commits a non-ready layout, creates the versioned
 `scrolls-operations` recovery branch, then commits the ready marker and receipt.
 Only that final commit makes initialization successful. It refuses existing local stores, partial
 initialization, additional branches, retained tags, reflog history and non-initial history. There is no reset,
@@ -69,8 +69,8 @@ snapshot, without applying it again.
 Supported direct mutations are `new`, `edit`, `link`, `unlink`, `status` and
 `batch`, subject to ontology policy. Protected mutations create isolated proposals. Shared proposal selection,
 inspection, human acceptance/rejection and reviewed ontology changes use the
-same engine as local mode. Imports, maintenance migrations, Beads and
-consumption-audit commands remain explicitly unavailable. They never fall back
+same engine as local mode. Profile-based Git imports are supported. Legacy Markdown import, maintenance
+migrations, Beads and consumption-audit commands remain explicitly unavailable. They never fall back
 to local state.
 
 Ordinary reads bypass local Beads files and do not append local consumption
@@ -132,9 +132,56 @@ evidence. Pending, failed and abandoned operations reserve their IDs; changing
 input never reuses one. Branches and recovery history are retained; automatic
 pruning is not implemented.
 
-Writer generation 1 clients refuse generation 2 stores. Generation 2 refuses
+Writer generation 2 clients refuse generation 3 stores. Generation 3 refuses
 older shared stores; upgrading them requires a future exclusive maintenance
 procedure with verified backup. These preview stores are disposable.
+
+## Captured-source imports
+
+The existing profile engine supports shared `import profiles validate`,
+`import plan git` and `import apply`. Bundled profile list/show commands need
+no store connection. Planning reads shared state and writes only its requested
+new plan file; it requires no publication operation ID. For example, as a human:
+
+```sh
+scrolls --connection /absolute/machine-local.json --actor alice --role human import plan git /path/to/source --rev FULL_GIT_COMMIT --root . --source handbook --profile handbook --out /tmp/handbook.plan.json --json
+scrolls --connection /absolute/machine-local.json --actor alice --role human --op-id handbook-1 import apply /tmp/handbook.plan.json --dry-run --json
+scrolls --connection /absolute/machine-local.json --actor alice --role human --op-id handbook-1 import apply /tmp/handbook.plan.json --json
+```
+
+Agents use `--role agent`; apply must retain the plan's actor and role. Store
+UUID, main/schema revisions, profile and exact candidate digest remain bound
+by the plan. One SQL connection and lock cover the whole shared operation.
+Git reads ignore replacement refs and inherited `GIT_*` redirection, preserving
+the recorded commit/tree/blob identities. Source bytes and modes are retained
+unchanged. Captured records remain source-owned; editable adoption is not
+implemented by this unit.
+
+Direct imports commit records, relationships, source files, provenance and the
+receipt atomically. Protected imports use the durable proposal protocol above.
+Prepared intents reserve namespaces even before a proposal branch exists.
+Another client can resume creation without the originating checkout, plan or
+profile file using `recover ORIGINAL_OP --resume`; it then inspects the proposal
+to obtain a review token. Interrupted acceptance uses the already-issued token.
+Explicit abandonment releases an unpublished namespace reservation but never
+makes its original operation ID reusable with changed input.
+
+Completed receipt replay precedes stale-base and source-object checks: a copied
+plan can recover the original result after later main writes and deletion of
+the source checkout. Verified identical-source imports may record a no-op
+receipt under a new operation ID. Changed snapshots in an accepted or pending
+namespace remain refused; there is no automatic import reconciliation.
+
+Source limits remain 64 MiB per file, 1 GiB total and 100,000 files. Shared
+publication also has an encoded SQL text budget: the lesser of the server's
+`max_allowed_packet` and 1 GiB, minus the command byte. JSON/base64/SQL encoding
+means that budget is not equal to source-file bytes. `doctor` reports it as
+`shared_query_bytes`. Oversized requests fail with `input_limit` and roll back;
+clients never truncate files or change server settings automatically. Split
+sources into independent namespaces or qualify an appropriate server setting.
+Dolt 2.2.0's tested default yields 1,073,741,823 SQL text bytes. Shared reads
+currently take the same lock; long imports can cause other clients' bounded
+lock acquisition to time out until snapshot caches are implemented.
 
 ## Qualification
 
@@ -170,8 +217,15 @@ interrupted abandonment and reviewed handbook/research configuration. The
 previous shared writer is built from an additional pinned clean checkout:
 
 ```sh
-git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-shared-v1
-git -C .verification/scrolls-shared-v1 checkout --detach 1ef4eeeeff3a41c52beb29131878cad571b0d230
+git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-shared-previous
+git -C .verification/scrolls-shared-previous checkout --detach a4bf897811abbb19657a824b5eb3470a2733ce16
 ```
 
 Both baseline checkouts must exist before running the full test command above.
+
+The pinned-PEP verification script now runs both local and disposable shared
+Dolt stores using the same binary snapshot, with a named fixture SQL account
+and a second client directory. It compares all 820 paths, bytes and modes and
+744 documents across both stores, records timings and the transport budget,
+and shuts down its owned server. It never accepts a live endpoint. Reference
+coverage remains declared metadata only, not body links or RST roles.

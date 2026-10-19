@@ -81,7 +81,8 @@ qualifies that version.
 The authoring/review preview now covers candidate validation, temporary-branch
 acceptance, durable recovery, concurrent graph constraints, operation replay,
 stale review tokens and actual prior-writer rejection. See its qualification
-section for the pinned source fixtures. Shared import and maintenance migrations
-remain unsupported. Schema migrations require exclusive maintenance and verified
+section for the pinned source fixtures. Profile-based shared imports now run through the same engine and full PEP
+fidelity exercise; legacy Markdown import and maintenance migrations remain
+unsupported. Schema migrations require exclusive maintenance and verified
 backups. Neither the transport nor the authoring/review qualification establishes
 full migration readiness.

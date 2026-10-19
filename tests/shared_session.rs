@@ -665,7 +665,7 @@ fn shared_cli_initialization_replay_isolation_fencing_and_refusals() {
         vec!["migrate"],
         vec!["beads", "list"],
         vec!["consumed"],
-        vec!["import", "profiles", "list"],
+        vec!["import", "markdown", ".", "--rev", "HEAD"],
     ] {
         assert!(
             s.call("b", &args, false)
@@ -1694,9 +1694,10 @@ fn build_pinned(source: &Path, revision: &str) -> tempfile::TempDir {
 }
 
 #[test]
-fn prior_shared_writer_executable_refuses_review_generation() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(".verification/scrolls-shared-v1");
-    let build = build_pinned(&source, "1ef4eeeeff3a41c52beb29131878cad571b0d230");
+fn prior_shared_writer_executable_refuses_current_generation() {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".verification/scrolls-shared-previous");
+    let build = build_pinned(&source, "a4bf897811abbb19657a824b5eb3470a2733ce16");
     let s = Server::handbook();
     let before = s.main_head();
     let client = s.client(
@@ -2142,4 +2143,879 @@ fn shared_committed_row_identity_mismatch_is_refused() {
     let error = s.call("b", &["list"], false);
     assert!(error.to_string().contains("stored_row_identity"), "{error}");
     assert_eq!(s.main_head(), before);
+}
+
+fn import_source(s: &Server) -> PathBuf {
+    let repo = s.dir.path().join("source");
+    fs::create_dir_all(repo.join("chapters")).unwrap();
+    fs::write(
+        repo.join("chapters/one.md"),
+        "---\nid: one\ntitle: First\n---\nCaptured; text ' 💾\n",
+    )
+    .unwrap();
+    fs::write(repo.join("README.md"), "# Overview\n").unwrap();
+    fs::write(repo.join("asset.bin"), [0, 255, 1]).unwrap();
+    fs::write(repo.join("run.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(repo.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@localhost"],
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["config", "core.hooksPath", "/dev/null"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "source"],
+    ] {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    repo
+}
+impl Server {
+    fn import_plan(&self, repo: &Path, role: &str, custom: bool, name: &str) -> PathBuf {
+        let plan = self
+            .dir
+            .path()
+            .join(format!("{}.plan.json", uuid::Uuid::new_v4()));
+        let mut args = vec![
+            "--role",
+            role,
+            "import",
+            "plan",
+            "git",
+            repo.to_str().unwrap(),
+            "--root",
+            ".",
+            "--rev",
+            "HEAD",
+            "--source",
+            name,
+            "--out",
+            plan.to_str().unwrap(),
+        ];
+        let profile = self.dir.path().join("profile.yaml");
+        if custom {
+            fs::write(
+                &profile,
+                include_str!("../profiles/handbook.yaml")
+                    .replace("literal: evidence", "literal: page")
+                    .replace("source_updated:", "updated:"),
+            )
+            .unwrap();
+            args.extend(["--profile-file", profile.to_str().unwrap()]);
+        } else {
+            args.extend(["--profile", "handbook"]);
+        }
+        self.call("planner", &args, true);
+        plan
+    }
+}
+#[test]
+fn shared_import_direct_fidelity_and_replay_without_source_checkout() {
+    let mut s = Server::empty();
+    s.init(None);
+    let repo = import_source(&s);
+    let before = s.main_head();
+    let plan = s.import_plan(&repo, "human", false, "book");
+    assert_eq!(s.main_head(), before);
+    s.call("a", &["import", "profiles", "list"], true);
+    let args = [
+        "--op-id",
+        "import",
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+    ];
+    s.interrupted(&args, literal("import source book by alice"));
+    let receipt: String = s
+        .raw("main")
+        .query_first("SELECT payload FROM operations WHERE id='import'")
+        .unwrap()
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    let written = json!({"data":receipt["result"]});
+    assert_ne!(s.main_head(), before);
+    let record = s.call("b", &["show", "book:chapter/one", "--provenance"], true);
+    assert!(
+        record["data"]["record"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Captured; text")
+    );
+    let id = record["data"]["record"]["id"].as_str().unwrap();
+    assert!(
+        s.call(
+            "b",
+            &[
+                "--op-id",
+                "edit-capture",
+                "edit",
+                id,
+                "--expect",
+                "1",
+                "--body",
+                "changed"
+            ],
+            false
+        )
+        .to_string()
+        .contains("source_ownership")
+    );
+    let export = s.dir.path().join("export");
+    s.call("b", &["render", "--out", export.to_str().unwrap()], true);
+    for path in ["chapters/one.md", "README.md", "asset.bin", "run.sh"] {
+        assert_eq!(
+            fs::read(repo.join(path)).unwrap(),
+            fs::read(export.join("sources/book").join(path)).unwrap()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            fs::metadata(export.join("sources/book/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+    let copied = s.dir.path().join("copied-plan.json");
+    fs::copy(&plan, &copied).unwrap();
+    fs::remove_file(plan).unwrap();
+    fs::remove_dir_all(repo).unwrap();
+    s.call(
+        "other",
+        &[
+            "--op-id",
+            "later",
+            "new",
+            "note",
+            "--title",
+            "Later",
+            "--body",
+            "unrelated",
+        ],
+        true,
+    );
+    let later = s.main_head();
+    let replay = s.call(
+        "b",
+        &[
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            copied.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(written["data"], replay["data"]);
+    assert_eq!(s.main_head(), later);
+    s.call("b", &["doctor"], true);
+}
+#[test]
+fn shared_import_prepared_namespace_reservation_and_cross_client_recovery() {
+    let mut s = Server::handbook();
+    let repo = import_source(&s);
+    let plan = s.import_plan(&repo, "agent", true, "book");
+    let second = s.import_plan(&repo, "agent", true, "book");
+    s.interrupted(
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        literal("record shared operation recovery"),
+    );
+    let error = s.call(
+        "other",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "second",
+            "import",
+            "apply",
+            second.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(error.to_string().contains("source_reserved"), "{error}");
+    fs::remove_file(plan).unwrap();
+    fs::remove_file(second).unwrap();
+    fs::remove_dir_all(repo).unwrap();
+    let recovered = s.call(
+        "other",
+        &["--role", "agent", "recover", "import", "--resume"],
+        true,
+    );
+    let branch = recovered["data"]["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.call(
+        "human",
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    s.call("reader", &["show", "book:chapter/one"], true);
+    s.call("reader", &["doctor"], true);
+}
+
+#[test]
+fn shared_import_pins_original_git_objects_despite_replacements() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = import_source(&s);
+    let original = fs::read(repo.join("chapters/one.md")).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let base = git(&["rev-parse", "HEAD"]);
+    let original_blob = git(&["rev-parse", "HEAD:chapters/one.md"]);
+    fs::write(
+        repo.join("chapters/one.md"),
+        String::from_utf8(original.clone())
+            .unwrap()
+            .replace("Captured", "Tampered"),
+    )
+    .unwrap();
+    git(&["add", "chapters/one.md"]);
+    git(&["commit", "-qm", "replacement"]);
+    let newer = git(&["rev-parse", "HEAD"]);
+    let substitute = git(&["rev-parse", "HEAD:chapters/one.md"]);
+    git(&["replace", &original_blob, &substitute]);
+    git(&["replace", &base, &newer]);
+    let plan = s.dir.path().join("original.plan.json");
+    let nested = repo.join("chapters");
+    // A foreign GIT_DIR must not redirect the explicitly selected repository.
+    let out = s
+        .client(
+            "a",
+            &[
+                "import",
+                "plan",
+                "git",
+                nested.to_str().unwrap(),
+                "--root",
+                ".",
+                "--rev",
+                &base,
+                "--source",
+                "original",
+                "--profile",
+                "handbook",
+                "--out",
+                plan.to_str().unwrap(),
+            ],
+        )
+        .env("GIT_DIR", s.dir.path().join("absent.git"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let p: serde_json::Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    assert_eq!(p["source"]["commit"], base);
+    s.call(
+        "b",
+        &[
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    let export = s.dir.path().join("export");
+    s.call("b", &["render", "--out", export.to_str().unwrap()], true);
+    assert_eq!(
+        fs::read(export.join("sources/original/chapters/one.md")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn shared_import_packet_limit_refuses_without_partial_state() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = import_source(&s);
+    fs::write(repo.join("large.bin"), vec![42; 100_000]).unwrap();
+    for args in [
+        ["add", "large.bin"].as_slice(),
+        ["commit", "-qm", "large asset"].as_slice(),
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let plan = s.import_plan(&repo, "human", false, "large");
+    let before = s.main_head();
+    s.raw("main")
+        .query_drop("SET GLOBAL max_allowed_packet=65536")
+        .unwrap();
+    let error = s.call(
+        "a",
+        &[
+            "--op-id",
+            "large",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(error.to_string().contains("input_limit"), "{error}");
+    assert_eq!(s.main_head(), before);
+    assert_eq!(
+        s.raw("main")
+            .query_first::<u64, _>("SELECT COUNT(*) FROM import_sources")
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(
+        s.raw("main")
+            .query::<String, _>("SELECT table_name FROM dolt_status")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        s.call("a", &["doctor"], true)["data"]["shared_query_bytes"],
+        65535
+    );
+    s.raw("main")
+        .query_drop("SET GLOBAL max_allowed_packet=1073741824")
+        .unwrap();
+    s.call(
+        "a",
+        &[
+            "--op-id",
+            "large",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(
+        s.call("a", &["doctor"], true)["data"]["import_health"]["files"],
+        5
+    );
+}
+
+#[test]
+fn shared_import_stale_and_changed_bindings_do_not_publish() {
+    for change in ["main", "schema", "actor", "plan"] {
+        let s = Server::handbook();
+        let repo = import_source(&s);
+        let plan = s.import_plan(&repo, "agent", true, "book");
+        if change == "main" {
+            s.call(
+                "other",
+                &[
+                    "--op-id", "later", "new", "page", "--title", "Later", "--body", "x",
+                ],
+                true,
+            );
+        } else if change == "schema" {
+            let schema = s.call("other", &["schema", "show"], true)["data"]["schema_revision"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let file = s.dir.path().join("updated-schema.yaml");
+            fs::write(
+                &file,
+                include_str!("../examples/handbook.yaml")
+                    .replace("A handbook page", "Updated handbook page"),
+            )
+            .unwrap();
+            let p = s.call(
+                "other",
+                &[
+                    "--op-id",
+                    "schema",
+                    "schema",
+                    "apply",
+                    file.to_str().unwrap(),
+                    "--expect",
+                    &schema,
+                ],
+                true,
+            );
+            let branch = p["data"]["branch"].as_str().unwrap();
+            s.call(
+                "other",
+                &[
+                    "--op-id",
+                    "schema-review",
+                    "review",
+                    "accept",
+                    branch,
+                    "--review-token",
+                    &s.token(branch),
+                ],
+                true,
+            );
+        } else if change == "plan" {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+            value["source"]["root"] = json!("changed");
+            fs::write(&plan, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let before = s.main_head();
+        let mut args = vec![
+            "--role",
+            "agent",
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ];
+        if change == "actor" {
+            args.extend(["--actor", "bob"]);
+        }
+        let error = s.call("a", &args, false);
+        assert!(
+            error.to_string().contains("stale_plan"),
+            "{change}: {error}"
+        );
+        assert_eq!(s.main_head(), before);
+        assert_eq!(
+            s.raw("main")
+                .query_first::<u64, _>("SELECT COUNT(*) FROM import_sources")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+    let a = Server::empty();
+    a.init(None);
+    let repo = import_source(&a);
+    let plan = a.import_plan(&repo, "human", false, "book");
+    let b = Server::empty();
+    b.init(None);
+    let before = b.main_head();
+    assert!(
+        b.call(
+            "a",
+            &[
+                "--op-id",
+                "import",
+                "import",
+                "apply",
+                plan.to_str().unwrap()
+            ],
+            false
+        )
+        .to_string()
+        .contains("wrong store")
+    );
+    assert_eq!(b.main_head(), before);
+}
+
+#[test]
+fn shared_import_abandonment_releases_namespace_for_another_snapshot() {
+    let mut s = Server::handbook();
+    let repo = import_source(&s);
+    let original = s.import_plan(&repo, "agent", true, "book");
+    fs::write(
+        repo.join("chapters/one.md"),
+        "---\nid: one\ntitle: First\n---\nChanged snapshot\n",
+    )
+    .unwrap();
+    for args in [
+        ["add", "chapters/one.md"].as_slice(),
+        ["commit", "-qm", "changed snapshot"].as_slice(),
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let changed = s.import_plan(&repo, "agent", true, "book");
+    s.interrupted(
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "held",
+            "import",
+            "apply",
+            original.to_str().unwrap(),
+        ],
+        literal("record shared operation recovery"),
+    );
+    assert!(
+        s.call(
+            "other",
+            &[
+                "--role",
+                "agent",
+                "--op-id",
+                "new",
+                "import",
+                "apply",
+                changed.to_str().unwrap()
+            ],
+            false
+        )
+        .to_string()
+        .contains("source_reserved")
+    );
+    s.call(
+        "owner",
+        &[
+            "--op-id",
+            "cancel",
+            "recover",
+            "held",
+            "--abandon",
+            "--reason",
+            "Use the newer snapshot",
+        ],
+        true,
+    );
+    let p = s.call(
+        "other",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "new",
+            "import",
+            "apply",
+            changed.to_str().unwrap(),
+        ],
+        true,
+    );
+    let branch = p["data"]["branch"].as_str().unwrap();
+    s.call(
+        "owner",
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &s.token(branch),
+        ],
+        true,
+    );
+    assert!(
+        s.call("reader", &["show", "book:chapter/one"], true)["data"]["record"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Changed snapshot")
+    );
+    assert!(
+        s.call(
+            "other",
+            &["--role", "agent", "recover", "held", "--resume"],
+            false
+        )
+        .to_string()
+        .contains("abandoned")
+    );
+}
+
+#[test]
+fn shared_import_concurrent_identical_apply_and_changed_input_replay() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = import_source(&s);
+    let plan = s.import_plan(&repo, "human", false, "book");
+    let children: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|op| {
+            s.client(
+                op,
+                &["--op-id", op, "import", "apply", plan.to_str().unwrap()],
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+        })
+        .collect();
+    let values: Vec<serde_json::Value> = children
+        .into_iter()
+        .map(|c| {
+            let out = c.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        values
+            .iter()
+            .filter(|v| v["data"]["identical_replay"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        s.call("reader", &["doctor"], true)["data"]["import_health"]["files"],
+        4
+    );
+    let before = s.main_head();
+    let mut changed: scrolls::source_import::Plan =
+        serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    changed.actor = "bob".into();
+    changed.source.actor = "bob".into();
+    changed.seal().unwrap();
+    fs::write(&plan, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(
+        s.call(
+            "other",
+            &[
+                "--actor",
+                "bob",
+                "--op-id",
+                "one",
+                "import",
+                "apply",
+                plan.to_str().unwrap()
+            ],
+            false
+        )
+        .to_string()
+        .contains("different arguments")
+    );
+    assert_eq!(s.main_head(), before);
+}
+
+#[test]
+fn shared_import_corrupt_original_blocks_acceptance() {
+    let s = Server::handbook();
+    let repo = import_source(&s);
+    let plan = s.import_plan(&repo, "agent", true, "book");
+    let p = s.call(
+        "author",
+        &[
+            "--role",
+            "agent",
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    let branch = p["data"]["branch"].as_str().unwrap();
+    let mut raw = s.raw(branch);
+    let (id, payload): (String, String) = raw
+        .query_first("SELECT id,payload FROM import_files ORDER BY id LIMIT 1")
+        .unwrap()
+        .unwrap();
+    let mut file: scrolls::source_import::File = serde_json::from_str(&payload).unwrap();
+    file.file.sha256 = "0".repeat(64);
+    raw.query_drop(format!("UPDATE import_files SET payload={} WHERE id={}; CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','foreign corruption','--author','Raw <raw@localhost>')", literal(&serde_json::to_string(&file).unwrap()), literal(&id))).unwrap();
+    let before = s.main_head();
+    let token = s.token(branch);
+    let error = s.call(
+        "owner",
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        false,
+    );
+    assert!(
+        error.to_string().contains("checksum/mode mismatch"),
+        "{error}"
+    );
+    assert_eq!(s.main_head(), before);
+}
+
+#[test]
+fn shared_import_research_profile_preserves_zero_and_metadata() {
+    let s = Server::empty();
+    s.init(Some(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/research.yaml")
+            .to_str()
+            .unwrap(),
+    ));
+    let repo = import_source(&s);
+    let mut profile: serde_json::Value = serde_yaml::from_str(scrolls::profile::HANDBOOK).unwrap();
+    for rule in profile["documents"].as_array_mut().unwrap() {
+        rule["record"]["kind"] = json!({"literal":"trial"});
+        rule["record"]["fields"] = json!({"count":{"literal":0}});
+    }
+    let file = s.dir.path().join("research-profile.json");
+    fs::write(&file, serde_json::to_vec(&profile).unwrap()).unwrap();
+    s.call(
+        "reader",
+        &["import", "profiles", "validate", file.to_str().unwrap()],
+        true,
+    );
+    let plan = s.dir.path().join("research.plan.json");
+    s.call(
+        "planner",
+        &[
+            "import",
+            "plan",
+            "git",
+            repo.to_str().unwrap(),
+            "--root",
+            ".",
+            "--rev",
+            "HEAD",
+            "--source",
+            "research",
+            "--profile-file",
+            file.to_str().unwrap(),
+            "--out",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    s.call(
+        "writer",
+        &[
+            "--op-id",
+            "research",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(
+        s.call(
+            "reader",
+            &["show", "research:chapter/one", "--provenance"],
+            true
+        )["data"]["record"]["fields"],
+        json!({"count":0,"replicated":false})
+    );
+}
+
+#[test]
+fn shared_import_acceptance_recovers_original_token_and_assets() {
+    for after_main in [false, true] {
+        let mut s = Server::handbook();
+        let repo = import_source(&s);
+        let plan = s.import_plan(&repo, "agent", true, "book");
+        let p = s.call(
+            "author",
+            &[
+                "--role",
+                "agent",
+                "--op-id",
+                "import",
+                "import",
+                "apply",
+                plan.to_str().unwrap(),
+            ],
+            true,
+        );
+        let branch = p["data"]["branch"].as_str().unwrap();
+        let token = s.token(branch);
+        fs::remove_file(plan).unwrap();
+        fs::remove_dir_all(repo).unwrap();
+        let needle = if after_main {
+            "CALL DOLT_MERGE('--ff-only'".into()
+        } else {
+            literal(&format!("accept {branch} by alice"))
+        };
+        s.interrupted(
+            &[
+                "--op-id",
+                "accept",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                &token,
+            ],
+            needle,
+        );
+        if after_main {
+            s.call(
+                "other",
+                &[
+                    "--op-id", "later", "new", "page", "--title", "Later", "--body", "x",
+                ],
+                true,
+            );
+        }
+        let recovered = s.call("second", &["recover", "accept", "--resume"], true);
+        assert_eq!(recovered["data"]["review_token"], token);
+        assert_eq!(
+            s.call("reader", &["doctor"], true)["data"]["import_health"]["files"],
+            4
+        );
+        let export = s.dir.path().join("export");
+        s.call(
+            "reader",
+            &["render", "--out", export.to_str().unwrap()],
+            true,
+        );
+        assert_eq!(
+            fs::read(export.join("sources/book/asset.bin")).unwrap(),
+            [0, 255, 1]
+        );
+    }
 }

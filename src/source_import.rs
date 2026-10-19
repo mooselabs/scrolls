@@ -127,13 +127,20 @@ pub struct Candidate {
     pub files: Vec<File>,
     pub source: Source,
 }
+fn git_command(repo: &Path) -> Command {
+    let mut command = Command::new("git");
+    // Explicit repository and object identity must not be redirected by an
+    // unrelated process environment or local replacement refs.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("GIT_")) {
+            command.env_remove(key);
+        }
+    }
+    command.arg("--no-replace-objects").arg("-C").arg(repo);
+    command
+}
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()?;
+    let out = git_command(repo).args(args).stdin(Stdio::null()).output()?;
     ensure!(
         out.status.success(),
         "source_read: git failed: {}",
@@ -236,7 +243,10 @@ pub fn source(
 /// Inventory tree entries before requesting any raw blob. Git export attributes are ignored.
 fn files(source: &Source, p: &Profile) -> Result<Vec<File>> {
     let repo = Path::new(&source.repository);
-    let raw = git(repo, &["ls-tree", "-r", "-z", "-l", &source.tree])?;
+    let raw = git(
+        repo,
+        &["ls-tree", "--full-tree", "-r", "-z", "-l", &source.tree],
+    )?;
     let mut entries = vec![];
     let mut total = 0u64;
     for row in raw.split(|c| *c == 0).filter(|s| !s.is_empty()) {
@@ -276,9 +286,7 @@ fn files(source: &Source, p: &Profile) -> Result<Vec<File>> {
             size,
         ));
     }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let mut child = git_command(repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -739,6 +747,70 @@ pub fn same(a: &Source, b: &Source) -> bool {
         && a.schema_hash == b.schema_hash
         && a.contract == b.contract
 }
+// A shared import retains one locked SQL connection from its first base read
+// through publication. Local imports keep their existing read/build/write path.
+enum ImportStore<'a> {
+    Shared(&'a Store),
+    Local(Store),
+}
+impl std::ops::Deref for ImportStore<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Shared(s) => s,
+            Self::Local(s) => s,
+        }
+    }
+}
+fn shared_store(cli: &Cli) -> Result<Option<Store>> {
+    cli.connection
+        .as_ref()
+        .map(|connection| {
+            if matches!(
+                cli.command,
+                Cmd::Import {
+                    command: ImportCommand::Apply { .. }
+                }
+            ) && !cli.dry_run
+            {
+                Store::open_shared_recovery(
+                    connection,
+                    &cli.store,
+                    cli.op_id
+                        .as_deref()
+                        .context("import apply requires --op-id ID")?,
+                )
+            } else {
+                Store::open_shared(connection, &cli.store)
+            }
+        })
+        .transpose()
+}
+fn import_store<'a>(
+    cli: &Cli,
+    shared: Option<&'a Store>,
+    readonly: bool,
+) -> Result<ImportStore<'a>> {
+    if let Some(s) = shared {
+        return Ok(ImportStore::Shared(s));
+    }
+    ensure!(
+        cli.connection.is_none(),
+        "shared import session missing; local fallback refused"
+    );
+    Ok(ImportStore::Local(if readonly {
+        Store::open_readonly(&cli.store, &cli.dolt)?
+    } else {
+        Store::open(&cli.store, &cli.dolt, false)?
+    }))
+}
+fn response(s: &Store, data: Value) -> Result<Value> {
+    if s.is_shared() {
+        crate::storage::shared_review::receipt_response(s, data, "main")
+    } else {
+        Ok(json!({"schema_version":2,"ok":true,"data":data}))
+    }
+}
 /// Handle import profile commands before the ordinary opener, keeping planning read-only.
 pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
     let envelope = |data: Value| json!({"schema_version":2,"ok":true,"data":data});
@@ -755,7 +827,8 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 ));
             }
             ProfileCommand::Validate { file } => {
-                let s = Store::open_readonly(&cli.store, &cli.dolt)?;
+                let shared = shared_store(cli)?;
+                let s = import_store(cli, shared.as_ref(), true)?;
                 let rev = s.head("main")?;
                 let g = s.graph_at(&rev)?;
                 let text = read_profile(file)?;
@@ -778,6 +851,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
         !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
         "invalid actor"
     );
+    let shared = shared_store(cli)?;
     match command {
         ImportCommand::Plan {
             command:
@@ -801,10 +875,11 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 )?
             };
             let (store_id, main_revision, g) = {
-                let s = Store::open_readonly(&cli.store, &cli.dolt)?;
+                let s = import_store(cli, shared.as_ref(), true)?;
                 let rev = s.head("main")?;
                 ensure!(
-                    s.one_at::<u32>("metadata", "schema", &rev)? == Some(4),
+                    s.one_at::<u32>("metadata", "schema", &rev)?
+                        == Some(if s.is_shared() { 5 } else { 4 }),
                     "store format 4 required; run migrate"
                 );
                 (
@@ -853,7 +928,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 .unwrap_or(Path::new("."))
                 .canonicalize()?;
             ensure!(
-                !parent.starts_with(cli.store.canonicalize()?),
+                cli.connection.is_some() || !parent.starts_with(cli.store.canonicalize()?),
                 "invalid_plan_destination: plan must be outside the store"
             );
             write_plan(out, &plan)?;
@@ -881,7 +956,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 &json!({"import_plan":plan.digest,"actor":actor,"role":cli.role.name()}),
             )?);
             let before = {
-                let s = Store::open_readonly(&cli.store, &cli.dolt)?;
+                let s = import_store(cli, shared.as_ref(), true)?;
                 let rev = s.head("main")?;
                 ensure!(
                     s.one_at::<String>("metadata", "store_id", &rev)?.as_deref()
@@ -890,9 +965,16 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 );
                 // Completed operation retry precedes every stale-base and source-object check.
                 if let Some(result) = s.receipt(op, &hash)? {
-                    return Ok(envelope(replay(&s, result)?));
+                    return response(&s, replay(&s, result)?);
                 }
                 let g = s.graph_at(&rev)?;
+                if s.is_shared() && !cli.dry_run {
+                    if let Some(result) =
+                        crate::storage::shared_review::resume(&s, cli, &g, op, &hash)?
+                    {
+                        return response(&s, result);
+                    }
+                }
                 if let Some(existing) = g.import_sources.get(&plan.source.source_id) {
                     ensure!(
                         same(existing, &plan.source)
@@ -901,7 +983,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     );
                     let result = json!({"identical_replay":true,"source":existing.source_id,"branch":"main","op_id":op,"original_op_id":existing.op_id});
                     drop(s);
-                    return Ok(envelope(noop_receipt(cli, &plan, op, &hash, result)?));
+                    return noop_receipt(cli, shared.as_ref(), &plan, op, &hash, result);
                 }
                 for proposal in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
                     let pending = s.graph_at(&proposal.branch)?;
@@ -919,8 +1001,15 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                         result["original_op_id"] = result["op_id"].clone();
                         result["op_id"] = json!(op);
                         drop(s);
-                        return Ok(envelope(noop_receipt(cli, &plan, op, &hash, result)?));
+                        return noop_receipt(cli, shared.as_ref(), &plan, op, &hash, result);
                     }
+                }
+                if s.is_shared() {
+                    crate::storage::shared_review::check_import_reservation(
+                        &s,
+                        &plan.source.source_id,
+                        op,
+                    )?;
                 }
                 ensure!(
                     rev == plan.main_revision && g.schema.revision() == plan.schema_hash,
@@ -935,10 +1024,10 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     && planned_changes(&candidate) == plan.changes,
                 "stale_plan: recomputed candidate differs; replan"
             );
-            let s = Store::open(&cli.store, &cli.dolt, false)?;
+            let s = import_store(cli, shared.as_ref(), false)?;
             s.checkout("main")?;
             if let Some(result) = s.receipt(op, &hash)? {
-                return Ok(envelope(replay(&s, result)?));
+                return response(&s, replay(&s, result)?);
             }
             ensure!(
                 s.head("main")? == plan.main_revision
@@ -980,26 +1069,41 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 .insert(candidate.source.source_id.clone(), candidate.source.clone());
             let mut sql = crate::storage::graph_changes(&before, &candidate.graph)?;
             sql.push_str(&persist(&candidate)?);
-            if protected {
-                let p = Proposal {
-                    branch: target.clone(),
-                    base: plan.main_revision.clone(),
-                    actor: actor.into(),
-                    status: "pending".into(),
-                    reason: None,
-                };
-                sql.push_str(&put("metadata", &target, &p)?);
+            let proposal = protected.then(|| Proposal {
+                branch: target.clone(),
+                base: plan.main_revision.clone(),
+                actor: actor.into(),
+                status: "pending".into(),
+                reason: None,
+            });
+            if let Some(p) = &proposal {
+                sql.push_str(&put("metadata", &target, p)?);
             }
             sql.push_str(&put("operations",op,&json!({"op_id":op,"args_hash":hash,"actor":actor,"command":cli.command,"result":result,"committed_at":now()}))?);
-            if protected {
+            if let Some(p) = &proposal {
+                if s.is_shared() {
+                    let published = crate::storage::shared_review::publish_proposal(
+                        &s, cli, p, &sql, op, &hash, &result,
+                    )?;
+                    return response(&s, published);
+                }
                 s.run(&["checkout", "-b", &target, "main"])?;
             }
-            s.transaction(
-                &sql,
-                &format!("import source {} by {actor}", candidate.source.source_id),
-                actor,
-            )?;
-            Ok(envelope(result))
+            let message = format!("import source {} by {actor}", candidate.source.source_id);
+            if s.is_shared() {
+                s.commit_shared_checked(&sql, &message, actor, false, || {
+                    let actual = s.graph()?;
+                    policy::validate_change(&before, &actual, &BTreeSet::new())?;
+                    crate::source_import::health(&actual, &s.import_files()?)?;
+                    actual
+                        .schema
+                        .guards(&before, &actual, actor, cli.role.name())?;
+                    Ok(())
+                })?;
+            } else {
+                s.transaction(&sql, &message, actor)?;
+            }
+            response(&s, result)
         }
         _ => bail!("unsupported import command"),
     }
@@ -1052,6 +1156,7 @@ pub fn diagnostic(error: &anyhow::Error) -> Value {
         "unresolved_reference",
         "empty_document_set",
         "source_update_unsupported",
+        "source_reserved",
         "unsupported_file_type",
         "source_ownership",
         "stale_plan",
@@ -1070,9 +1175,30 @@ pub fn diagnostic(error: &anyhow::Error) -> Value {
             .nth(1)
             .map(|s| s.split([' ', ';', ':']).next().unwrap_or(s))
     };
-    json!({"code":code,"severity":"error","path":context("path"),"rule":context("rule"),"field":context("field"),"span":context("span"),"reason":reason,"remedy":match code {"stale_plan"=>"Create a fresh plan against the current store, schema and actor.","source_ownership"=>"Keep captured content unchanged; create a local record or relationship.","source_update_unsupported"=>"Resolve any pending proposal; changed snapshots require an independent source namespace.","recovery_required"=>"Run doctor and inspect the recovery journal before planning.","input_limit"=>"Split the source or reduce metadata; profiles cannot raise engine limits.",_=>"Correct the profile or source value at the reported location, then plan again."}})
+    json!({"code":code,"severity":"error","path":context("path"),"rule":context("rule"),"field":context("field"),"span":context("span"),"reason":reason,"remedy":match code {"stale_plan"=>"Create a fresh plan against the current store, schema and actor.","source_ownership"=>"Keep captured content unchanged; create a local record or relationship.","source_reserved"=>"Recover or explicitly abandon the named interrupted import before publishing this namespace.","source_update_unsupported"=>"Resolve any pending proposal; changed snapshots require an independent source namespace.","recovery_required"=>"Run doctor and inspect the recovery journal before planning.","input_limit"=>"Split the source or reduce metadata; profiles cannot raise engine limits.",_=>"Correct the profile or source value at the reported location, then plan again."}})
 }
 
+pub(crate) fn file_health(f: &File) -> Result<usize> {
+    namespace(&f.source_id)?;
+    path(&f.file.path)?;
+    let raw = STANDARD.decode(&f.file.bytes)?;
+    ensure!(
+        raw.len() as u64 <= FILE_LIMIT,
+        "input_limit: original source file exceeds limit"
+    );
+    ensure!(
+        digest(&raw) == f.file.sha256
+            && f.size == raw.len() as u64
+            && [0o100644, 0o100755].contains(&f.file.mode),
+        "source_ownership: original checksum/mode mismatch {}",
+        f.file.path
+    );
+    ensure!(
+        ["document", "asset"].contains(&f.classification.as_str()),
+        "source_ownership: invalid file classification"
+    );
+    Ok(raw.len())
+}
 pub fn health(g: &Graph, files: &[File]) -> Result<Value> {
     let mut paths = BTreeSet::new();
     let mut bytes = 0usize;
@@ -1084,19 +1210,7 @@ pub fn health(g: &Graph, files: &[File]) -> Result<Value> {
                 && paths.insert((f.source_id.clone(), f.file.path.clone())),
             "source_ownership: orphan or duplicate source file"
         );
-        let raw = STANDARD.decode(&f.file.bytes)?;
-        bytes += raw.len();
-        ensure!(
-            digest(&raw) == f.file.sha256
-                && f.size == raw.len() as u64
-                && [0o100644, 0o100755].contains(&f.file.mode),
-            "source_ownership: original checksum/mode mismatch {}",
-            f.file.path
-        );
-        ensure!(
-            ["document", "asset"].contains(&f.classification.as_str()),
-            "source_ownership: invalid file classification"
-        );
+        bytes += file_health(f)?;
     }
     for m in g.import_members.values() {
         ensure!(
@@ -1117,14 +1231,21 @@ pub fn health(g: &Graph, files: &[File]) -> Result<Value> {
     )
 }
 
-fn noop_receipt(cli: &Cli, plan: &Plan, op: &str, hash: &str, result: Value) -> Result<Value> {
+fn noop_receipt(
+    cli: &Cli,
+    shared: Option<&Store>,
+    plan: &Plan,
+    op: &str,
+    hash: &str,
+    result: Value,
+) -> Result<Value> {
     if cli.dry_run {
-        return Ok(json!({"dry_run":true,"result":result}));
+        return Ok(json!({"schema_version":2,"ok":true,"data":{"dry_run":true,"result":result}}));
     }
-    let s = Store::open(&cli.store, &cli.dolt, false)?;
+    let s = import_store(cli, shared, false)?;
     s.checkout("main")?;
     if let Some(existing) = s.receipt(op, hash)? {
-        return replay(&s, existing);
+        return response(&s, replay(&s, existing)?);
     }
     ensure!(
         s.one::<String>("metadata", "store_id")?.as_deref() == Some(&plan.store_id),
@@ -1156,7 +1277,7 @@ fn noop_receipt(cli: &Cli, plan: &Plan, op: &str, hash: &str, result: Value) -> 
     // A receipt changes no captured data. Keeping it on the source branch preserves proposal isolation.
     s.checkout(branch)?;
     s.transaction(&sql, "record identical source import retry", &plan.actor)?;
-    replay(&s, result)
+    response(&s, replay(&s, result)?)
 }
 
 fn planned_changes(candidate: &Candidate) -> Value {

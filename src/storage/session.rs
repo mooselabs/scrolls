@@ -1,10 +1,13 @@
 //! Transport boundary for a single serialized operation. Shared sessions are
-//! used by local and direct shared authoring; shared review remains unavailable.
+//! used by local and shared authoring, review and captured-source imports.
 use super::{DOLT_VERSION, Store, literal};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::{Conn, OptsBuilder, consts::ColumnType, prelude::Queryable};
 use serde_json::{Map, Value, json};
-use std::{cell::RefCell, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    time::Duration,
+};
 
 /// The graph engine consumes JSON rows with identical types from either backend.
 /// A caller keeps this object alive for the entire operation, including reads,
@@ -66,6 +69,7 @@ pub struct SharedSession {
     connection: RefCell<Conn>,
     database: String,
     lock_name: String,
+    query_limit: Cell<usize>,
 }
 
 fn identifier(value: &str) -> Result<()> {
@@ -141,6 +145,7 @@ impl SharedSession {
         let s = Self {
             connection: RefCell::new(Conn::new(opts).context("shared Dolt connection failed")?),
             database: config.database.clone(),
+            query_limit: Cell::new(1024 * 1024 * 1024 - 1),
             // Database lookup may fold case; aliases must not get distinct locks.
             // A digest also keeps the MySQL lock identifier within 64 bytes.
             lock_name: crate::model::digest(format!(
@@ -167,7 +172,20 @@ impl SharedSession {
         s.sql("ROLLBACK")?;
         s.sql("SET autocommit = 1")?;
         s.select_branch(branch)?;
+        let limit = s.sql("SELECT @@max_allowed_packet AS packet_limit")?;
+        let limit = limit
+            .first()
+            .and_then(|r| r["packet_limit"].as_u64())
+            .context("missing shared packet limit")?;
+        ensure!(limit > 1, "invalid shared packet limit");
+        s.query_limit
+            .set(usize::try_from(limit.min(1024 * 1024 * 1024) - 1)?);
         Ok(s)
+    }
+
+    /// Encoded SQL text budget, reserving the COM_QUERY command byte.
+    pub fn query_limit(&self) -> usize {
+        self.query_limit.get()
     }
 
     pub fn select_branch(&self, branch: &str) -> Result<()> {
@@ -242,6 +260,11 @@ impl SharedSession {
 
 impl SqlSession for SharedSession {
     fn sql(&self, sql: &str) -> Result<Vec<Value>> {
+        ensure!(
+            sql.len() <= self.query_limit(),
+            "input_limit: encoded shared SQL request exceeds {} bytes; split the source or qualify a larger server packet setting",
+            self.query_limit()
+        );
         let mut connection = self.connection.borrow_mut();
         let mut result = connection
             .query_iter(sql)

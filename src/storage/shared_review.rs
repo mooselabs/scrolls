@@ -151,12 +151,21 @@ struct Change {
 impl Change {
     fn sql(&self) -> Result<String> {
         ensure!(
-            ["records", "edges", "metadata", "operations"].contains(&self.table.as_str()),
+            [
+                "records",
+                "edges",
+                "metadata",
+                "operations",
+                "import_sources",
+                "import_files",
+                "import_members"
+            ]
+            .contains(&self.table.as_str()),
             "invalid recovery change table"
         );
         if let Some(payload) = &self.payload {
             let _: Value = serde_json::from_str(payload)?;
-            let verb = if self.table == "operations" {
+            let verb = if self.table == "operations" || self.table.starts_with("import_") {
                 "INSERT"
             } else {
                 "REPLACE"
@@ -180,17 +189,21 @@ fn changes(sql: &str, op: &str) -> Result<Vec<Change>> {
     // Decode only the writer's canonical generated DML; recovery never executes
     // SQL text loaded from database metadata.
     let put = regex::Regex::new(
-        r"^REPLACE INTO ([a-z_]+) \(id,payload\) VALUES \(CONVERT\(0x([0-9a-f]+) USING utf8mb4\),CONVERT\(0x([0-9a-f]+) USING utf8mb4\)\)$",
+        r"^(REPLACE|INSERT) INTO ([a-z_]+) \(id,payload\) VALUES \(CONVERT\(0x([0-9a-f]+) USING utf8mb4\),CONVERT\(0x([0-9a-f]+) USING utf8mb4\)\)$",
     )?;
     let delete =
         regex::Regex::new(r"^DELETE FROM edges WHERE id=CONVERT\(0x([0-9a-f]+) USING utf8mb4\)$")?;
     let mut out = vec![];
     for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         let change = if let Some(c) = put.captures(statement) {
+            ensure!(
+                !c[2].starts_with("import_") || &c[1] == "INSERT",
+                "captured imports require immutable inserts"
+            );
             Change {
-                table: c[1].into(),
-                id: String::from_utf8(hex::decode(&c[2])?)?,
-                payload: Some(String::from_utf8(hex::decode(&c[3])?)?),
+                table: c[2].into(),
+                id: String::from_utf8(hex::decode(&c[3])?)?,
+                payload: Some(String::from_utf8(hex::decode(&c[4])?)?),
             }
         } else if let Some(c) = delete.captures(statement) {
             Change {
@@ -218,6 +231,41 @@ fn validate_change_frame(change: &Change, op: &str) -> Result<()> {
     }
     if change.table == "operations" {
         ensure!(change.id == op, "recovery receipt identity mismatch");
+    }
+    if change.table.starts_with("import_") {
+        let payload = change
+            .payload
+            .as_deref()
+            .context("captured imports cannot be deleted")?;
+        match change.table.as_str() {
+            "import_sources" => {
+                let value: crate::source_import::Source = serde_json::from_str(payload)?;
+                crate::source_import::namespace(&value.source_id)?;
+                ensure!(
+                    change.id == value.source_id && value.op_id == op,
+                    "source_ownership: recovery source identity mismatch"
+                );
+            }
+            "import_files" => {
+                let value: crate::source_import::File = serde_json::from_str(payload)?;
+                ensure!(
+                    change.id == value.key(),
+                    "source_ownership: recovery file key mismatch"
+                );
+                crate::source_import::file_health(&value)?;
+            }
+            "import_members" => {
+                let value: crate::source_import::Member = serde_json::from_str(payload)?;
+                ensure!(
+                    change.id == value.row_key()
+                        && value.record_id
+                            == crate::source_import::record_id(&value.source_id, &value.key),
+                    "source_ownership: recovery membership key mismatch"
+                );
+                crate::source_import::path(&value.path)?;
+            }
+            _ => bail!("unsupported capture table"),
+        }
     }
     Ok(())
 }
@@ -308,6 +356,18 @@ fn read(s: &Store, op: &str) -> Result<Option<Intent>> {
                 );
                 for change in changes {
                     validate_change_frame(change, op)?;
+                    if change.table == "import_sources" {
+                        let source: crate::source_import::Source = serde_json::from_str(
+                            change.payload.as_deref().context("source payload")?,
+                        )?;
+                        ensure!(
+                            source.actor == i.actor
+                                && source.role == i.role.name()
+                                && i.result["source"] == source.source_id
+                                && i.result["candidate_digest"] == source.candidate_digest,
+                            "source_ownership: recovery source attribution/result mismatch"
+                        );
+                    }
                 }
             }
             Plan::Abandon { operation } => ensure!(
@@ -345,6 +405,44 @@ pub(crate) fn check_identity(s: &Store, op: &str, hash: &str) -> Result<()> {
             i.args_hash == hash,
             "--op-id {op} was already used with different arguments or attribution"
         );
+    }
+    Ok(())
+}
+/// Nonterminal intents reserve namespaces before a proposal branch exists.
+/// Completed receipts retain replay precedence even if the journal's final
+/// bookkeeping acknowledgement was lost.
+pub(crate) fn check_import_reservation(s: &Store, source: &str, op: &str) -> Result<()> {
+    for row in s.sql(&format!("SELECT id,JSON_UNQUOTE(JSON_EXTRACT(payload,'$.op_id')) AS operation FROM metadata AS OF {} WHERE id LIKE 'intent:%' AND (JSON_EXTRACT(payload,'$.stage.state') IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(payload,'$.stage.state')) NOT IN ('complete','failed','abandoned'))", revision_literal(JOURNAL)))? {
+        let owner = row["operation"].as_str().context("invalid reservation identity")?;
+        ensure!(row["id"] == key(owner), "invalid reservation key");
+        if owner == op { continue; }
+        let intent = read(s, owner)?.context("missing reservation")?;
+        if s.receipt(owner, &intent.args_hash)?.is_some() { continue; }
+        if let Plan::Write { changes, .. } = &intent.plan {
+            ensure!(!changes.iter().any(|c| c.table == "import_sources" && c.id == source),
+                "source_reserved: source {source} belongs to interrupted operation {owner}; recover or explicitly abandon it");
+        }
+    }
+    Ok(())
+}
+fn check_import_publication(s: &Store, changes: &[Change], op: &str) -> Result<()> {
+    for c in changes.iter().filter(|c| c.table == "import_sources") {
+        check_import_reservation(s, &c.id, op)?;
+        ensure!(
+            s.one_at::<Value>("import_sources", &c.id, "main")?
+                .is_none(),
+            "source_update_unsupported: recovery namespace {} is already published; reconcile the original operation",
+            c.id
+        );
+        for p in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
+            ensure!(
+                s.one_at::<Value>("import_sources", &c.id, &p.branch)?
+                    .is_none(),
+                "source_update_unsupported: namespace {} is reserved by {}",
+                c.id,
+                p.branch
+            );
+        }
     }
     Ok(())
 }
@@ -497,6 +595,20 @@ fn dry_candidate(
         .map(|m| (m.record_id.clone(), m))
         .collect();
     crate::source_import::validate(&g)?;
+    let af = s
+        .import_files_at(base)?
+        .into_iter()
+        .map(|f| (f.key(), f))
+        .collect();
+    let bf = s
+        .import_files_at(proposal)?
+        .into_iter()
+        .map(|f| (f.key(), f))
+        .collect();
+    let files = chosen("import_files", merged, ours, &af, &bf)?
+        .into_values()
+        .collect::<Vec<_>>();
+    crate::source_import::health(&g, &files)?;
     let debt = metadata
         .get("import")
         .map(|p| serde_json::from_str::<ImportInfo>(p))
@@ -614,6 +726,7 @@ fn publish_write(s: &Store, mut i: Intent) -> Result<Value> {
             p.status
         );
     }
+    check_import_publication(s, changes, &i.op_id)?;
     let state = branch_state(s, &i)?;
     if state == "absent" {
         ensure!(
@@ -653,6 +766,7 @@ fn publish_write(s: &Store, mut i: Intent) -> Result<Value> {
             "dirty_state: candidate differs from durable intent"
         );
         let candidate = s.graph()?;
+        crate::source_import::health(&candidate, &s.import_files()?)?;
         crate::policy::validate_change(&graph, &candidate, &BTreeSet::new())?;
         candidate.schema.validate()?;
         for pin in &candidate.schema.pins {
@@ -675,6 +789,7 @@ pub(crate) fn publish_proposal(
 ) -> Result<Value> {
     let before = Snapshot::read(s, Some(&p.base))?;
     let delta = changes(sql, op)?;
+    check_import_publication(s, &delta, op)?;
     ensure!(
         !before.rows["operations"].contains_key(op),
         "operation already exists"
