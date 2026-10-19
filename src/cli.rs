@@ -319,7 +319,9 @@ impl Cmd {
                     command: SchemaCommand::Apply { .. }
                 }
                 | Self::Migrate
-                | Self::Import { .. }
+                | Self::Import {
+                    command: ImportCommand::Apply { .. } | ImportCommand::Markdown { .. }
+                }
                 | Self::New(_)
                 | Self::Edit { .. }
                 | Self::Link { .. }

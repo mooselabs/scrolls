@@ -4,7 +4,7 @@ use super::{
     session::{Connection, SharedSession},
 };
 use crate::{
-    cli::{Cli, Cmd, Role},
+    cli::{Cli, Cmd, ImportCommand, Role},
     model::digest,
     schema::Schema,
 };
@@ -70,12 +70,14 @@ pub fn check_command(cli: &Cli) -> Result<()> {
         !matches!(
             cli.command,
             Cmd::Migrate
-                | Cmd::Import { .. }
+                | Cmd::Import {
+                    command: ImportCommand::Markdown { .. }
+                }
                 | Cmd::Beads { .. }
                 | Cmd::Consumed { .. }
                 | Cmd::Context { bead: Some(_), .. }
         ),
-        "shared_unsupported: migration, import, Beads and audit paths require further qualification"
+        "shared_unsupported: migration, legacy Markdown import, Beads and audit paths require further qualification"
     );
     if cli.command.mutation()
         && !cli.dry_run
@@ -143,8 +145,8 @@ impl Store {
         );
         ensure!(
             self.one::<u32>("metadata", "schema")? == Some(5)
-                && self.one::<u32>("metadata", "shared_writer")? == Some(2),
-            "unsupported_shared_writer: this client requires shared format 5, writer 2; no automatic migration"
+                && self.one::<u32>("metadata", "shared_writer")? == Some(3),
+            "unsupported_shared_writer: this client requires shared format 5, writer 3; no automatic migration"
         );
         let uuid: String = self
             .one("metadata", "store_id")?
@@ -258,7 +260,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     if cli.dry_run {
         return Ok(
             json!({"schema_version":2,"ok":true,"revision":base,"branch":"main",
-            "data":{"dry_run":true,"base_revision":base,"ontology_digest":ontology_digest,"format":5,"writer":2}}),
+            "data":{"dry_run":true,"base_revision":base,"ontology_digest":ontology_digest,"format":5,"writer":3}}),
         );
     }
     ensure!(
@@ -282,7 +284,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     }
     let store_id = uuid::Uuid::new_v4().to_string();
     sql.push_str(&put("metadata", "schema", &5)?);
-    sql.push_str(&put("metadata", "shared_writer", &2)?);
+    sql.push_str(&put("metadata", "shared_writer", &3)?);
     sql.push_str(&put("metadata", "store_id", &store_id)?);
     sql.push_str(&put("metadata", "ontology", schema)?);
     let result =

@@ -127,6 +127,15 @@ impl Store {
         }
         self.import_rows("import_files", None, crate::source_import::File::key)
     }
+    pub fn shared_query_limit(&self) -> Option<usize> {
+        self.shared.as_ref().map(|s| s.query_limit())
+    }
+    pub fn import_files_at(&self, rev: &str) -> Result<Vec<crate::source_import::File>> {
+        if self.one_at::<u32>("metadata", "schema", rev)?.unwrap_or(1) < 4 {
+            return Ok(vec![]);
+        }
+        self.import_rows("import_files", Some(rev), crate::source_import::File::key)
+    }
     pub fn graph_at(&self, rev: &str) -> Result<Graph> {
         let format = self.one_at::<u32>("metadata", "schema", rev)?.unwrap_or(1);
         let mut g = Graph {
@@ -597,7 +606,7 @@ impl Store {
             self.check_versioned_inventory("HEAD")?;
             anyhow::ensure!(
                 self.one::<u32>("metadata", "schema")? == Some(5)
-                    && self.one::<u32>("metadata", "shared_writer")? == Some(2),
+                    && self.one::<u32>("metadata", "shared_writer")? == Some(3),
                 "unsupported shared branch format"
             );
             return Ok(());

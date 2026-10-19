@@ -206,7 +206,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
             branch,
         );
     }
@@ -849,6 +849,7 @@ pub(crate) fn validate_merged_review(
     role: Role,
 ) -> Result<()> {
     let merged = s.graph()?;
+    crate::source_import::health(&merged, &s.import_files()?)?;
     let debt = s
         .one::<ImportInfo>("metadata", "import")?
         .map(|i| i.lint_debt)
