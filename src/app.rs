@@ -95,6 +95,9 @@ pub fn run(cli: &Cli) -> Result<Value> {
         bail!("recover is a shared-store command; use --connection");
     }
     if let Cmd::Import { command } = &cli.command {
+        if crate::markdown_import::handles(command)? {
+            return crate::markdown_import::run(cli, command);
+        }
         if !matches!(command, ImportCommand::Markdown { .. }) {
             return crate::source_import::run(cli, command);
         }
@@ -209,7 +212,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"markdown_health":crate::markdown_import::health(&store,&store.graph()?,None)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
             branch,
         );
     }
@@ -808,26 +811,32 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
             json!(rows)
         }
-        Cmd::Render { out, format } => crate::render::render(
-            &graph,
-            &store.rows("source_files")?,
-            info.as_ref(),
-            &store
-                .one::<Vec<Edge>>("metadata", "import_edges")?
-                .unwrap_or_default(),
-            &revision,
-            crate::render::Options {
-                out,
-                format: *format,
-                dry_run: cli.dry_run,
-                beads: &local,
-                import_files: &if schema >= 4 {
-                    store.import_files()?
-                } else {
-                    vec![]
+        Cmd::Render { out, format } => {
+            crate::markdown_import::health(&store, &graph, None)?;
+            crate::render::render(
+                &graph,
+                &store.rows("source_files")?,
+                info.as_ref(),
+                &store
+                    .one::<Vec<Edge>>("metadata", "import_edges")?
+                    .unwrap_or_default(),
+                &revision,
+                crate::render::Options {
+                    out,
+                    format: *format,
+                    dry_run: cli.dry_run,
+                    beads: &local,
+                    markdown_import: store
+                        .one::<crate::markdown_import::Plan>("metadata", "markdown_import")?
+                        .as_ref(),
+                    import_files: &if schema >= 4 {
+                        store.import_files()?
+                    } else {
+                        vec![]
+                    },
                 },
-            },
-        )?,
+            )?
+        }
         _ => bail!("unsupported command"),
     };
     if store.is_shared()
@@ -862,6 +871,7 @@ pub(crate) fn validate_merged_review(
     role: Role,
 ) -> Result<()> {
     let merged = s.graph()?;
+    crate::markdown_import::health(s, &merged, None)?;
     crate::source_import::health(&merged, &s.import_files()?)?;
     let debt = s
         .one::<ImportInfo>("metadata", "import")?

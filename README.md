@@ -300,6 +300,11 @@ See the [profile contract](docs/import-profiles.md) and [migration guide](docs/m
 
 ## Markdown import and export
 
+The local adapter below retains the whole documentation source tree. Shared
+Markdown-only migration uses a reviewed, human-applied bootstrap plan; see
+[shared editable Markdown](docs/shared-markdown.md) for the separate interface,
+original fidelity and retained Git link behavior.
+
 For a Liskov import, start with an empty store and pin the source commit:
 
 ```fish
@@ -337,7 +342,7 @@ pinned old-writer fixture before running the complete qualification:
 git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-0.3.0
 git -C .verification/scrolls-0.3.0 checkout --detach 3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4
 git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-shared-previous
-git -C .verification/scrolls-shared-previous checkout --detach a4bf897811abbb19657a824b5eb3470a2733ce16
+git -C .verification/scrolls-shared-previous checkout --detach 024d95242ea811520f2925d3e27ab45c933145a5
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
@@ -375,7 +380,8 @@ and support boundaries above describe Scrolls.
 
 The unreleased shared backend can initialize a fresh externally provisioned Dolt
 2.2.0 database and publish direct or reviewed graph changes using a named SQL
-account, with durable cross-client recovery and profile-based captured Git imports.
+account, with durable cross-client recovery, profile-based captured Git imports and
+[shared editable Markdown bootstrap](docs/shared-markdown.md).
 Database-only verified backup and restore are described in [shared backups](docs/shared-backups.md).
 See [shared authoring](docs/shared-authoring.md) for the reviewed initialization
 procedure, connection file, supported commands and qualification fixtures.

@@ -222,6 +222,8 @@ pub fn proposal_detail(store: &Store, name: &str) -> Result<Value> {
     let revision = store.head(name)?;
     let ancestor = store.merge_base(&main, &revision)?;
     let proposed = store.graph_at(&revision)?;
+    crate::markdown_import::health(store, &store.graph_at(&main)?, Some(&main))?;
+    crate::markdown_import::health(store, &proposed, Some(&revision))?;
     let old = store.graph_at(&ancestor)?;
     let ids: BTreeSet<_> = old.records.keys().chain(proposed.records.keys()).collect();
     let changes: Vec<_> = ids

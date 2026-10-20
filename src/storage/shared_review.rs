@@ -630,6 +630,35 @@ fn dry_candidate(
         .map(|p| serde_json::from_str(p))
         .transpose()?
         .unwrap_or(json!({}));
+    if let Some(plan) = metadata.get("markdown_import") {
+        let af = s
+            .rows_at::<crate::model::SourceFile>("source_files", base)?
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
+        let bf = s
+            .rows_at::<crate::model::SourceFile>("source_files", proposal)?
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
+        let files = chosen("source_files", merged, ours, &af, &bf)?
+            .into_values()
+            .collect::<Vec<_>>();
+        crate::markdown_import::health_content(
+            &g,
+            &files,
+            Some(&serde_json::from_str::<ImportInfo>(
+                metadata.get("import").context("missing Markdown import")?,
+            )?),
+            &routing,
+            &serde_json::from_str::<Vec<crate::model::Edge>>(
+                metadata
+                    .get("import_edges")
+                    .context("missing Markdown baseline")?,
+            )?,
+            Some(&serde_json::from_str::<crate::markdown_import::Plan>(plan)?),
+        )?;
+    }
     crate::app::validate_review_candidate(main, &g, &debt, &requirements, &routing, who, role)
 }
 fn commit_changes(
@@ -1345,5 +1374,15 @@ pub(crate) fn check_readable(s: &Store) -> Result<()> {
         };
         ensure!(readable, "recovery_required: unfinished shared operation");
     }
+    Ok(())
+}
+
+/// Bootstrap cannot race a prepared proposal that has not created its branch yet.
+pub(crate) fn check_bootstrap_ready(s: &Store) -> Result<()> {
+    let rows = s.sql(&format!("SELECT id FROM metadata AS OF {} WHERE id LIKE 'intent:%' AND (JSON_EXTRACT(payload,'$.stage.state') IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(payload,'$.stage.state')) NOT IN ('complete','abandoned'))", revision_literal(JOURNAL)))?;
+    ensure!(
+        rows.is_empty(),
+        "Markdown bootstrap refuses unresolved shared operations"
+    );
     Ok(())
 }

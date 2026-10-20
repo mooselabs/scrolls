@@ -4,9 +4,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::Cursor,
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 pub struct Imported {
@@ -15,12 +15,18 @@ pub struct Imported {
     pub info: ImportInfo,
     pub routing: Value,
 }
-fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let o = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
+pub(crate) fn git_command(repo: &Path) -> Command {
+    let mut c = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("GIT_")) {
+            c.env_remove(key);
+        }
+    }
+    c.arg("--no-replace-objects").arg("-C").arg(repo);
+    c
+}
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let o = git_command(repo).args(args).stdin(Stdio::null()).output()?;
     if !o.status.success() {
         bail!(
             "git {}: {}",
@@ -123,6 +129,14 @@ pub fn resolve_reference(path: &str, reference: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
+    import_selected(dir, rev, actor, false)
+}
+pub(crate) fn import_selected(
+    dir: &Path,
+    rev: &str,
+    actor: &str,
+    markdown_only: bool,
+) -> Result<Imported> {
     let dir = dir.canonicalize()?;
     let root = String::from_utf8(git(&dir, &["rev-parse", "--show-toplevel"])?)?
         .trim()
@@ -130,7 +144,12 @@ pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
     let root = Path::new(&root);
     let commit = String::from_utf8(git(
         root,
-        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ],
     )?)?
     .trim()
     .to_string();
@@ -142,60 +161,17 @@ pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
     if prefix.is_empty() {
         bail!("pass the documentation directory within the Git repository");
     }
-    let archive = git(root, &["archive", "--format=tar", &commit, &prefix])?;
-    let tree = git(root, &["ls-tree", "-rz", &commit, "--", &prefix])?;
-    let mut oids = BTreeMap::new();
-    for entry in tree.split(|b| *b == 0).filter(|b| !b.is_empty()) {
-        let s = std::str::from_utf8(entry)?;
-        let (header, path) = s.split_once('\t').context("git tree entry")?;
-        oids.insert(
-            path.to_string(),
-            header
-                .split_whitespace()
-                .nth(2)
-                .context("git oid")?
-                .to_string(),
-        );
-    }
+    let source_files = read_files(root, &commit, &prefix, markdown_only)?;
     let mut graph = Graph::default();
     let mut files = vec![];
     let mut markdown = 0;
     let mut untyped = 0;
     let re = regex::Regex::new(r"^(?:BKLG|EPIC|Q)-\d{8}-[a-z0-9]{4}").unwrap();
-    for entry in tar::Archive::new(Cursor::new(archive)).entries()? {
-        let mut entry = entry?;
-        if entry.header().entry_type().is_dir()
-            || entry.header().entry_type().is_pax_global_extensions()
-            || entry.header().entry_type().is_pax_local_extensions()
-        {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
-            bail!(
-                "unsupported non-regular tracked file {}; import refuses symlink escapes",
-                entry.path()?.display()
-            );
-        }
-        let full = entry
-            .path()?
-            .to_str()
-            .context("UTF8 source path required")?
-            .to_string();
-        let path = full
-            .strip_prefix(&format!("{prefix}/"))
-            .context("archive outside source prefix")?
-            .to_string();
-        safe_path(&path)?;
-        let mut bytes = vec![];
-        std::io::Read::read_to_end(&mut entry, &mut bytes)?;
-        let hash = digest(&bytes);
-        files.push(SourceFile {
-            path: path.clone(),
-            sha256: hash,
-            git_oid: oids[&full].clone(),
-            mode: entry.header().mode()?,
-            bytes: STANDARD.encode(&bytes),
-        });
+    for source in source_files {
+        let path = source.path.clone();
+        let full = format!("{prefix}/{path}");
+        let bytes = STANDARD.decode(&source.bytes)?;
+        files.push(source);
         if !path.ends_with(".md") {
             continue;
         }
@@ -446,4 +422,119 @@ pub fn import(dir: &Path, rev: &str, actor: &str) -> Result<Imported> {
         info,
         routing: json!({"triggers":triggers,"manifest":manifest,"agents_sha256":digest(agents.as_bytes())}),
     })
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GitEntry {
+    pub path: String,
+    pub mode: u32,
+    pub oid: String,
+    pub size: u64,
+}
+pub(crate) fn inventory(repo: &Path, commit: &str) -> Result<Vec<GitEntry>> {
+    let tree = git(repo, &["ls-tree", "-rlz", "--full-tree", commit])?;
+    tree.split(|b| *b == 0)
+        .filter(|b| !b.is_empty())
+        .map(|row| {
+            let row = std::str::from_utf8(row).context("non-UTF8 Git path")?;
+            let (head, path) = row.split_once('\t').context("invalid Git inventory")?;
+            safe_path(path)?;
+            let parts: Vec<_> = head.split_whitespace().collect();
+            anyhow::ensure!(parts.len() == 4, "invalid Git inventory");
+            Ok(GitEntry {
+                path: path.into(),
+                mode: u32::from_str_radix(parts[0], 8)?,
+                oid: parts[2].into(),
+                size: if parts[3] == "-" {
+                    0
+                } else {
+                    parts[3].parse()?
+                },
+            })
+        })
+        .collect()
+}
+fn read_files(
+    repo: &Path,
+    commit: &str,
+    prefix: &str,
+    markdown_only: bool,
+) -> Result<Vec<SourceFile>> {
+    let prefix = format!("{prefix}/");
+    let entries: Vec<_> = inventory(repo, commit)?
+        .into_iter()
+        .filter(|e| e.path.starts_with(&prefix) && (!markdown_only || e.path.ends_with(".md")))
+        .collect();
+    anyhow::ensure!(
+        entries.len() <= crate::source_import::FILE_COUNT,
+        "input_limit: too many source files"
+    );
+    let total: u64 = entries.iter().map(|e| e.size).sum();
+    anyhow::ensure!(
+        total <= crate::source_import::TOTAL_LIMIT,
+        "input_limit: source bytes exceed 1 GiB"
+    );
+    for e in &entries {
+        anyhow::ensure!(
+            [0o100644, 0o100755].contains(&e.mode),
+            "unsupported non-regular tracked file {}",
+            e.path
+        );
+        anyhow::ensure!(
+            e.size <= crate::source_import::FILE_LIMIT,
+            "input_limit: source file exceeds 64 MiB"
+        );
+    }
+    let mut child = git_command(repo)
+        .arg("cat-file")
+        .arg("--batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let result = (|| -> Result<Vec<SourceFile>> {
+        let mut input = child.stdin.take().context("Git input")?;
+        let mut output = BufReader::new(child.stdout.take().context("Git output")?);
+        let mut files = vec![];
+        for e in entries {
+            writeln!(input, "{}", e.oid)?;
+            input.flush()?;
+            let mut header = String::new();
+            output.read_line(&mut header)?;
+            let parts: Vec<_> = header.split_whitespace().collect();
+            anyhow::ensure!(
+                parts.len() == 3
+                    && parts[0] == e.oid
+                    && parts[1] == "blob"
+                    && parts[2].parse::<u64>()? == e.size,
+                "source_read: Git blob framing mismatch"
+            );
+            let mut bytes = vec![0; e.size as usize];
+            output.read_exact(&mut bytes)?;
+            let mut end = [0];
+            output.read_exact(&mut end)?;
+            anyhow::ensure!(end == *b"\n", "source_read: Git blob terminator");
+            files.push(SourceFile {
+                path: e
+                    .path
+                    .strip_prefix(&prefix)
+                    .context("source prefix")?
+                    .into(),
+                sha256: digest(&bytes),
+                git_oid: e.oid,
+                mode: e.mode,
+                bytes: STANDARD.encode(bytes),
+            });
+        }
+        drop(input);
+        Ok(files)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let files = result?;
+    anyhow::ensure!(status.success(), "source_read: Git object reader failed");
+    Ok(files)
 }

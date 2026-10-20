@@ -216,12 +216,42 @@ impl SharedSession {
         owned_working_set: bool,
         validate: impl FnOnce() -> Result<()>,
     ) -> Result<String> {
+        self.commit_checked_transport(changes, message, actor, owned_working_set, false, validate)
+    }
+    pub(crate) fn commit_markdown_checked(
+        &self,
+        changes: &str,
+        message: &str,
+        actor: &str,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        self.commit_checked_transport(changes, message, actor, false, true, validate)
+    }
+    fn commit_checked_transport(
+        &self,
+        changes: &str,
+        message: &str,
+        actor: &str,
+        owned_working_set: bool,
+        chunked: bool,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        // The complete operation still has the original encoded input limit.
+        ensure!(
+            changes.len() <= self.query_limit(),
+            "input_limit: encoded shared SQL request exceeds {} bytes",
+            self.query_limit()
+        );
         if !owned_working_set {
             self.clean()?;
         }
         self.sql("START TRANSACTION")?;
         let result = (|| {
-            self.sql(changes)?;
+            if chunked {
+                self.markdown_changes(changes)?;
+            } else {
+                self.sql(changes)?;
+            }
             validate()?;
             self.sql("CALL DOLT_ADD('.')")?;
             let committed = self.sql(&format!(
@@ -256,6 +286,29 @@ impl SharedSession {
                 bail!("commit_failed: reconcile operation receipt before retry; {error:#}")
             }
         }
+    }
+    fn markdown_changes(&self, changes: &str) -> Result<()> {
+        const BATCH_BYTES: usize = 1024 * 1024;
+        let mut start = 0;
+        let mut end = 0;
+        // This private path accepts only our generated hex-literal DML. Newlines
+        // in authored content are hex encoded, so every line is one statement.
+        for line in changes.split_inclusive('\n') {
+            ensure!(
+                (line.starts_with("REPLACE INTO ") || line.starts_with("INSERT INTO "))
+                    && line.trim_end().ends_with(';'),
+                "unsupported canonical Markdown bulk DML"
+            );
+            if end > start && end + line.len() - start > BATCH_BYTES {
+                self.sql(&changes[start..end])?;
+                start = end;
+            }
+            end += line.len();
+        }
+        if end > start {
+            self.sql(&changes[start..end])?;
+        }
+        Ok(())
     }
 }
 
