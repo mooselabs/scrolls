@@ -37,7 +37,7 @@ scrolls --connection /absolute/machine-local.json --actor alice --role human --o
 
 Omit `--schema` in both commands for the bundled ontology. Apply validates the
 empty graph and creates all nine tables, ontology, UUID, shared format 5 and
-writer generation 3. It commits a non-ready layout, creates the versioned
+writer generation 4. It commits a non-ready layout, creates the versioned
 `scrolls-operations` recovery branch, then commits the ready marker and receipt.
 Only that final commit makes initialization successful. It refuses existing local stores, partial
 initialization, additional branches, retained tags, reflog history and non-initial history. There is no reset,
@@ -69,7 +69,7 @@ snapshot, without applying it again.
 Supported direct mutations are `new`, `edit`, `link`, `unlink`, `status` and
 `batch`, subject to ontology policy. Protected mutations create isolated proposals. Shared proposal selection,
 inspection, human acceptance/rejection and reviewed ontology changes use the
-same engine as local mode. Profile-based Git imports are supported. Legacy Markdown import, maintenance
+same engine as local mode. Profile-based captured Git imports and [editable Markdown bootstrap](shared-markdown.md) are supported. The local Markdown shorthand, maintenance
 migrations, Beads and consumption-audit commands remain explicitly unavailable. They never fall back
 to local state.
 
@@ -132,7 +132,7 @@ evidence. Pending, failed and abandoned operations reserve their IDs; changing
 input never reuses one. Branches and recovery history are retained; automatic
 pruning is not implemented.
 
-Writer generation 2 clients refuse generation 3 stores. Generation 3 refuses
+Writer generation 3 clients refuse generation 4 stores. Generation 4 refuses
 older shared stores; upgrading them requires a future exclusive maintenance
 procedure with verified backup. These preview stores are disposable.
 
@@ -218,7 +218,7 @@ previous shared writer is built from an additional pinned clean checkout:
 
 ```sh
 git clone https://github.com/mooselabs/scrolls.git .verification/scrolls-shared-previous
-git -C .verification/scrolls-shared-previous checkout --detach a4bf897811abbb19657a824b5eb3470a2733ce16
+git -C .verification/scrolls-shared-previous checkout --detach 024d95242ea811520f2925d3e27ab45c933145a5
 ```
 
 Both baseline checkouts must exist before running the full test command above.

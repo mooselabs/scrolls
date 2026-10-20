@@ -35,6 +35,7 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 | `lint` | Structural errors and retained imported debt; nonzero on new errors. |
 | `consumed [--for-session ID]` | Audited deliveries and record revisions. |
 | `doctor` / `migrate` | Inspect / explicitly upgrade a store. |
+| `import plan markdown DIR --rev COMMIT --git-web-url URL --out PLAN` | Human-only shared editable bootstrap planning; see [contract](shared-markdown.md). |
 | `import markdown DIR --rev COMMIT` | Pinned Git Liskov adapter; requires bundled knowledge ontology. |
 | `render --out DIR [--format native\|liskov]` | Fresh destination export with complete graph and configuration. |
 

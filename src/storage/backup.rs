@@ -345,8 +345,8 @@ mod linux {
             .one("metadata", "shared_writer")?
             .context("backup_writer")?;
         ensure!(
-            format == 5 && writer == 3 && s.one::<bool>("metadata", "shared_ready")? == Some(true),
-            "backup_unsupported_format: shared format 5 writer 3 required"
+            format == 5 && writer == 4 && s.one::<bool>("metadata", "shared_ready")? == Some(true),
+            "backup_unsupported_format: shared format 5 writer 4 required"
         );
         let schema_revision = s.graph()?.schema.revision();
         let local = refs(s, "dolt_branches", "name", "hash")?;
@@ -395,6 +395,8 @@ mod linux {
                 policy::lint(&graph).is_subset(&debt),
                 "backup_graph_invalid: inspect source lint"
             );
+            crate::markdown_import::health(s, &graph, Some(&head))
+                .map_err(|_| anyhow!("backup_source_health: inspect Markdown originals"))?;
             crate::source_import::health(&graph, &s.import_files_at(&head)?)
                 .map_err(|_| anyhow!("backup_source_health: inspect source provenance"))?;
             ensure!(

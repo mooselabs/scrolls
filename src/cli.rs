@@ -408,6 +408,15 @@ pub enum ProfileCommand {
 }
 #[derive(Debug, Serialize, Subcommand)]
 pub enum PlanCommand {
+    Markdown {
+        dir: PathBuf,
+        #[arg(long)]
+        rev: String,
+        #[arg(long)]
+        git_web_url: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Git {
         repo: PathBuf,
         #[arg(long)]

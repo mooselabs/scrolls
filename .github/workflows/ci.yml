@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: mooselabs/scrolls
-          ref: a4bf897811abbb19657a824b5eb3470a2733ce16
+          ref: 024d95242ea811520f2925d3e27ab45c933145a5
           path: .verification/scrolls-shared-previous
       # Includes real local/shared Dolt HTTP, security, recovery and shutdown tests.
       - run: cargo test --locked --all-targets

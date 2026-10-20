@@ -641,7 +641,7 @@ impl Store {
             self.check_versioned_inventory("HEAD")?;
             anyhow::ensure!(
                 self.one::<u32>("metadata", "schema")? == Some(5)
-                    && self.one::<u32>("metadata", "shared_writer")? == Some(3),
+                    && self.one::<u32>("metadata", "shared_writer")? == Some(4),
                 "unsupported shared branch format"
             );
             return Ok(());
@@ -708,6 +708,18 @@ impl Store {
             .as_ref()
             .context("shared operation required")?
             .commit_checked(changes, message, actor, owned, validate)
+    }
+    pub(crate) fn commit_shared_markdown_checked(
+        &self,
+        changes: &str,
+        message: &str,
+        actor: &str,
+        validate: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        self.shared
+            .as_ref()
+            .context("shared operation required")?
+            .commit_markdown_checked(changes, message, actor, validate)
     }
     pub fn head(&self, branch: &str) -> Result<String> {
         Ok(self.sql(&format!(

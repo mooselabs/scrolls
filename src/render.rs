@@ -71,6 +71,7 @@ pub struct Options<'a> {
     pub format: Format,
     pub dry_run: bool,
     pub beads: &'a crate::beads::Local,
+    pub markdown_import: Option<&'a crate::markdown_import::Plan>,
 }
 pub fn render(
     g: &Graph,
@@ -87,7 +88,9 @@ pub fn render(
         dry_run,
         beads,
         import_files,
+        markdown_import,
     } = options;
+
     if format == Format::Liskov && !g.import_sources.is_empty() {
         bail!("generic sources require native export; Liskov format is unsupported");
     }
@@ -345,8 +348,20 @@ pub fn render(
             serde_json::to_vec_pretty(&crate::source_import::summary(g, import_files))?,
         )?;
     }
+    let mut references = crate::markdown_links::Report::default();
+    if let Some(plan) = markdown_import {
+        let projector = crate::markdown_links::Projector::new(plan);
+        for record in g.records.values() {
+            if let Some(path) = &record.path {
+                let bytes = output.get(path).context("missing imported Markdown view")?;
+                let (projected, report) = projector.project(std::str::from_utf8(bytes)?, path)?;
+                output.insert(path.clone(), projected.into_bytes());
+                references.extend(report);
+            }
+        }
+    }
     let hashes: BTreeMap<_, _> = output.iter().map(|(p, b)| (p.clone(), digest(b))).collect();
-    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()});
+    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"git_references":references,"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()});
     for path in output.keys() {
         safe_path(path)?;
         for ancestor in Path::new(path).ancestors().skip(1) {
@@ -369,6 +384,18 @@ pub fn render(
         fs::create_dir_all(target.parent().unwrap())?;
         let mut f = fs::File::create(&target)?;
         f.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(source) = files.iter().find(|source| source.path == *path) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &target,
+                fs::Permissions::from_mode(if source.mode & 0o111 != 0 {
+                    0o755
+                } else {
+                    0o644
+                }),
+            )?;
+        }
         #[cfg(unix)]
         if let Some(source) = import_files
             .iter()
@@ -401,7 +428,7 @@ pub fn render(
         return Err(e.into());
     }
     Ok(
-        json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()}),
+        json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"git_references":references,"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()}),
     )
 }
 fn render_work_navigation(

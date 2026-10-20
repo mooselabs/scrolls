@@ -1731,7 +1731,7 @@ fn build_pinned(source: &Path, revision: &str) -> tempfile::TempDir {
 fn prior_shared_writer_executable_refuses_current_generation() {
     let source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join(".verification/scrolls-shared-previous");
-    let build = build_pinned(&source, "a4bf897811abbb19657a824b5eb3470a2733ce16");
+    let build = build_pinned(&source, "024d95242ea811520f2925d3e27ab45c933145a5");
     let s = Server::handbook();
     let before = s.main_head();
     let client = s.client(
@@ -4013,4 +4013,757 @@ fn shared_connection_io_budget_is_explicit_bounded_and_redacted() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("private-budget-marker"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("private-budget-marker"));
     }
+}
+
+fn editable_markdown_source(s: &Server) -> PathBuf {
+    let repo = import_source(s);
+    for dir in [
+        "knowledge",
+        "raw",
+        "decisions/adr",
+        "backlog/items",
+        "questions/answered",
+        "assets",
+    ] {
+        fs::create_dir_all(repo.join("docs").join(dir)).unwrap();
+    }
+    let fm = |kind: &str, title: &str, status: &str, source: &str| {
+        format!(
+            "---\ntitle: {title}\ndoc_type: {kind}\nstatus: {status}\nowner: alice\ncreated: 2026-10-20\nlast_reviewed: 2026-10-20\nconfidence: high\nsource_documents: {source}\nrelated_repos: []\n---\n"
+        )
+    };
+    fs::write(repo.join("docs/raw/one.md"),fm("raw","Source","raw","[]")+"Original $Format:%H$\r\n[script](../../run.sh#L2) ![asset](../assets/a.bin)\n`[literal](../../run.sh)`\n").unwrap();
+    fs::write(
+        repo.join("docs/raw/exec.md"),
+        fm("raw", "Executable Markdown", "raw", "[]") + "Executable source\n",
+    )
+    .unwrap();
+    fs::write(repo.join("docs/knowledge/one.md"),fm("knowledge","Knowledge","canonical","[../raw/one.md]")+"[source](../raw/one.md) [retained][script]\n\n[script]: ../../run.sh \"Run it\"\n[gap](../../repos/missing/a.rs)\n").unwrap();
+    fs::write(
+        repo.join("docs/decisions/adr/0001-original.md"),
+        fm("adr", "Decision", "accepted", "[../../raw/one.md]") + "Decision body\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("docs/backlog/items/BKLG-20261020-abcd-old.md"),
+        fm("backlog", "History", "done", "[]") + "Frozen\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("docs/questions/answered/Q-20261020-efgh-old.md"),
+        fm("question", "Historical question", "answered", "[]") + "Frozen\n",
+    )
+    .unwrap();
+    fs::write(repo.join("docs/assets/a.bin"), [0, 255, 3]).unwrap();
+    fs::write(
+        repo.join(".gitattributes"),
+        "docs/raw/exec.md export-ignore\ndocs/raw/one.md export-subst\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo.join("docs/raw/exec.md"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    for args in [["add", "."], ["commit", "-qm"]] {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(&repo).args(args);
+        if args[0] == "commit" {
+            c.arg("editable source");
+        }
+        assert!(c.status().unwrap().success());
+    }
+    repo
+}
+fn editable_plan(s: &Server, repo: &Path, name: &str) -> PathBuf {
+    let plan = s.dir.path().join(format!("{name}.json"));
+    s.call(
+        "planner",
+        &[
+            "import",
+            "plan",
+            "markdown",
+            repo.join("docs").to_str().unwrap(),
+            "--rev",
+            "HEAD",
+            "--git-web-url",
+            "https://github.com/example/docs",
+            "--out",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    plan
+}
+#[test]
+fn shared_editable_markdown_fidelity_edit_review_render_and_source_free_replay() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let base = s.main_head();
+    let plan = editable_plan(&s, &repo, "markdown");
+    assert_eq!(s.main_head(), base);
+    let args = [
+        "--op-id",
+        "markdown",
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+    ];
+    let dry = s.call(
+        "reader",
+        &[
+            "--dry-run",
+            "--op-id",
+            "markdown",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(dry["data"]["result"]["import"]["files"], 6);
+    assert_eq!(s.main_head(), base);
+    let imported = s.call("writer", &args, true);
+    assert_eq!(imported["data"]["import"]["files"], 6);
+    assert_eq!(
+        s.call("reader", &["doctor"], true)["data"]["markdown_health"]["files"],
+        6
+    );
+    let original: Vec<String> = s
+        .raw("main")
+        .query("SELECT payload FROM source_files ORDER BY id")
+        .unwrap();
+    assert_eq!(original.len(), 6);
+    for payload in original {
+        let file: scrolls::model::SourceFile = serde_json::from_str(&payload).unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&file.bytes)
+            .unwrap();
+        assert_eq!(bytes, fs::read(repo.join("docs").join(&file.path)).unwrap());
+        if file.path == "raw/exec.md" {
+            assert_eq!(file.mode, 0o100755);
+        }
+    }
+    let knowledge = s.call("reader", &["show", "knowledge/one.md"], true);
+    let id = knowledge["data"]["record"]["id"].as_str().unwrap();
+    let edit = s.call(
+        "author",
+        &[
+            "--op-id",
+            "edit-imported",
+            "--role",
+            "agent",
+            "edit",
+            id,
+            "--expect",
+            "1",
+            "--body",
+            "Reviewed replacement",
+        ],
+        true,
+    );
+    assert!(
+        edit["data"]["branch"]
+            .as_str()
+            .unwrap()
+            .starts_with("proposal/")
+    );
+    let branch = edit["data"]["branch"].as_str().unwrap();
+    assert_ne!(
+        s.call("reader", &["show", id], true)["data"]["record"]["body"],
+        "Reviewed replacement"
+    );
+    let review = s.call("reviewer", &["review", branch], true);
+    s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept-imported",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            review["data"]["review_token"].as_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(
+        s.call("reader", &["show", id], true)["data"]["record"]["revision"],
+        2
+    );
+    s.call(
+        "stale",
+        &[
+            "--op-id", "stale", "edit", id, "--expect", "1", "--body", "stale",
+        ],
+        false,
+    );
+    s.call(
+        "frozen",
+        &[
+            "--op-id",
+            "frozen",
+            "edit",
+            "BKLG-20261020-abcd",
+            "--expect",
+            "1",
+            "--body",
+            "change",
+        ],
+        false,
+    );
+    s.call(
+        "frozen",
+        &[
+            "--op-id",
+            "frozen-q",
+            "edit",
+            "Q-20261020-efgh",
+            "--expect",
+            "1",
+            "--body",
+            "change",
+        ],
+        false,
+    );
+    s.call("reader", &["show", "ADR-0001"], true);
+    s.call(
+        "author",
+        &[
+            "--op-id",
+            "new-note",
+            "--role",
+            "agent",
+            "new",
+            "note",
+            "--title",
+            "New work note",
+            "--body",
+            "Native note",
+        ],
+        true,
+    );
+    let out = s.dir.path().join("rendered");
+    s.call(
+        "exporter",
+        &[
+            "render",
+            "--format",
+            "liskov",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert!(!out.join("assets/a.bin").exists());
+    let text = fs::read_to_string(out.join("raw/one.md")).unwrap();
+    assert!(text.contains("https://github.com/example/docs/blob/"));
+    assert!(text.contains("`[literal](../../run.sh)`"));
+    assert!(text.contains("$Format:%H$"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(out.join("raw/exec.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+    let copied = s.dir.path().join("copied.json");
+    fs::copy(&plan, &copied).unwrap();
+    fs::remove_file(plan).unwrap();
+    fs::remove_dir_all(repo).unwrap();
+    let replay = s.call(
+        "second-client",
+        &[
+            "--op-id",
+            "markdown",
+            "import",
+            "apply",
+            copied.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(replay["data"], imported["data"]);
+    assert_eq!(
+        s.call(
+            "second-client",
+            &[
+                "--op-id",
+                "same-source",
+                "import",
+                "apply",
+                copied.to_str().unwrap()
+            ],
+            true
+        )["data"]["identical_replay"],
+        true
+    );
+    assert_eq!(
+        s.call("reader", &["show", id], true)["data"]["record"]["body"],
+        "Reviewed replacement"
+    );
+}
+#[test]
+fn shared_editable_markdown_stale_identity_and_role_refusals() {
+    for change in ["main", "actor", "role", "store", "plan"] {
+        let s = Server::empty();
+        s.init(None);
+        let repo = editable_markdown_source(&s);
+        let plan = editable_plan(&s, &repo, "plan");
+        let mut args = vec![
+            "--op-id",
+            "import",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ];
+        if change == "main" {
+            s.call(
+                "author",
+                &["--op-id", "advance", "new", "note", "--title", "Advance"],
+                true,
+            );
+        }
+        if change == "actor" {
+            args.extend(["--actor", "bob"]);
+        }
+        if change == "role" {
+            args.extend(["--role", "agent"]);
+        }
+        if change == "store" {
+            let other = Server::empty();
+            other.init(None);
+            let before = other.main_head();
+            other.call("wrong-store", &args, false);
+            assert_eq!(other.main_head(), before);
+            continue;
+        }
+        if change == "plan" {
+            let mut p: serde_json::Value =
+                serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+            p["commit"] = json!("changed");
+            fs::write(&plan, serde_json::to_vec(&p).unwrap()).unwrap();
+        }
+        let before = s.main_head();
+        s.call("refused", &args, false);
+        assert_eq!(s.main_head(), before);
+        assert_eq!(
+            s.raw("main")
+                .query_first::<u64, _>("SELECT COUNT(*) FROM source_files")
+                .unwrap(),
+            Some(0)
+        );
+    }
+}
+#[test]
+fn shared_editable_markdown_concurrent_apply_and_lost_ack() {
+    let mut s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let plan = editable_plan(&s, &repo, "plan");
+    let args = [
+        "--op-id",
+        "bootstrap",
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+    ];
+    s.interrupted(&args, "CALL DOLT_COMMIT(".into());
+    let mut first = s
+        .client("one", &args)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let second = s.call("two", &args, true);
+    assert!(first.wait().unwrap().success());
+    assert_eq!(second["data"]["import"]["files"], 6);
+    assert_eq!(
+        s.raw("main")
+            .query_first::<u64, _>("SELECT COUNT(*) FROM source_files")
+            .unwrap(),
+        Some(6)
+    );
+    s.call("reader", &["doctor"], true);
+}
+#[test]
+fn shared_editable_markdown_original_corruption_blocks_doctor_render_and_review() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let plan = editable_plan(&s, &repo, "plan");
+    s.call(
+        "writer",
+        &[
+            "--op-id",
+            "bootstrap",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    let proposal = s.call(
+        "author",
+        &[
+            "--op-id",
+            "edit",
+            "edit",
+            "knowledge/one.md",
+            "--expect",
+            "1",
+            "--body",
+            "Proposal",
+        ],
+        true,
+    );
+    let branch = proposal["data"]["branch"].as_str().unwrap();
+    let payload: String = s
+        .raw("main")
+        .query_first("SELECT payload FROM source_files WHERE id='raw/one.md'")
+        .unwrap()
+        .unwrap();
+    let mut f: scrolls::model::SourceFile = serde_json::from_str(&payload).unwrap();
+    f.bytes = "eA==".into();
+    let mut raw = s.raw("main");
+    raw.query_drop(format!("UPDATE source_files SET payload={} WHERE id='raw/one.md'; CALL DOLT_ADD('.'); CALL DOLT_COMMIT('-m','corrupt original','--author','Raw <raw@localhost>')",literal(&serde_json::to_string(&f).unwrap()))).unwrap();
+    drop(raw);
+    s.call("reader", &["doctor"], false);
+    s.call(
+        "exporter",
+        &[
+            "render",
+            "--out",
+            s.dir.path().join("refused").to_str().unwrap(),
+        ],
+        false,
+    );
+    s.call("reviewer", &["review", branch], false);
+}
+
+#[test]
+fn shared_editable_markdown_raw_git_objects_and_packet_limit() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let oid = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD:docs/raw/one.md"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    fs::write(repo.join("replacement"), "substituted").unwrap();
+    let replacement = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["hash-object", "-w", "replacement"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["replace", &oid, &replacement])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let plan = s.dir.path().join("hostile.json");
+    let result = s
+        .client(
+            "planner",
+            &[
+                "import",
+                "plan",
+                "markdown",
+                repo.join("docs").to_str().unwrap(),
+                "--rev",
+                "HEAD",
+                "--git-web-url",
+                "https://github.com/example/docs",
+                "--out",
+                plan.to_str().unwrap(),
+            ],
+        )
+        .env("GIT_DIR", "/nonexistent/redirect")
+        .env("GIT_OBJECT_DIRECTORY", "/nonexistent/objects")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let original_budget: u64 = s
+        .raw("main")
+        .query_first("SELECT @@GLOBAL.max_allowed_packet")
+        .unwrap()
+        .unwrap();
+    s.raw("main")
+        .query_drop("SET GLOBAL max_allowed_packet=16384")
+        .unwrap();
+    let before = s.main_head();
+    let args = [
+        "--op-id",
+        "packet",
+        "import",
+        "apply",
+        plan.to_str().unwrap(),
+    ];
+    s.call("limited", &args, false);
+    assert_eq!(s.main_head(), before);
+    assert_eq!(
+        s.raw("main")
+            .query_first::<u64, _>("SELECT COUNT(*) FROM source_files")
+            .unwrap(),
+        Some(0)
+    );
+    s.raw("main")
+        .query_drop(format!("SET GLOBAL max_allowed_packet={original_budget}"))
+        .unwrap();
+    s.call("writer", &args, true);
+    let shown = s.call("reader", &["show", "raw/one.md"], true);
+    assert!(
+        shown["data"]["record"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("$Format:%H$")
+    );
+    s.call("reader", &["doctor"], true);
+}
+#[test]
+fn shared_editable_markdown_backup_restores_originals_receipts_and_pending_review() {
+    let mut s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let plan = editable_plan(&s, &repo, "plan");
+    let imported = s.call(
+        "writer",
+        &[
+            "--op-id",
+            "bootstrap",
+            "import",
+            "apply",
+            plan.to_str().unwrap(),
+        ],
+        true,
+    );
+    let original_rows: Vec<(String, String)> = s
+        .raw("main")
+        .query("SELECT id,payload FROM source_files ORDER BY id")
+        .unwrap();
+    let proposal = s.call(
+        "author",
+        &[
+            "--op-id",
+            "pending-edit",
+            "edit",
+            "knowledge/one.md",
+            "--expect",
+            "1",
+            "--body",
+            "Survives restoration",
+        ],
+        true,
+    );
+    let branch = proposal["data"]["branch"].as_str().unwrap().to_string();
+    let token = s.token(&branch);
+    let backup = s.dir.path().join("backup");
+    s.call(
+        "host",
+        &["backup", "create", "--out", backup.to_str().unwrap()],
+        true,
+    );
+    let output = s.dir.path().join("restored");
+    restore_backup_artifact(&backup, &output, true);
+    s.stop();
+    let restored = server_from_restored(&output);
+    let copied = restored.dir.path().join("copied.json");
+    fs::copy(plan, &copied).unwrap();
+    fs::remove_dir_all(s.dir.path()).unwrap();
+    let rows: Vec<(String, String)> = restored
+        .raw("main")
+        .query("SELECT id,payload FROM source_files ORDER BY id")
+        .unwrap();
+    assert_eq!(rows, original_rows);
+    let replay = restored.call(
+        "second",
+        &[
+            "--op-id",
+            "bootstrap",
+            "import",
+            "apply",
+            copied.to_str().unwrap(),
+        ],
+        true,
+    );
+    assert_eq!(replay["data"], imported["data"]);
+    restored.call(
+        "second",
+        &[
+            "--op-id",
+            "accept-restored",
+            "review",
+            "accept",
+            &branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+    assert_eq!(
+        restored.call("reader", &["show", "knowledge/one.md"], true)["data"]["record"]["body"],
+        "Survives restoration"
+    );
+    restored.call("reader", &["doctor"], true);
+}
+
+#[test]
+fn shared_editable_markdown_changed_snapshot_and_reused_operation_never_overwrite() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let path = editable_plan(&s, &repo, "plan");
+    s.call(
+        "author",
+        &[
+            "--op-id",
+            "bootstrap",
+            "import",
+            "apply",
+            path.to_str().unwrap(),
+        ],
+        true,
+    );
+    s.call(
+        "author",
+        &[
+            "--op-id",
+            "authored",
+            "edit",
+            "raw/one.md",
+            "--expect",
+            "1",
+            "--body",
+            "Current authored value",
+        ],
+        true,
+    );
+    let mut plan: scrolls::markdown_import::Plan =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan.commit = "b".repeat(40);
+    plan.digest.clear();
+    plan.digest = scrolls::model::digest(serde_json::to_vec(&plan).unwrap());
+    fs::write(&path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    fs::remove_dir_all(repo).unwrap();
+    let before = s.main_head();
+    for op in ["bootstrap", "changed-snapshot"] {
+        let rejected = s.call(
+            "second",
+            &["--op-id", op, "import", "apply", path.to_str().unwrap()],
+            false,
+        );
+        assert!(rejected.to_string().contains(if op == "bootstrap" {
+            "different arguments"
+        } else {
+            "source_update_unsupported"
+        }));
+        assert_eq!(s.main_head(), before);
+    }
+    assert_eq!(
+        s.call("reader", &["show", "raw/one.md"], true)["data"]["record"]["body"],
+        "Current authored value"
+    );
+    let input = s.dir.path().join("native-decision.json");
+    fs::write(&input, serde_json::to_vec(&json!([
+        {"op":"new","kind":"decision","handle":"decision","title":"New native decision","body":"Native decision authoring"},
+        {"op":"link","from":"raw/one.md","rel":"supports","to":"$decision","expect":2}
+    ])).unwrap()).unwrap();
+    let decision = s.call(
+        "author",
+        &[
+            "--op-id",
+            "native-decision",
+            "batch",
+            input.to_str().unwrap(),
+        ],
+        true,
+    );
+    let branch = decision["data"]["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept-native",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        true,
+    );
+}
+
+#[test]
+fn shared_editable_markdown_interrupted_bulk_batches_roll_back_before_replay() {
+    let mut s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let path = repo.join("docs/knowledge/one.md");
+    let mut body = fs::read_to_string(&path).unwrap();
+    body.push_str(&"Large Markdown body. ".repeat(30_000));
+    fs::write(path, body).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "docs/knowledge/one.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-qm", "bulk fixture"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let plan = editable_plan(&s, &repo, "bulk");
+    let before = s.main_head();
+    let args = ["--op-id", "bulk", "import", "apply", plan.to_str().unwrap()];
+    s.interrupted(&args, "REPLACE INTO source_files".into());
+    assert_eq!(s.main_head(), before);
+    let counts:(u64,u64,u64)=s.raw("main").query_first("SELECT (SELECT COUNT(*) FROM records),(SELECT COUNT(*) FROM source_files),(SELECT COUNT(*) FROM operations WHERE id='bulk')").unwrap().unwrap();
+    assert_eq!(counts, (0, 0, 0));
+    s.call("second-client", &args, true);
+    assert_eq!(
+        s.call("reader", &["doctor"], true)["data"]["markdown_health"]["files"],
+        6
+    );
 }

@@ -1,7 +1,7 @@
 # Verified database backups
 
 `scrolls backup` creates and checks database-only recovery artifacts for shared
-format 5, writer generation 3, with Dolt 2.2.0. It is Linux-only and does not
+format 5, writer generation 4, with Dolt 2.2.0. It is Linux-only and does not
 activate a replacement service or change client bindings.
 
 Run creation on the SQL host, with a named account authorized to read the store,

@@ -195,6 +195,7 @@ fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
                 out: &out,
                 format,
                 beads: &scrolls::beads::Local::default(),
+                markdown_import: None,
                 dry_run: false,
             },
         )
@@ -279,6 +280,7 @@ fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
             out: &out,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),
+            markdown_import: None,
             dry_run: false,
         },
     )
@@ -300,6 +302,7 @@ fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
                 out: &dir.path().join("bad"),
                 format: Format::Liskov,
                 beads: &scrolls::beads::Local::default(),
+                markdown_import: None,
                 dry_run: false
             }
         )
@@ -351,6 +354,7 @@ fn native_supersession_cannot_publish_incompatible_legacy_status() {
             out: &out,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),
+            markdown_import: None,
             dry_run: false,
         },
     )
@@ -369,6 +373,7 @@ fn native_supersession_cannot_publish_incompatible_legacy_status() {
             out: &bad,
             format: Format::Liskov,
             beads: &scrolls::beads::Local::default(),
+            markdown_import: None,
             dry_run: false,
         },
     )

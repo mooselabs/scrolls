@@ -706,6 +706,9 @@ pub fn summary(g: &Graph, files: &[File]) -> Value {
     json!({"sources":g.import_sources,"members":g.import_members,"files":files.iter().map(|f|json!({"source_id":f.source_id,"path":f.file.path,"sha256":f.file.sha256,"git_oid":f.file.git_oid,"mode":f.file.mode,"size":f.size,"classification":f.classification})).collect::<Vec<_>>()})
 }
 pub fn write_plan(out: &Path, plan: &Plan) -> Result<()> {
+    write_json_plan(out, plan)
+}
+pub(crate) fn write_json_plan(out: &Path, plan: &impl Serialize) -> Result<()> {
     let parent = out
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

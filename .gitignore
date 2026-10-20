@@ -1,5 +1,5 @@
-/target/
-/.tools/
+/target
+/.tools
 /.scrolls/
 /.verification/
 
