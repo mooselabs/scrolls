@@ -1,4 +1,6 @@
 //! Pinned source snapshots, deterministic plans, provenance and ownership.
+use crate::model::import_types::tuple;
+pub use crate::model::import_types::{File, Member, Source};
 use crate::{
     cli::*,
     model::*,
@@ -21,62 +23,6 @@ pub const FILE_LIMIT: u64 = 64 * 1024 * 1024;
 pub const TOTAL_LIMIT: u64 = 1024 * 1024 * 1024;
 pub const FILE_COUNT: usize = 100_000;
 pub const CONTRACT: &str = "scrolls.import.v1:profile1:markdown1:rst1:git-raw1";
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    pub source_id: String,
-    pub repository: String,
-    pub commit: String,
-    pub tree: String,
-    pub root: String,
-    pub profile: String,
-    pub profile_hash: String,
-    pub compiled_hash: String,
-    pub schema_hash: String,
-    pub contract: String,
-    pub candidate_digest: String,
-    pub actor: String,
-    pub role: String,
-    pub imported_at: String,
-    pub op_id: String,
-    pub coverage: Value,
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct File {
-    pub source_id: String,
-    pub size: u64,
-    pub file: SourceFile,
-    pub classification: String,
-}
-impl File {
-    pub fn key(&self) -> String {
-        tuple("scrolls.import.file.v1", &self.source_id, &self.file.path)
-    }
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Member {
-    pub source_id: String,
-    pub key: String,
-    pub record_id: String,
-    pub path: String,
-    pub codec: String,
-    pub rule: String,
-    pub metadata: Value,
-    pub spans: Vec<Value>,
-    pub baseline: Record,
-    pub references: Vec<Value>,
-    pub edges: BTreeMap<String, Edge>,
-}
-impl Member {
-    pub fn row_key(&self) -> String {
-        tuple("scrolls.import.member.v1", &self.source_id, &self.key)
-    }
-}
-fn tuple(version: &str, source: &str, key: &str) -> String {
-    digest(serde_json::to_vec(&json!([version, source, key])).unwrap())
-}
 pub fn record_id(source: &str, key: &str) -> String {
     format!("sc-{}", tuple("scrolls.import.record.v1", source, key))
 }
