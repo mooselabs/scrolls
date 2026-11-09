@@ -3,6 +3,84 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum Role {
+    Human,
+    Agent,
+}
+impl Role {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+pub(crate) mod import_types {
+    use super::{Edge, Record, SourceFile, digest};
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct Source {
+        pub source_id: String,
+        pub repository: String,
+        pub commit: String,
+        pub tree: String,
+        pub root: String,
+        pub profile: String,
+        pub profile_hash: String,
+        pub compiled_hash: String,
+        pub schema_hash: String,
+        pub contract: String,
+        pub candidate_digest: String,
+        pub actor: String,
+        pub role: String,
+        pub imported_at: String,
+        pub op_id: String,
+        pub coverage: Value,
+    }
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct File {
+        pub source_id: String,
+        pub size: u64,
+        pub file: SourceFile,
+        pub classification: String,
+    }
+    impl File {
+        pub fn key(&self) -> String {
+            tuple("scrolls.import.file.v1", &self.source_id, &self.file.path)
+        }
+    }
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct Member {
+        pub source_id: String,
+        pub key: String,
+        pub record_id: String,
+        pub path: String,
+        pub codec: String,
+        pub rule: String,
+        pub metadata: Value,
+        pub spans: Vec<Value>,
+        pub baseline: Record,
+        pub references: Vec<Value>,
+        pub edges: BTreeMap<String, Edge>,
+    }
+    impl Member {
+        pub fn row_key(&self) -> String {
+            tuple("scrolls.import.member.v1", &self.source_id, &self.key)
+        }
+    }
+    pub(crate) fn tuple(version: &str, source: &str, key: &str) -> String {
+        digest(serde_json::to_vec(&json!([version, source, key])).unwrap())
+    }
+}
+
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -150,8 +228,8 @@ pub struct Proposal {
 }
 #[derive(Clone, Default, Debug)]
 pub struct Graph {
-    pub import_sources: BTreeMap<String, crate::source_import::Source>,
-    pub import_members: BTreeMap<String, crate::source_import::Member>,
+    pub import_sources: BTreeMap<String, import_types::Source>,
+    pub import_members: BTreeMap<String, import_types::Member>,
     pub schema: crate::schema::Schema,
     pub records: BTreeMap<String, Record>,
     pub edges: BTreeMap<String, Edge>,

@@ -119,7 +119,7 @@ pub struct Guard {
     #[serde(default)]
     pub direction: Direction,
 }
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Incoming,

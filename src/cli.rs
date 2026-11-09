@@ -1,5 +1,8 @@
+// BKLG-20261108-6zdg: retain the public CLI path while the model owns Role.
+pub use crate::model::Role;
+use crate::schema::Direction;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::PathBuf;
 #[derive(Parser, Debug, Serialize)]
 #[command(
@@ -32,17 +35,27 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Cmd,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq)]
-pub enum Role {
-    Human,
-    Agent,
+impl ValueEnum for Role {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Human, Self::Agent]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.name()))
+    }
 }
-impl Role {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Agent => "agent",
-        }
+
+impl ValueEnum for Direction {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Incoming, Self::Outgoing, Self::Both]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Incoming => "incoming",
+            Self::Outgoing => "outgoing",
+            Self::Both => "both",
+        }))
     }
 }
 #[derive(Debug, Serialize, Args)]
@@ -449,4 +462,67 @@ pub enum BackupCommand {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_direction(args: &[&str]) -> Direction {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Cmd::Walk { direction, .. } = cli.command else {
+            panic!("expected walk command");
+        };
+        direction
+    }
+
+    #[test]
+    fn walk_direction_incoming() {
+        assert_eq!(
+            walk_direction(&["scrolls", "walk", "record", "--direction", "incoming"]),
+            Direction::Incoming
+        );
+    }
+
+    #[test]
+    fn walk_direction_outgoing() {
+        assert_eq!(
+            walk_direction(&["scrolls", "walk", "record", "--direction", "outgoing"]),
+            Direction::Outgoing
+        );
+    }
+
+    #[test]
+    fn walk_direction_both() {
+        assert_eq!(
+            walk_direction(&["scrolls", "walk", "record", "--direction", "both"]),
+            Direction::Both
+        );
+    }
+
+    #[test]
+    fn walk_direction_defaults_to_both() {
+        assert_eq!(
+            walk_direction(&["scrolls", "walk", "record"]),
+            Direction::Both
+        );
+    }
+
+    #[test]
+    fn role_human() {
+        let cli = Cli::try_parse_from(["scrolls", "--role", "human", "walk", "record"]).unwrap();
+        assert_eq!(cli.role, Role::Human);
+    }
+
+    #[test]
+    fn role_agent() {
+        let cli = Cli::try_parse_from(["scrolls", "--role", "agent", "walk", "record"]).unwrap();
+        assert_eq!(cli.role, Role::Agent);
+    }
+
+    #[test]
+    fn role_defaults_to_agent() {
+        let cli = Cli::try_parse_from(["scrolls", "walk", "record"]).unwrap();
+        assert_eq!(cli.role, Role::Agent);
+    }
 }
