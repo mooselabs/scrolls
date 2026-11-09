@@ -1,3 +1,4 @@
+// BKLG-20261108-6zdg: retain the public CLI path while the model owns Role.
 pub use crate::model::Role;
 use crate::schema::Direction;
 use clap::{Args, Parser, Subcommand, ValueEnum};

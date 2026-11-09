@@ -1,5 +1,6 @@
 //! Pinned source snapshots, deterministic plans, provenance and ownership.
 use crate::model::import_types::tuple;
+// BKLG-20261108-6zdg: retain public importer paths for the model-owned types.
 pub use crate::model::import_types::{File, Member, Source};
 use crate::{
     cli::*,
