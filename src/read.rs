@@ -1,5 +1,13 @@
 //! Typed knowledge reads shared by CLI and HTTP. No audit, recovery or mutation.
-use crate::{beads::Local, cli::Filters, model::*, query, schema::Direction, storage::Store};
+use crate::{
+    beads::Local,
+    cli::Filters,
+    model::*,
+    query,
+    schema::Direction,
+    storage::Store,
+    store::{self, KnowledgeStore},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::PathBuf, time::Duration};
@@ -212,7 +220,7 @@ impl Snapshot {
 
 /// Proposal inspection uses immutable revisions and never checks out a branch.
 /// Both transports call this while holding their operation lock.
-pub fn proposal_detail(store: &Store, name: &str) -> Result<Value> {
+pub fn proposal_detail(store: &dyn KnowledgeStore, name: &str) -> Result<Value> {
     let proposal = store
         .proposals()?
         .into_iter()
@@ -221,10 +229,10 @@ pub fn proposal_detail(store: &Store, name: &str) -> Result<Value> {
     let main = store.head("main")?;
     let revision = store.head(name)?;
     let ancestor = store.merge_base(&main, &revision)?;
-    let proposed = store.graph_at(&revision)?;
-    crate::markdown_import::health(store, &store.graph_at(&main)?, Some(&main))?;
+    let proposed = store::graph(store, Some(&revision))?;
+    crate::markdown_import::health(store, &store::graph(store, Some(&main))?, Some(&main))?;
     crate::markdown_import::health(store, &proposed, Some(&revision))?;
-    let old = store.graph_at(&ancestor)?;
+    let old = store::graph(store, Some(&ancestor))?;
     let ids: BTreeSet<_> = old.records.keys().chain(proposed.records.keys()).collect();
     let changes: Vec<_> = ids
         .into_iter()
@@ -232,17 +240,14 @@ pub fn proposal_detail(store: &Store, name: &str) -> Result<Value> {
         .map(|id| json!({"id":id,"before":old.records.get(id),"after":proposed.records.get(id)}))
         .collect();
     Ok(
-        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":crate::review_token::ReviewToken::new(name,&main,&revision).encode()?,"merge_base":ancestor,"records":changes,"graph_diff":store.diff_text(&main,&revision,"edges")?,"configuration_diff":store.diff_text(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store.import_files_at(&revision)?)}),
+        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":crate::review_token::ReviewToken::new(name,&main,&revision).encode()?,"merge_base":ancestor,"records":changes,"graph_diff":store.diff(&main,&revision,"edges")?,"configuration_diff":store.diff(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store::import_files(store, Some(&revision))?)}),
     )
 }
 
-pub fn history(store: &Store, revision: &str, id: Option<&str>) -> Result<Vec<Value>> {
+pub fn history(store: &dyn KnowledgeStore, revision: &str, id: Option<&str>) -> Result<Vec<Value>> {
     if let Some(id) = id {
-        store.sql(&format!("SELECT commit_hash,committer,commit_date,payload FROM dolt_history_records AS OF {} WHERE id={} ORDER BY commit_date,commit_hash,payload",crate::storage::revision_literal(revision),crate::storage::literal(id)))
+        store.history(revision, id)
     } else {
-        store.sql(&format!(
-            "SELECT * FROM DOLT_LOG({}) ORDER BY date,commit_hash",
-            crate::storage::literal(revision)
-        ))
+        store.log(revision)
     }
 }
