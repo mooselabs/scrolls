@@ -120,89 +120,50 @@ impl Store {
         })
         .transpose()
     }
-    fn import_rows<T: DeserializeOwned>(
-        &self,
-        table: &str,
-        rev: Option<&str>,
-        key: fn(&T) -> String,
-    ) -> Result<Vec<T>> {
+    /// Read keyed payloads in the selected view. Metadata retains its historical
+    /// unordered health query; graph/import tables retain their keyed ordering.
+    pub fn read_rows(&self, table: &str, rev: Option<&str>) -> Result<Vec<(String, String)>> {
         let at = rev
             .map(|r| format!(" AS OF {}", revision_literal(r)))
             .unwrap_or_default();
-        self.sql(&format!("SELECT id,payload FROM {table}{at} ORDER BY id"))?
+        let order = if table == "metadata" {
+            ""
+        } else {
+            " ORDER BY id"
+        };
+        self.sql(&format!("SELECT id,payload FROM {table}{at}{order}"))?
             .into_iter()
             .map(|row| {
-                let value: T =
-                    serde_json::from_str(row["payload"].as_str().context("import payload")?)?;
-                anyhow::ensure!(
-                    row["id"] == key(&value),
-                    "{}: invalid keyed row in {table}",
-                    if table.starts_with("import_") {
-                        "source_ownership"
-                    } else {
-                        "stored_row_identity"
-                    }
-                );
-                Ok(value)
+                Ok((
+                    row["id"].as_str().context("missing row key")?.into(),
+                    row["payload"].as_str().context("missing payload")?.into(),
+                ))
             })
             .collect()
     }
+    pub fn read_one(&self, table: &str, id: &str, rev: Option<&str>) -> Result<Option<String>> {
+        let at = rev
+            .map(|r| format!(" AS OF {}", revision_literal(r)))
+            .unwrap_or_default();
+        self.sql(&format!(
+            "SELECT payload FROM {table}{at} WHERE id={}",
+            literal(id)
+        ))?
+        .first()
+        .map(|row| Ok(row["payload"].as_str().context("missing payload")?.into()))
+        .transpose()
+    }
     pub fn import_files(&self) -> Result<Vec<crate::source_import::File>> {
-        if self.one::<u32>("metadata", "schema")?.unwrap_or(1) < 4 {
-            return Ok(vec![]);
-        }
-        self.import_rows("import_files", None, crate::source_import::File::key)
+        crate::store::import_files(self, None)
     }
     pub fn shared_query_limit(&self) -> Option<usize> {
         self.shared.as_ref().map(|s| s.query_limit())
     }
     pub fn import_files_at(&self, rev: &str) -> Result<Vec<crate::source_import::File>> {
-        if self.one_at::<u32>("metadata", "schema", rev)?.unwrap_or(1) < 4 {
-            return Ok(vec![]);
-        }
-        self.import_rows("import_files", Some(rev), crate::source_import::File::key)
+        crate::store::import_files(self, Some(rev))
     }
     pub fn graph_at(&self, rev: &str) -> Result<Graph> {
-        let format = self.one_at::<u32>("metadata", "schema", rev)?.unwrap_or(1);
-        let mut g = Graph {
-            schema: self
-                .one_at("metadata", "ontology", rev)?
-                .unwrap_or_default(),
-            records: self
-                .import_rows::<Record>("records", Some(rev), |r| r.id.clone())?
-                .into_iter()
-                .map(|mut r| {
-                    r.normalize_metadata();
-                    (r.id.clone(), r)
-                })
-                .collect(),
-            edges: self
-                .import_rows::<Edge>("edges", Some(rev), Edge::key)?
-                .into_iter()
-                .map(|e| (e.key(), e))
-                .collect(),
-            ..Graph::default()
-        };
-        if format >= 4 {
-            g.import_sources = self
-                .import_rows::<crate::source_import::Source>("import_sources", Some(rev), |s| {
-                    s.source_id.clone()
-                })?
-                .into_iter()
-                .map(|s| (s.source_id.clone(), s))
-                .collect();
-            g.import_members = self
-                .import_rows::<crate::source_import::Member>(
-                    "import_members",
-                    Some(rev),
-                    crate::source_import::Member::row_key,
-                )?
-                .into_iter()
-                .map(|m| (m.record_id.clone(), m))
-                .collect();
-        }
-        crate::source_import::validate(&g)?;
-        Ok(g)
+        crate::store::graph(self, Some(rev))
     }
     fn migration_journal(&self, value: &Value) -> Result<()> {
         let mut f = tempfile::NamedTempFile::new_in(&self.root)?;
@@ -754,44 +715,7 @@ impl Store {
         .transpose()
     }
     pub fn graph(&self) -> Result<Graph> {
-        let format = self.one::<u32>("metadata", "schema")?.unwrap_or(1);
-        let mut g = Graph {
-            schema: self.one("metadata", "ontology")?.unwrap_or_default(),
-            records: self
-                .import_rows::<Record>("records", None, |r| r.id.clone())?
-                .into_iter()
-                .map(|mut r| {
-                    r.normalize_metadata();
-                    (r.id.clone(), r)
-                })
-                .collect(),
-            edges: self
-                .import_rows::<Edge>("edges", None, Edge::key)?
-                .into_iter()
-                .map(|e| (e.key(), e))
-                .collect(),
-            ..Graph::default()
-        };
-        if format >= 4 {
-            g.import_sources = self
-                .import_rows::<crate::source_import::Source>("import_sources", None, |s| {
-                    s.source_id.clone()
-                })?
-                .into_iter()
-                .map(|s| (s.source_id.clone(), s))
-                .collect();
-            g.import_members = self
-                .import_rows::<crate::source_import::Member>(
-                    "import_members",
-                    None,
-                    crate::source_import::Member::row_key,
-                )?
-                .into_iter()
-                .map(|m| (m.record_id.clone(), m))
-                .collect();
-        }
-        crate::source_import::validate(&g)?;
-        Ok(g)
+        crate::store::graph(self, None)
     }
     pub fn transaction(&self, changes: &str, message: &str, actor: &str) -> Result<()> {
         if let Some(session) = &self.shared {
@@ -840,6 +764,19 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    pub fn history(&self, revision: &str, id: &str) -> Result<Vec<Value>> {
+        self.sql(&format!("SELECT commit_hash,committer,commit_date,payload FROM dolt_history_records AS OF {} WHERE id={} ORDER BY commit_date,commit_hash,payload",revision_literal(revision),literal(id)))
+    }
+    pub fn log(&self, revision: &str) -> Result<Vec<Value>> {
+        self.sql(&format!(
+            "SELECT * FROM DOLT_LOG({}) ORDER BY date,commit_hash",
+            literal(revision)
+        ))
+    }
+    /// Dolt-only review guard spanning the current working set and main.
+    pub(crate) fn merged_review_guards(&self) -> Result<Vec<Value>> {
+        self.sql("SELECT payload FROM metadata WHERE id LIKE 'guard:%' AND id NOT IN (SELECT id FROM metadata AS OF 'main' WHERE id LIKE 'guard:%')")
     }
     pub fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
         if self.is_shared() {

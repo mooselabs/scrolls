@@ -878,8 +878,10 @@ pub(crate) fn validate_merged_review(
         .map(|i| i.lint_debt)
         .unwrap_or_default();
     let mut requirements = vec![];
-    for row in s.sql("SELECT payload FROM metadata WHERE id LIKE 'guard:%' AND id NOT IN (SELECT id FROM metadata AS OF 'main' WHERE id LIKE 'guard:%')")? {
-        requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(row["payload"].as_str().context("guard payload")?)?);
+    for row in s.merged_review_guards()? {
+        requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(
+            row["payload"].as_str().context("guard payload")?,
+        )?);
     }
     let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
     validate_review_candidate(

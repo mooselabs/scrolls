@@ -4,6 +4,7 @@ use crate::{
     import::{GitEntry, Imported},
     model::*,
     storage::{self, Store, put},
+    store::KnowledgeStore,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -421,39 +422,22 @@ pub fn health_content(
         json!({"enabled":true,"files":files.len(),"bytes":total,"checksums_valid":true,"candidate_digest":plan.candidate_digest}),
     )
 }
-pub fn health(s: &Store, g: &Graph, rev: Option<&str>) -> Result<Value> {
-    let metadata: BTreeMap<String, Value> = if let Some(rev) = rev {
-        s.sql(&format!(
-            "SELECT id,payload FROM metadata AS OF {}",
-            storage::revision_literal(rev)
-        ))?
-    } else {
-        s.sql("SELECT id,payload FROM metadata")?
-    }
-    .iter()
-    .map(|r| {
-        Ok((
-            r["id"].as_str().context("metadata key")?.into(),
-            serde_json::from_str(r["payload"].as_str().context("metadata payload")?)?,
-        ))
-    })
-    .collect::<Result<_>>()?;
+pub fn health(s: &dyn KnowledgeStore, g: &Graph, rev: Option<&str>) -> Result<Value> {
+    let metadata: BTreeMap<String, Value> = s
+        .rows("metadata", rev)?
+        .into_iter()
+        .map(|(id, payload)| Ok((id, serde_json::from_str(&payload)?)))
+        .collect::<Result<_>>()?;
     let Some(plan) = metadata.get("markdown_import") else {
         return Ok(json!({"enabled":false}));
     };
-    let at = rev
-        .map(|r| format!(" AS OF {}", storage::revision_literal(r)))
-        .unwrap_or_default();
     let files = s
-        .sql(&format!(
-            "SELECT id,payload FROM source_files{at} ORDER BY id"
-        ))?
-        .iter()
-        .map(|r| {
-            let f: SourceFile =
-                serde_json::from_str(r["payload"].as_str().context("Markdown source payload")?)?;
+        .rows("source_files", rev)?
+        .into_iter()
+        .map(|(id, payload)| {
+            let f: SourceFile = serde_json::from_str(&payload)?;
             ensure!(
-                r["id"].as_str() == Some(f.path.as_str()),
+                id == f.path,
                 "markdown_original_integrity: source row identity mismatch"
             );
             Ok(f)
