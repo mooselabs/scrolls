@@ -1,16 +1,115 @@
-//! Knowledge reads and graph assembly, independent of the storage backend.
+//! Typed knowledge changes, reads and graph assembly, independent of the backend.
 use crate::{model::*, source_import, storage::Store};
 use anyhow::Result;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-/// The read surface of the knowledge engine. Revisions and payloads keep their
+/// A row after-image or edge deletion. Payloads are serialized once, preserving
+/// struct field order for existing stores and proposal protocols.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    Put {
+        table: String,
+        id: String,
+        payload: String,
+    },
+    Insert {
+        table: String,
+        id: String,
+        payload: String,
+    },
+    DeleteEdge {
+        id: String,
+    },
+}
+
+impl Change {
+    pub fn put<T: Serialize>(table: &str, id: &str, value: &T) -> Result<Self> {
+        Ok(Self::Put {
+            table: table.into(),
+            id: id.into(),
+            payload: serde_json::to_string(value)?,
+        })
+    }
+    pub fn insert<T: Serialize>(table: &str, id: &str, value: &T) -> Result<Self> {
+        Ok(Self::Insert {
+            table: table.into(),
+            id: id.into(),
+            payload: serde_json::to_string(value)?,
+        })
+    }
+}
+
+/// An ordered, atomic batch. Order matters for graph writes, immutable imports
+/// and the receipt that accompanies them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub changes: Vec<Change>,
+}
+
+impl From<Change> for ChangeSet {
+    fn from(change: Change) -> Self {
+        Self {
+            changes: vec![change],
+        }
+    }
+}
+
+impl ChangeSet {
+    pub fn push(&mut self, change: Change) {
+        self.changes.push(change);
+    }
+    pub fn extend(&mut self, other: Self) {
+        self.changes.extend(other.changes);
+    }
+    pub fn graph(before: &Graph, after: &Graph) -> Result<Self> {
+        let mut changes = Self::default();
+        for (id, r) in &after.records {
+            if before.records.get(id) != Some(r) {
+                changes.push(Change::put("records", id, r)?);
+            }
+        }
+        for (id, e) in &after.edges {
+            if before.edges.get(id) != Some(e) {
+                changes.push(Change::put("edges", id, e)?);
+            }
+        }
+        for id in before.edges.keys() {
+            if !after.edges.contains_key(id) {
+                changes.push(Change::DeleteEdge { id: id.clone() });
+            }
+        }
+        Ok(changes)
+    }
+}
+
+/// The read and write surface of the knowledge engine. Revisions and payloads keep their
 /// backend representation until the later ADR-0280 format-neutrality cut.
 ///
 /// `at: None` always selects the session's current view, including uncommitted
 /// writes in its open transaction. `Some(at)` selects that ref or revision.
 /// Rows are `(id, JSON payload)` pairs; their order is supplied by the backend.
 pub trait KnowledgeStore {
+    fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()>;
+    /// Commit on the shared session, validating its uncommitted view before
+    /// persistence. `owned` retains the existing temporary-working-set policy.
+    fn commit_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        owned: bool,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String>;
+    /// The shared Markdown bulk transport keeps the same atomic validation.
+    fn commit_markdown_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String>;
+    fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>>;
     fn head(&self, reference: &str) -> Result<String>;
     fn revision(&self) -> Result<String>;
     fn branches(&self) -> Result<Vec<String>>;
@@ -26,6 +125,31 @@ pub trait KnowledgeStore {
 }
 
 impl KnowledgeStore for Store {
+    fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
+        self.transaction(&changes.to_sql(), message, actor)
+    }
+    fn commit_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        owned: bool,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String> {
+        self.commit_shared_checked(&changes.to_sql(), message, actor, owned, validate)
+    }
+    fn commit_markdown_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String> {
+        self.commit_shared_markdown_checked(&changes.to_sql(), message, actor, validate)
+    }
+    fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
+        Store::receipt(self, op, hash)
+    }
     fn head(&self, reference: &str) -> Result<String> {
         Store::head(self, reference)
     }
@@ -160,6 +284,31 @@ mod tests {
         tables: BTreeMap<String, Vec<(String, String)>>,
     }
     impl KnowledgeStore for Fixture {
+        fn commit(&self, _: &ChangeSet, _: &str, _: &str) -> Result<()> {
+            anyhow::bail!("unexpected commit")
+        }
+        fn commit_checked(
+            &self,
+            _: &ChangeSet,
+            _: &str,
+            _: &str,
+            _: bool,
+            _: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<String> {
+            anyhow::bail!("unexpected checked commit")
+        }
+        fn commit_markdown_checked(
+            &self,
+            _: &ChangeSet,
+            _: &str,
+            _: &str,
+            _: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<String> {
+            anyhow::bail!("unexpected Markdown commit")
+        }
+        fn receipt(&self, _: &str, _: &str) -> Result<Option<Value>> {
+            anyhow::bail!("unexpected receipt read")
+        }
         fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
             assert_eq!(at, self.at);
             Ok(self.tables.get(table).cloned().unwrap_or_default())

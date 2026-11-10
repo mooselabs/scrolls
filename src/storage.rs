@@ -4,7 +4,10 @@ mod inspection;
 pub mod session;
 pub mod shared;
 pub mod shared_review;
-use crate::model::*;
+use crate::{
+    model::*,
+    store::{Change, ChangeSet},
+};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -847,39 +850,46 @@ impl Store {
         Ok(())
     }
 }
+impl ChangeSet {
+    /// Dolt encoding, kept byte-identical for the shared proposal parser and
+    /// Markdown bulk transport. Engine code builds changes without SQL text.
+    pub fn to_sql(&self) -> String {
+        let mut sql = String::new();
+        for change in &self.changes {
+            match change {
+                Change::Put { table, id, payload } | Change::Insert { table, id, payload } => {
+                    let verb = if matches!(change, Change::Put { .. }) {
+                        "REPLACE"
+                    } else {
+                        "INSERT"
+                    };
+                    sql.push_str(&format!(
+                        "{verb} INTO {table} (id,payload) VALUES ({},{});\n",
+                        literal(id),
+                        literal(payload),
+                    ));
+                }
+                Change::DeleteEdge { id } => {
+                    sql.push_str(&format!("DELETE FROM edges WHERE id={};", literal(id)));
+                }
+            }
+        }
+        sql
+    }
+}
+
 /// Append immutable rows. Duplicate keys must fail rather than replace a tuple.
+/// BKLG-20261108-enit: retain the String API used by existing callers.
 pub fn insert<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
-    Ok(format!(
-        "INSERT INTO {table} (id,payload) VALUES ({},{});\n",
-        literal(id),
-        literal(&serde_json::to_string(value)?)
-    ))
+    Ok(ChangeSet::from(Change::insert(table, id, value)?).to_sql())
 }
+/// BKLG-20261108-enit: retain the String API used by existing callers.
 pub fn put<T: Serialize>(table: &str, id: &str, value: &T) -> Result<String> {
-    Ok(format!(
-        "REPLACE INTO {table} (id,payload) VALUES ({},{});\n",
-        literal(id),
-        literal(&serde_json::to_string(value)?)
-    ))
+    Ok(ChangeSet::from(Change::put(table, id, value)?).to_sql())
 }
+/// BKLG-20261108-enit: retain the String API used by existing callers.
 pub fn graph_changes(before: &Graph, after: &Graph) -> Result<String> {
-    let mut sql = String::new();
-    for (id, r) in &after.records {
-        if before.records.get(id) != Some(r) {
-            sql.push_str(&put("records", id, r)?);
-        }
-    }
-    for (id, e) in &after.edges {
-        if before.edges.get(id) != Some(e) {
-            sql.push_str(&put("edges", id, e)?);
-        }
-    }
-    for id in before.edges.keys() {
-        if !after.edges.contains_key(id) {
-            sql.push_str(&format!("DELETE FROM edges WHERE id={};", literal(id)));
-        }
-    }
-    Ok(sql)
+    Ok(ChangeSet::graph(before, after)?.to_sql())
 }
 
 #[cfg(test)]

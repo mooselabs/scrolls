@@ -382,7 +382,7 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                 &json!({"command":command,"actor":actor,"revision":revision}),
             )?);
             // Detect collisions with both graph-operation and publication receipts.
-            let _ = store.receipt(&op, &hash)?;
+            let _ = crate::store::KnowledgeStore::receipt(store, &op, &hash)?;
             if let Some(old) = local.operations.get(&op) {
                 ensure!(
                     old["hash"] == hash,
