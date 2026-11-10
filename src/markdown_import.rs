@@ -3,8 +3,8 @@ use crate::{
     cli::*,
     import::{GitEntry, Imported},
     model::*,
-    storage::{self, Store, put},
-    store::KnowledgeStore,
+    storage::{self, Store},
+    store::{Change, ChangeSet, KnowledgeStore},
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -249,7 +249,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 s.one::<String>("metadata", "store_id")?.as_deref() == Some(&plan.store_id),
                 "stale_plan: wrong store UUID"
             );
-            if let Some(result) = s.receipt(op, &hash)? {
+            if let Some(result) = KnowledgeStore::receipt(&s, op, &hash)? {
                 return response(&s, result);
             }
             storage::shared_review::check_identity(&s, op, &hash)?;
@@ -265,12 +265,12 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 health(&s, &before, None)?;
                 let result = json!({"identical_replay":true,"import":plan.summary["import"],"branch":"main","op_id":op});
                 if !cli.dry_run {
-                    s.commit_shared_checked(
-                        &crate::app::receipt(op, &hash, actor, &cli.command, &result)?,
+                    s.commit_checked(
+                        &crate::app::receipt_changes(op, &hash, actor, &cli.command, &result)?,
                         "record identical Markdown replay",
                         actor,
                         false,
-                        || Ok(()),
+                        &mut || Ok(()),
                     )?;
                 }
                 return response(
@@ -297,28 +297,29 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     && i.graph.records.keys().cloned().collect::<Vec<_>>() == plan.record_ids,
                 "stale_plan: pinned Markdown candidate changed"
             );
-            let mut sql = storage::graph_changes(&before, &i.graph)?;
+            let mut changes = ChangeSet::graph(&before, &i.graph)?;
             for f in &i.files {
-                sql.push_str(&put("source_files", &f.path, f)?);
+                changes.push(Change::put("source_files", &f.path, f)?);
             }
-            sql.push_str(&put("metadata", "import", &i.info)?);
-            sql.push_str(&put("metadata", "routing", &i.routing)?);
-            sql.push_str(&put(
+            changes.push(Change::put("metadata", "import", &i.info)?);
+            changes.push(Change::put("metadata", "routing", &i.routing)?);
+            changes.push(Change::put(
                 "metadata",
                 "import_edges",
                 &i.graph.edges.values().collect::<Vec<_>>(),
             )?);
-            sql.push_str(&put("metadata", "markdown_import", &plan)?);
+            changes.push(Change::put("metadata", "markdown_import", &plan)?);
             let result = json!({"import":i.info,"candidate_digest":plan.candidate_digest,"op_id":op,"branch":"main"});
-            sql.push_str(&crate::app::receipt(
+            changes.extend(crate::app::receipt_changes(
                 op,
                 &hash,
                 actor,
                 &cli.command,
                 &result,
             )?);
+            let sql_bytes = changes.to_sql().len();
             ensure!(
-                sql.len()
+                sql_bytes
                     <= s.shared_query_limit()
                         .context("missing shared SQL budget")?,
                 "input_limit: encoded Markdown SQL request exceeds the shared packet budget"
@@ -326,10 +327,10 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             if cli.dry_run {
                 return response(
                     &s,
-                    json!({"dry_run":true,"result":result,"sql_bytes":sql.len(),"shared_query_bytes":s.shared_query_limit()}),
+                    json!({"dry_run":true,"result":result,"sql_bytes":sql_bytes,"shared_query_bytes":s.shared_query_limit()}),
                 );
             }
-            s.commit_shared_markdown_checked(&sql, "bootstrap editable Markdown", actor, || {
+            s.commit_markdown_checked(&changes, "bootstrap editable Markdown", actor, &mut || {
                 let actual = s.graph()?;
                 health(&s, &actual, None)?;
                 ensure!(

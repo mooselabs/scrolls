@@ -2,7 +2,8 @@ use crate::{
     cli::*,
     model::*,
     policy, query,
-    storage::{self, Store, put},
+    storage::{self, Store},
+    store::{Change, ChangeSet, KnowledgeStore},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -60,6 +61,7 @@ fn actor(cli: &Cli) -> Result<&str> {
     }
     Ok(a)
 }
+// BKLG-20261108-enit: storage's shared review protocol still uses the String API.
 pub(crate) fn receipt(
     op: &str,
     hash: &str,
@@ -67,11 +69,21 @@ pub(crate) fn receipt(
     command: &Cmd,
     result: &Value,
 ) -> Result<String> {
-    put(
+    Ok(receipt_changes(op, hash, actor, command, result)?.to_sql())
+}
+
+pub(crate) fn receipt_changes(
+    op: &str,
+    hash: &str,
+    actor: &str,
+    command: &Cmd,
+    result: &Value,
+) -> Result<ChangeSet> {
+    Ok(ChangeSet::from(Change::put(
         "operations",
         op,
         &json!({"op_id":op,"args_hash":hash,"actor":actor,"command":command,"result":result,"committed_at":now()}),
-    )
+    )?))
 }
 pub(crate) fn wrap(store: &Store, data: Value, branch: &str) -> Result<Value> {
     Ok(
@@ -192,7 +204,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         let hash = digest(serde_json::to_vec(
             &json!({"command":"init","schema":initial_schema,"actor":cli.actor,"role":cli.role}),
         )?);
-        if let Some(result) = store.receipt(&op, &hash)? {
+        if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
             return wrap(&store, result, branch);
         }
         let result = json!({"store":store.root,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"op_id":op});
@@ -204,9 +216,15 @@ pub fn run(cli: &Cli) -> Result<Value> {
         {
             bail!("existing store configuration differs; use schema apply FILE --expect REV");
         }
-        let mut sql = put("metadata", "ontology", requested)?;
-        sql.push_str(&receipt(&op, &hash, actor(cli)?, &cli.command, &result)?);
-        store.transaction(&sql, "initialize store receipt", actor(cli)?)?;
+        let mut changes = ChangeSet::from(Change::put("metadata", "ontology", requested)?);
+        changes.extend(receipt_changes(
+            &op,
+            &hash,
+            actor(cli)?,
+            &cli.command,
+            &result,
+        )?);
+        store.commit(&changes, "initialize store receipt", actor(cli)?)?;
         return wrap(&store, result, branch);
     }
     if matches!(cli.command, Cmd::Doctor) {
@@ -231,7 +249,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         let hash = digest(serde_json::to_vec(
             &json!({"command":"migrate","actor":cli.actor,"role":cli.role}),
         )?);
-        if let Some(result) = store.receipt(&op, &hash)? {
+        if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
             return wrap(&store, result, branch);
         }
         if schema == 4 {
@@ -251,15 +269,15 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if cli.dry_run {
             return wrap(&store, json!({"dry_run":true,"result":result}), branch);
         }
-        let mut sql = put("metadata", "schema", &4)?;
+        let mut changes = ChangeSet::from(Change::put("metadata", "schema", &4)?);
         if schema < 3 {
-            sql.push_str(&put(
+            changes.push(Change::put(
                 "metadata",
                 "ontology",
                 &crate::schema::Schema::default(),
             )?);
         }
-        sql.push_str(&put("metadata", "store_id", &store_id)?);
+        changes.push(Change::put("metadata", "store_id", &store_id)?);
         // Translate legacy diagnostics from preserved import originals, never
         // from current records (which could contain new violations).
         if schema < 3 && store.one::<ImportInfo>("metadata", "import")?.is_some() {
@@ -283,18 +301,24 @@ pub fn run(cli: &Cli) -> Result<Value> {
                     .one::<Value>("metadata", "routing")?
                     .unwrap_or(json!({})),
             ));
-            sql.push_str(&put("metadata", "validation_debt", &debt)?);
+            changes.push(Change::put("metadata", "validation_debt", &debt)?);
         }
 
         for rel in ["related_work", "implemented_by", "produced_by"] {
-            sql.push_str(&put(
+            changes.push(Change::put(
                 "registry",
                 &format!("rel:{rel}"),
                 &json!({"relation":rel,"requires_why":false}),
             )?);
         }
-        sql.push_str(&receipt(&op, &hash, actor(cli)?, &cli.command, &result)?);
-        store.migrate_format4(&sql, actor(cli)?)?;
+        changes.extend(receipt_changes(
+            &op,
+            &hash,
+            actor(cli)?,
+            &cli.command,
+            &result,
+        )?);
+        store.migrate_format4(&changes.to_sql(), actor(cli)?)?;
         return wrap(&store, result, branch);
     }
     if schema < 4 && cli.command.mutation() && !matches!(cli.command, Cmd::Review { .. }) {
@@ -387,7 +411,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         return storage::shared_review::recover(&store, cli, &op, &hash);
     }
     if cli.command.mutation() {
-        if let Some(result) = store.receipt(&op, &hash)? {
+        if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
             return if store.is_shared() {
                 storage::shared_review::receipt_response(&store, result, branch)
             } else {
@@ -431,8 +455,8 @@ pub fn run(cli: &Cli) -> Result<Value> {
             if cli.dry_run {
                 return wrap(&store, json!({"dry_run":true,"result":result}), branch);
             }
-            store.transaction(
-                &receipt(&op, &hash, actor(cli)?, &cli.command, &result)?,
+            store.commit(
+                &receipt_changes(&op, &hash, actor(cli)?, &cli.command, &result)?,
                 "record identical import replay",
                 actor(cli)?,
             )?;
@@ -445,20 +469,26 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if cli.dry_run {
             return wrap(&store, json!({"dry_run":true,"result":result}), branch);
         }
-        let mut sql = storage::graph_changes(&before, &imported.graph)?;
+        let mut changes = ChangeSet::graph(&before, &imported.graph)?;
         for f in &imported.files {
-            sql.push_str(&put("source_files", &f.path, f)?);
+            changes.push(Change::put("source_files", &f.path, f)?);
         }
-        sql.push_str(&put("metadata", "import", &imported.info)?);
-        sql.push_str(&put("metadata", "routing", &imported.routing)?);
-        sql.push_str(&put(
+        changes.push(Change::put("metadata", "import", &imported.info)?);
+        changes.push(Change::put("metadata", "routing", &imported.routing)?);
+        changes.push(Change::put(
             "metadata",
             "import_edges",
             &imported.graph.edges.values().collect::<Vec<_>>(),
         )?);
-        sql.push_str(&receipt(&op, &hash, actor(cli)?, &cli.command, &result)?);
-        store.transaction(
-            &sql,
+        changes.extend(receipt_changes(
+            &op,
+            &hash,
+            actor(cli)?,
+            &cli.command,
+            &result,
+        )?);
+        store.commit(
+            &changes,
             &format!("import {} by {}", imported.info.commit, actor(cli)?),
             actor(cli)?,
         )?;
@@ -637,13 +667,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if cli.dry_run {
             return wrap(&store, json!({"dry_run":true,"result":result}), branch);
         }
-        let mut sql = storage::graph_changes(&before, &graph)?;
+        let mut changes = ChangeSet::graph(&before, &graph)?;
         if config_change {
-            sql.push_str(&put("metadata", "ontology", &graph.schema)?);
+            changes.push(Change::put("metadata", "ontology", &graph.schema)?);
         }
         let requirements = crate::mutation::requirements(&before, &graph, &ops)?;
         if !requirements.is_empty() {
-            sql.push_str(&put(
+            changes.push(Change::put(
                 "metadata",
                 &format!("guard:{}", digest(&op)),
                 &requirements,
@@ -651,19 +681,25 @@ pub fn run(cli: &Cli) -> Result<Value> {
         }
 
         if let Some(p) = proposal {
-            sql.push_str(&put("metadata", &target, &p)?);
+            changes.push(Change::put("metadata", &target, &p)?);
             if store.is_shared() {
-                sql.push_str(&receipt(&op, &hash, who, &cli.command, &result)?);
+                changes.extend(receipt_changes(&op, &hash, who, &cli.command, &result)?);
                 let result = storage::shared_review::publish_proposal(
-                    &store, cli, &p, &sql, &op, &hash, &result,
+                    &store,
+                    cli,
+                    &p,
+                    &changes.to_sql(),
+                    &op,
+                    &hash,
+                    &result,
                 )?;
                 return storage::shared_review::receipt_response(&store, result, &target);
             }
             store.run(&["checkout", "-b", &target])?;
         }
-        sql.push_str(&receipt(&op, &hash, who, &cli.command, &result)?);
-        store.transaction(
-            &sql,
+        changes.extend(receipt_changes(&op, &hash, who, &cli.command, &result)?);
+        store.commit(
+            &changes,
             &format!("{} by {who}", serde_json::to_string(&cli.command)?),
             who,
         )?;
@@ -1001,9 +1037,9 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         }
         if !cli.dry_run {
             s.checkout(&name)?;
-            let mut sql = put("metadata", &name, &proposal)?;
-            sql.push_str(&receipt(op, hash, who, &cli.command, &result)?);
-            s.transaction(&sql, &format!("reject {name}: {reason}"), who)?;
+            let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
+            changes.extend(receipt_changes(op, hash, who, &cli.command, &result)?);
+            s.commit(&changes, &format!("reject {name}: {reason}"), who)?;
         }
         return wrap(
             s,
@@ -1056,9 +1092,9 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         proposal.status = "accepted".into();
         proposal.reason = reason.map(str::to_string);
         let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
-        let mut sql = put("metadata", &name, &proposal)?;
-        sql.push_str(&receipt(op, hash, who, &cli.command, &result)?);
-        s.transaction(&sql, &format!("accept {name} by {who}"), who)?;
+        let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
+        changes.extend(receipt_changes(op, hash, who, &cli.command, &result)?);
+        s.commit(&changes, &format!("accept {name} by {who}"), who)?;
         if s.head("main")? != base {
             bail!("main changed after validation; validated merge retained on {temp}")
         }

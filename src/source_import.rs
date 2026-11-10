@@ -7,7 +7,8 @@ use crate::{
     model::*,
     policy,
     profile::{self, Profile},
-    storage::{Store, put},
+    storage::Store,
+    store::{Change, ChangeSet, KnowledgeStore},
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -668,14 +669,18 @@ pub(crate) fn write_json_plan(out: &Path, plan: &impl Serialize) -> Result<()> {
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
+// BKLG-20261108-enit: integration callers still concatenate the String API.
 pub fn persist(candidate: &Candidate) -> Result<String> {
-    let mut sql = crate::storage::insert(
+    Ok(candidate_changes(candidate)?.to_sql())
+}
+fn candidate_changes(candidate: &Candidate) -> Result<ChangeSet> {
+    let mut changes = ChangeSet::from(Change::insert(
         "import_sources",
         &candidate.source.source_id,
         &candidate.source,
-    )?;
+    )?);
     for f in &candidate.files {
-        sql.push_str(&crate::storage::insert("import_files", &f.key(), f)?);
+        changes.push(Change::insert("import_files", &f.key(), f)?);
     }
     for m in candidate
         .graph
@@ -683,9 +688,9 @@ pub fn persist(candidate: &Candidate) -> Result<String> {
         .values()
         .filter(|m| m.source_id == candidate.source.source_id)
     {
-        sql.push_str(&crate::storage::insert("import_members", &m.row_key(), m)?);
+        changes.push(Change::insert("import_members", &m.row_key(), m)?);
     }
-    Ok(sql)
+    Ok(changes)
 }
 pub fn same(a: &Source, b: &Source) -> bool {
     a.source_id == b.source_id
@@ -914,7 +919,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     "stale_plan: wrong store UUID"
                 );
                 // Completed operation retry precedes every stale-base and source-object check.
-                if let Some(result) = s.receipt(op, &hash)? {
+                if let Some(result) = KnowledgeStore::receipt(&*s, op, &hash)? {
                     return response(&s, replay(&s, result)?);
                 }
                 let g = s.graph_at(&rev)?;
@@ -976,7 +981,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             );
             let s = import_store(cli, shared.as_ref(), false)?;
             s.checkout("main")?;
-            if let Some(result) = s.receipt(op, &hash)? {
+            if let Some(result) = KnowledgeStore::receipt(&*s, op, &hash)? {
                 return response(&s, replay(&s, result)?);
             }
             ensure!(
@@ -1017,8 +1022,8 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 .graph
                 .import_sources
                 .insert(candidate.source.source_id.clone(), candidate.source.clone());
-            let mut sql = crate::storage::graph_changes(&before, &candidate.graph)?;
-            sql.push_str(&persist(&candidate)?);
+            let mut changes = ChangeSet::graph(&before, &candidate.graph)?;
+            changes.extend(candidate_changes(&candidate)?);
             let proposal = protected.then(|| Proposal {
                 branch: target.clone(),
                 base: plan.main_revision.clone(),
@@ -1027,13 +1032,25 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 reason: None,
             });
             if let Some(p) = &proposal {
-                sql.push_str(&put("metadata", &target, p)?);
+                changes.push(Change::put("metadata", &target, p)?);
             }
-            sql.push_str(&put("operations",op,&json!({"op_id":op,"args_hash":hash,"actor":actor,"command":cli.command,"result":result,"committed_at":now()}))?);
+            changes.extend(crate::app::receipt_changes(
+                op,
+                &hash,
+                actor,
+                &cli.command,
+                &result,
+            )?);
             if let Some(p) = &proposal {
                 if s.is_shared() {
                     let published = crate::storage::shared_review::publish_proposal(
-                        &s, cli, p, &sql, op, &hash, &result,
+                        &s,
+                        cli,
+                        p,
+                        &changes.to_sql(),
+                        op,
+                        &hash,
+                        &result,
                     )?;
                     return response(&s, published);
                 }
@@ -1041,7 +1058,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             }
             let message = format!("import source {} by {actor}", candidate.source.source_id);
             if s.is_shared() {
-                s.commit_shared_checked(&sql, &message, actor, false, || {
+                s.commit_checked(&changes, &message, actor, false, &mut || {
                     let actual = s.graph()?;
                     policy::validate_change(&before, &actual, &BTreeSet::new())?;
                     crate::source_import::health(&actual, &s.import_files()?)?;
@@ -1051,7 +1068,7 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     Ok(())
                 })?;
             } else {
-                s.transaction(&sql, &message, actor)?;
+                s.commit(&changes, &message, actor)?;
             }
             response(&s, result)
         }
@@ -1194,7 +1211,7 @@ fn noop_receipt(
     }
     let s = import_store(cli, shared, false)?;
     s.checkout("main")?;
-    if let Some(existing) = s.receipt(op, hash)? {
+    if let Some(existing) = KnowledgeStore::receipt(&*s, op, hash)? {
         return response(&s, replay(&s, existing)?);
     }
     ensure!(
@@ -1219,14 +1236,14 @@ fn noop_receipt(
         same(source, &plan.source) && source.candidate_digest == plan.source.candidate_digest,
         "source_update_unsupported: source differs"
     );
-    let sql = put(
-        "operations",
-        op,
-        &json!({"op_id":op,"args_hash":hash,"actor":plan.actor,"command":cli.command,"result":result,"committed_at":now()}),
-    )?;
+    let changes = crate::app::receipt_changes(op, hash, &plan.actor, &cli.command, &result)?;
     // A receipt changes no captured data. Keeping it on the source branch preserves proposal isolation.
     s.checkout(branch)?;
-    s.transaction(&sql, "record identical source import retry", &plan.actor)?;
+    s.commit(
+        &changes,
+        "record identical source import retry",
+        &plan.actor,
+    )?;
     response(&s, replay(&s, result)?)
 }
 
