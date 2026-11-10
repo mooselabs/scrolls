@@ -2,6 +2,7 @@ use crate::{
     cli::*,
     model::*,
     policy, query,
+    review::{receipt_changes, validate_merged_review, wrap},
     storage::{self, Store},
     store::{Change, ChangeSet, KnowledgeStore},
 };
@@ -61,35 +62,54 @@ fn actor(cli: &Cli) -> Result<&str> {
     }
     Ok(a)
 }
-// BKLG-20261108-enit: storage's shared review protocol still uses the String API.
-pub(crate) fn receipt(
-    op: &str,
-    hash: &str,
-    actor: &str,
-    command: &Cmd,
-    result: &Value,
-) -> Result<String> {
-    Ok(receipt_changes(op, hash, actor, command, result)?.to_sql())
+impl Cli {
+    pub(crate) fn operation_context(
+        &self,
+        op: &str,
+        hash: &str,
+    ) -> Result<crate::review::OperationContext> {
+        use crate::review::{OperationContext, RecoveryRequest, ReviewRequest};
+        let review = match &self.command {
+            Cmd::Review {
+                action,
+                review_token,
+                reason,
+                ..
+            } => Some(ReviewRequest {
+                action: action.clone(),
+                token: review_token.clone(),
+                reason: reason.clone(),
+            }),
+            _ => None,
+        };
+        let recovery = match &self.command {
+            Cmd::Recover {
+                operation,
+                abandon,
+                resume,
+                reason,
+            } => Some(RecoveryRequest {
+                operation: operation.clone(),
+                abandon: *abandon,
+                resume: *resume,
+                reason: reason.clone(),
+            }),
+            _ => None,
+        };
+        Ok(OperationContext {
+            op_id: op.into(),
+            args_hash: hash.into(),
+            explicit_op_id: self.op_id.is_some(),
+            actor: self.actor.clone(),
+            role: self.role,
+            dry_run: self.dry_run,
+            command: serde_json::to_value(&self.command)?,
+            review,
+            recovery,
+        })
+    }
 }
 
-pub(crate) fn receipt_changes(
-    op: &str,
-    hash: &str,
-    actor: &str,
-    command: &Cmd,
-    result: &Value,
-) -> Result<ChangeSet> {
-    Ok(ChangeSet::from(Change::put(
-        "operations",
-        op,
-        &json!({"op_id":op,"args_hash":hash,"actor":actor,"command":command,"result":result,"committed_at":now()}),
-    )?))
-}
-pub(crate) fn wrap(store: &Store, data: Value, branch: &str) -> Result<Value> {
-    Ok(
-        json!({"schema_version":2,"ok":true,"revision":store.revision()?,"branch":branch,"data":data}),
-    )
-}
 fn proposal_name(s: &Store, input: &str) -> Result<String> {
     if s.branches()?.contains(&input.to_string()) && input.starts_with("proposal/") {
         Ok(input.into())
@@ -221,7 +241,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &op,
             &hash,
             actor(cli)?,
-            &cli.command,
+            &serde_json::to_value(&cli.command)?,
             &result,
         )?);
         store.commit(&changes, "initialize store receipt", actor(cli)?)?;
@@ -315,7 +335,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &op,
             &hash,
             actor(cli)?,
-            &cli.command,
+            &serde_json::to_value(&cli.command)?,
             &result,
         )?);
         store.migrate_format4(&changes.to_sql(), actor(cli)?)?;
@@ -407,8 +427,9 @@ pub fn run(cli: &Cli) -> Result<Value> {
         .op_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let context = cli.operation_context(&op, &hash)?;
     if matches!(cli.command, Cmd::Recover { resume: true, .. }) {
-        return storage::shared_review::recover(&store, cli, &op, &hash);
+        return storage::shared_review::recover(&store, &context);
     }
     if cli.command.mutation() {
         if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
@@ -419,14 +440,15 @@ pub fn run(cli: &Cli) -> Result<Value> {
             };
         }
         if store.is_shared() && !cli.dry_run {
-            if let Some(result) = storage::shared_review::resume(&store, cli, &before, &op, &hash)?
+            if let Some(result) =
+                storage::shared_review::resume(&store, &context, &before, &op, &hash)?
             {
                 return storage::shared_review::receipt_response(&store, result, branch);
             }
         }
     }
     if matches!(cli.command, Cmd::Recover { .. }) {
-        return storage::shared_review::recover(&store, cli, &op, &hash);
+        return storage::shared_review::recover(&store, &context);
     }
     if matches!(cli.command, Cmd::Review { .. }) {
         return review(cli, &store, &before, &op, &hash);
@@ -456,7 +478,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 return wrap(&store, json!({"dry_run":true,"result":result}), branch);
             }
             store.commit(
-                &receipt_changes(&op, &hash, actor(cli)?, &cli.command, &result)?,
+                &receipt_changes(
+                    &op,
+                    &hash,
+                    actor(cli)?,
+                    &serde_json::to_value(&cli.command)?,
+                    &result,
+                )?,
                 "record identical import replay",
                 actor(cli)?,
             )?;
@@ -484,7 +512,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &op,
             &hash,
             actor(cli)?,
-            &cli.command,
+            &serde_json::to_value(&cli.command)?,
             &result,
         )?);
         store.commit(
@@ -683,21 +711,31 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if let Some(p) = proposal {
             changes.push(Change::put("metadata", &target, &p)?);
             if store.is_shared() {
-                changes.extend(receipt_changes(&op, &hash, who, &cli.command, &result)?);
-                let result = storage::shared_review::publish_proposal(
-                    &store,
-                    cli,
-                    &p,
-                    &changes.to_sql(),
+                changes.extend(receipt_changes(
                     &op,
                     &hash,
+                    who,
+                    &serde_json::to_value(&cli.command)?,
+                    &result,
+                )?);
+                let result = storage::shared_review::publish_proposal(
+                    &store,
+                    &context,
+                    &p,
+                    &changes.to_sql(),
                     &result,
                 )?;
                 return storage::shared_review::receipt_response(&store, result, &target);
             }
             store.run(&["checkout", "-b", &target])?;
         }
-        changes.extend(receipt_changes(&op, &hash, who, &cli.command, &result)?);
+        changes.extend(receipt_changes(
+            &op,
+            &hash,
+            who,
+            &serde_json::to_value(&cli.command)?,
+            &result,
+        )?);
         store.commit(
             &changes,
             &format!("{} by {who}", serde_json::to_string(&cli.command)?),
@@ -900,76 +938,6 @@ pub fn run(cli: &Cli) -> Result<Value> {
     }
     Ok(response)
 }
-pub(crate) fn validate_merged_review(
-    s: &Store,
-    main_graph: &Graph,
-    who: &str,
-    role: Role,
-) -> Result<()> {
-    let merged = s.graph()?;
-    crate::markdown_import::health(s, &merged, None)?;
-    crate::source_import::health(&merged, &s.import_files()?)?;
-    let debt = s
-        .one::<ImportInfo>("metadata", "import")?
-        .map(|i| i.lint_debt)
-        .unwrap_or_default();
-    let mut requirements = vec![];
-    for row in s.merged_review_guards()? {
-        requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(
-            row["payload"].as_str().context("guard payload")?,
-        )?);
-    }
-    let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
-    validate_review_candidate(
-        main_graph,
-        &merged,
-        &debt,
-        &requirements,
-        &routing,
-        who,
-        role,
-    )
-}
-
-pub(crate) fn validate_review_candidate(
-    main_graph: &Graph,
-    merged: &Graph,
-    debt: &BTreeSet<String>,
-    requirements: &[crate::mutation::Requirement],
-    routing: &Value,
-    who: &str,
-    role: Role,
-) -> Result<()> {
-    for (id, source) in &merged.import_sources {
-        if !main_graph.import_sources.contains_key(id)
-            && (source.schema_hash != main_graph.schema.revision()
-                || source.schema_hash != merged.schema.revision())
-        {
-            bail!("stale_plan: import schema changed; reject proposal and create a new plan");
-        }
-    }
-    policy::validate_change(main_graph, merged, debt)?;
-    merged.schema.validate()?;
-    for pin in &merged.schema.pins {
-        merged.resolve(pin)?;
-    }
-    main_graph
-        .schema
-        .guards(main_graph, merged, who, role.name())?;
-    merged.schema.guards(main_graph, merged, who, role.name())?;
-    for req in requirements {
-        req.check(who, role.name())?;
-    }
-    let errors = policy::lint_routing(routing);
-    if !errors.is_empty() {
-        bail!(
-            "invalid routing triggers: {}",
-            errors.into_iter().collect::<Vec<_>>().join("; ")
-        );
-    }
-    Ok(())
-}
-
 fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Result<Value> {
     let Cmd::Review {
         action,
@@ -1032,13 +1000,24 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
                 s.checkout(&name)?;
                 return wrap(s, json!({"dry_run":true,"result":result}), &name);
             }
-            let result = storage::shared_review::reject(s, cli, &proposal, op, hash, &result)?;
+            let result = storage::shared_review::reject(
+                s,
+                &cli.operation_context(op, hash)?,
+                &proposal,
+                &result,
+            )?;
             return storage::shared_review::receipt_response(s, result, &name);
         }
         if !cli.dry_run {
             s.checkout(&name)?;
             let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
-            changes.extend(receipt_changes(op, hash, who, &cli.command, &result)?);
+            changes.extend(receipt_changes(
+                op,
+                hash,
+                who,
+                &serde_json::to_value(&cli.command)?,
+                &result,
+            )?);
             s.commit(&changes, &format!("reject {name}: {reason}"), who)?;
         }
         return wrap(
@@ -1064,12 +1043,10 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
     if s.is_shared() {
         let result = storage::shared_review::accept(
             s,
-            cli,
+            &cli.operation_context(op, hash)?,
             main_graph,
             &proposal,
             (&base, &proposal_revision),
-            op,
-            hash,
         )?;
         return wrap(s, result, "main");
     }
@@ -1093,7 +1070,13 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         proposal.reason = reason.map(str::to_string);
         let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
         let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
-        changes.extend(receipt_changes(op, hash, who, &cli.command, &result)?);
+        changes.extend(receipt_changes(
+            op,
+            hash,
+            who,
+            &serde_json::to_value(&cli.command)?,
+            &result,
+        )?);
         s.commit(&changes, &format!("accept {name} by {who}"), who)?;
         if s.head("main")? != base {
             bail!("main changed after validation; validated merge retained on {temp}")

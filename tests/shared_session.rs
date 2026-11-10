@@ -4767,3 +4767,154 @@ fn shared_editable_markdown_interrupted_bulk_batches_roll_back_before_replay() {
         6
     );
 }
+
+fn interrupted_review_for_context_checks() -> Server {
+    let mut s = Server::handbook();
+    let proposal = s.proposed_page("propose", "Operation context");
+    let branch = proposal["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    s.interrupted(
+        &[
+            "--op-id",
+            "accept",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        "CALL DOLT_BRANCH(".into(),
+    );
+    s
+}
+
+#[test]
+fn shared_review_resume_refuses_explicit_operation_id() {
+    let s = interrupted_review_for_context_checks();
+    let before = s.main_head();
+    let intent = s.intent("accept");
+    let error = s.call(
+        "recovery",
+        &["--op-id", "replacement", "recover", "accept", "--resume"],
+        false,
+    );
+    assert!(error.to_string().contains("omit --op-id"), "{error}");
+    assert_eq!(s.main_head(), before);
+    assert_eq!(s.intent("accept"), intent);
+    assert_eq!(
+        s.call("original", &["recover", "accept", "--resume"], true)["data"]["proposal"]["status"],
+        "accepted"
+    );
+}
+
+#[test]
+fn shared_review_resume_refuses_changed_attribution() {
+    let s = interrupted_review_for_context_checks();
+    let before = s.main_head();
+    let intent = s.intent("accept");
+    for args in [
+        vec!["--actor", "bob", "recover", "accept", "--resume"],
+        vec!["--role", "agent", "recover", "accept", "--resume"],
+    ] {
+        let error = s.call("recovery", &args, false);
+        assert!(
+            error
+                .to_string()
+                .contains("recovery attribution must match"),
+            "{error}"
+        );
+        assert_eq!(s.main_head(), before);
+        assert_eq!(s.intent("accept"), intent);
+    }
+}
+
+#[test]
+fn shared_review_abandonment_requires_human_role() {
+    let s = interrupted_review_for_context_checks();
+    let before = s.main_head();
+    let intent = s.intent("accept");
+    let error = s.call(
+        "recovery",
+        &[
+            "--op-id",
+            "cancel",
+            "--role",
+            "agent",
+            "recover",
+            "accept",
+            "--abandon",
+            "--reason",
+            "Cancel",
+        ],
+        false,
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("abandonment requires --role human"),
+        "{error}"
+    );
+    assert_eq!(s.main_head(), before);
+    assert_eq!(s.intent("accept"), intent);
+}
+
+#[test]
+fn shared_review_abandonment_requires_reason() {
+    let s = interrupted_review_for_context_checks();
+    let before = s.main_head();
+    let intent = s.intent("accept");
+    let error = s.call(
+        "recovery",
+        &[
+            "--op-id",
+            "cancel",
+            "--role",
+            "human",
+            "recover",
+            "accept",
+            "--abandon",
+        ],
+        false,
+    );
+    assert!(
+        error.to_string().contains("abandonment requires --reason"),
+        "{error}"
+    );
+    assert_eq!(s.main_head(), before);
+    assert_eq!(s.intent("accept"), intent);
+}
+
+#[test]
+fn shared_review_accept_reason_is_preserved_in_receipt() {
+    let s = Server::handbook();
+    let proposal = s.proposed_page("propose", "Review reason");
+    let branch = proposal["branch"].as_str().unwrap();
+    let token = s.token(branch);
+    let reason = "Checked evidence and routing";
+    let accepted = s.call(
+        "reviewer",
+        &[
+            "--op-id",
+            "accept-with-reason",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+            "--reason",
+            reason,
+        ],
+        true,
+    );
+    assert_eq!(accepted["data"]["proposal"]["reason"], reason);
+    let payload: String = s
+        .raw("main")
+        .query_first("SELECT payload FROM operations WHERE id='accept-with-reason'")
+        .unwrap()
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(receipt["result"], accepted["data"]);
+    assert_eq!(receipt["result"]["proposal"]["status"], "accepted");
+    assert_eq!(receipt["result"]["proposal"]["reason"], reason);
+    assert_eq!(receipt["command"]["Review"]["reason"], reason);
+}

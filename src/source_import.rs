@@ -924,9 +924,13 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 }
                 let g = s.graph_at(&rev)?;
                 if s.is_shared() && !cli.dry_run {
-                    if let Some(result) =
-                        crate::storage::shared_review::resume(&s, cli, &g, op, &hash)?
-                    {
+                    if let Some(result) = crate::storage::shared_review::resume(
+                        &s,
+                        &cli.operation_context(op, &hash)?,
+                        &g,
+                        op,
+                        &hash,
+                    )? {
                         return response(&s, result);
                     }
                 }
@@ -1034,22 +1038,20 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             if let Some(p) = &proposal {
                 changes.push(Change::put("metadata", &target, p)?);
             }
-            changes.extend(crate::app::receipt_changes(
+            changes.extend(crate::review::receipt_changes(
                 op,
                 &hash,
                 actor,
-                &cli.command,
+                &serde_json::to_value(&cli.command)?,
                 &result,
             )?);
             if let Some(p) = &proposal {
                 if s.is_shared() {
                     let published = crate::storage::shared_review::publish_proposal(
                         &s,
-                        cli,
+                        &cli.operation_context(op, &hash)?,
                         p,
                         &changes.to_sql(),
-                        op,
-                        &hash,
                         &result,
                     )?;
                     return response(&s, published);
@@ -1236,7 +1238,13 @@ fn noop_receipt(
         same(source, &plan.source) && source.candidate_digest == plan.source.candidate_digest,
         "source_update_unsupported: source differs"
     );
-    let changes = crate::app::receipt_changes(op, hash, &plan.actor, &cli.command, &result)?;
+    let changes = crate::review::receipt_changes(
+        op,
+        hash,
+        &plan.actor,
+        &serde_json::to_value(&cli.command)?,
+        &result,
+    )?;
     // A receipt changes no captured data. Keeping it on the source branch preserves proposal isolation.
     s.checkout(branch)?;
     s.commit(
