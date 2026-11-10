@@ -8,7 +8,7 @@ use crate::{
     policy,
     profile::{self, Profile},
     storage::Store,
-    store::{Change, ChangeSet, KnowledgeStore},
+    store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -924,8 +924,8 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 }
                 let g = s.graph_at(&rev)?;
                 if s.is_shared() && !cli.dry_run {
-                    if let Some(result) = crate::storage::shared_review::resume(
-                        &s,
+                    if let Some(result) = KnowledgeStore::resume(
+                        &*s,
                         &cli.operation_context(op, &hash)?,
                         &g,
                         op,
@@ -1045,20 +1045,21 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 &serde_json::to_value(&cli.command)?,
                 &result,
             )?);
-            if let Some(p) = &proposal {
-                if s.is_shared() {
-                    let published = crate::storage::shared_review::publish_proposal(
-                        &s,
-                        &cli.operation_context(op, &hash)?,
-                        p,
-                        &changes.to_sql(),
-                        &result,
-                    )?;
-                    return response(&s, published);
-                }
-                s.run(&["checkout", "-b", &target, "main"])?;
-            }
             let message = format!("import source {} by {actor}", candidate.source.source_id);
+            if let Some(p) = &proposal {
+                let published = s.propose(
+                    &cli.operation_context(op, &hash)?,
+                    ProposalWrite {
+                        changes: &changes,
+                        message: &message,
+                        target: &target,
+                        start: Some("main"),
+                        proposal: p,
+                        result: &result,
+                    },
+                )?;
+                return response(&s, published);
+            }
             if s.is_shared() {
                 s.commit_checked(&changes, &message, actor, false, &mut || {
                     let actual = s.graph()?;

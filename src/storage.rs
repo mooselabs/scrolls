@@ -6,7 +6,7 @@ pub mod shared;
 pub mod shared_review;
 use crate::{
     model::*,
-    store::{Change, ChangeSet},
+    store::{Change, ChangeSet, KnowledgeStore, OperationContext, ProposalWrite},
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -892,6 +892,218 @@ pub fn graph_changes(before: &Graph, after: &Graph) -> Result<String> {
     Ok(ChangeSet::graph(before, after)?.to_sql())
 }
 
+impl KnowledgeStore for Store {
+    fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
+        self.transaction(&changes.to_sql(), message, actor)
+    }
+    fn commit_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        owned: bool,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String> {
+        self.commit_shared_checked(&changes.to_sql(), message, actor, owned, validate)
+    }
+    fn commit_markdown_checked(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String> {
+        self.commit_shared_markdown_checked(&changes.to_sql(), message, actor, validate)
+    }
+    fn propose(&self, context: &OperationContext, write: ProposalWrite<'_>) -> Result<Value> {
+        if self.is_shared() {
+            return shared_review::publish_proposal(
+                self,
+                context,
+                write.proposal,
+                &write.changes.to_sql(),
+                write.result,
+            );
+        }
+        let mut args = vec!["checkout", "-b", write.target];
+        if let Some(start) = write.start {
+            args.push(start);
+        }
+        self.run(&args)?;
+        self.commit(
+            write.changes,
+            write.message,
+            context.actor.as_deref().context("actor")?,
+        )?;
+        Ok(write.result.clone())
+    }
+    fn reject(
+        &self,
+        context: &OperationContext,
+        proposal: &Proposal,
+        result: &Value,
+    ) -> Result<Value> {
+        let s = self;
+        let name = &proposal.branch;
+        let op = context.op_id.as_str();
+        let hash = context.args_hash.as_str();
+        let who = context.actor.as_deref().context("actor")?;
+        let reason = proposal
+            .reason
+            .as_deref()
+            .context("review reject requires --reason")?;
+        let mut result = result.clone();
+        if s.is_shared() {
+            result["branch"] = json!(name);
+            if context.dry_run {
+                s.checkout(name)?;
+                return Ok(json!({"dry_run":true,"result":result}));
+            }
+            return shared_review::reject(s, context, proposal, &result);
+        }
+        if !context.dry_run {
+            s.checkout(name)?;
+            let mut changes = ChangeSet::from(Change::put("metadata", name, proposal)?);
+            changes.extend(crate::review::receipt_changes(
+                op,
+                hash,
+                who,
+                &context.command,
+                &result,
+            )?);
+            s.commit(&changes, &format!("reject {name}: {reason}"), who)?;
+        }
+        Ok(if context.dry_run {
+            json!({"dry_run":true,"result":result})
+        } else {
+            result
+        })
+    }
+    fn accept(
+        &self,
+        context: &OperationContext,
+        main: &Graph,
+        proposal: &Proposal,
+        revisions: (&str, &str),
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Value> {
+        if self.is_shared() {
+            return shared_review::accept(self, context, main, proposal, revisions);
+        }
+        let s = self;
+        let mut proposal = proposal.clone();
+        let name = proposal.branch.clone();
+        let (base, proposal_revision) = revisions;
+        let who = context.actor.as_deref().context("actor")?;
+        let op = context.op_id.as_str();
+        let hash = context.args_hash.as_str();
+        let review = context.review.as_ref().context("not a review decision")?;
+        let token = review
+            .token
+            .as_deref()
+            .context("review acceptance requires its original token")?;
+        let reason = review.reason.as_deref();
+        let temp = format!("review/{}", uuid::Uuid::new_v4().simple());
+        s.run(&["checkout", "-b", &temp, "main"])?;
+        s.journal_review(&temp, base)?;
+        // The temporary branch is the only branch that may get merge conflicts or dirty state.
+        let outcome = (|| -> Result<Value> {
+            s.run(&["merge", "--no-commit", "--no-ff", &name])?;
+            let conflicts = s.sql("SELECT * FROM dolt_conflicts")?;
+            if !conflicts.is_empty() {
+                bail!("merge conflicts on {name}; main remains at {base}")
+            }
+            validate()?;
+            if context.dry_run {
+                return Ok(
+                    json!({"dry_run":true,"validated":true,"proposal":name,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token}),
+                );
+            }
+            proposal.status = "accepted".into();
+            proposal.reason = reason.map(str::to_string);
+            let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
+            let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
+            changes.extend(crate::review::receipt_changes(
+                op,
+                hash,
+                who,
+                &context.command,
+                &result,
+            )?);
+            s.commit(&changes, &format!("accept {name} by {who}"), who)?;
+            if s.head("main")? != base {
+                bail!("main changed after validation; validated merge retained on {temp}")
+            }
+            s.checkout("main")?;
+            s.run(&["merge", "--ff-only", &temp])?;
+            Ok(result)
+        })();
+        // We own this temporary working set and can abandon it. Never reset main.
+        let active = s.sql("SELECT active_branch() AS branch")?;
+        if active[0]["branch"] == temp {
+            let _ = s.run(&["merge", "--abort"]);
+            s.run(&["reset", "--hard"])?;
+            s.run(&["checkout", "main"])?;
+        }
+        fs::remove_file(s.root.join("review-journal.json"))?;
+        if outcome.is_ok() {
+            s.run(&["branch", "-D", &temp])?;
+        }
+        outcome
+    }
+    fn recover(&self, context: &OperationContext) -> Result<Value> {
+        shared_review::recover(self, context)
+    }
+    fn resume(
+        &self,
+        context: &OperationContext,
+        main: &Graph,
+        op: &str,
+        hash: &str,
+    ) -> Result<Option<Value>> {
+        shared_review::resume(self, context, main, op, hash)
+    }
+    fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
+        Store::receipt(self, op, hash)
+    }
+    fn head(&self, reference: &str) -> Result<String> {
+        Store::head(self, reference)
+    }
+    fn revision(&self) -> Result<String> {
+        Store::revision(self)
+    }
+    fn branches(&self) -> Result<Vec<String>> {
+        Store::branches(self)
+    }
+    fn merge_base(&self, from: &str, to: &str) -> Result<String> {
+        Store::merge_base(self, from, to)
+    }
+    fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
+        Store::read_rows(self, table, at)
+    }
+    fn one(&self, table: &str, id: &str, at: Option<&str>) -> Result<Option<String>> {
+        Store::read_one(self, table, id, at)
+    }
+    fn proposals(&self) -> Result<Vec<Proposal>> {
+        Store::proposals(self)
+    }
+    fn history(&self, at: &str, id: &str) -> Result<Vec<Value>> {
+        Store::history(self, at, id)
+    }
+    fn log(&self, at: &str) -> Result<Vec<Value>> {
+        Store::log(self, at)
+    }
+    fn diff(&self, from: &str, to: &str, table: &str) -> Result<String> {
+        Store::diff_text(self, from, to, table)
+    }
+    fn request_limit(&self) -> Option<usize> {
+        Store::shared_query_limit(self)
+    }
+    fn shared(&self) -> bool {
+        Store::is_shared(self)
+    }
+}
+
 #[cfg(test)]
 mod sql_text_tests {
     use super::*;
@@ -965,6 +1177,97 @@ mod sql_text_tests {
             "REPLACE INTO records (id,payload) VALUES (CONVERT(0x72 USING utf8mb4),CONVERT(0x7b226964223a2272222c226b696e64223a226e6f7465222c227469746c65223a224e6577222c22737461747573223a22222c22626f6479223a2271756f7465202720616e6420c3a95c6e222c226f776e6572223a22222c22636f6e666964656e6365223a226d656469756d222c2263726561746564223a22323032362d31312d3038222c226c6173745f7265766965776564223a22323032362d31312d3038222c227265766965775f6576657279223a302c226163746f72223a2261222c227669736962696c697479223a22696e7465726e616c222c2273796e63223a22616c77617973222c226669656c6473223a7b7d2c227265766973696f6e223a322c2270617468223a6e756c6c2c2266726f7a656e223a66616c73652c226f726967696e616c223a6e756c6c2c22616c6961736573223a5b5d7d USING utf8mb4));\nREPLACE INTO edges (id,payload) VALUES (CONVERT(0x6368616e676564 USING utf8mb4),CONVERT(0x7b2266726f6d223a2272222c2272656c223a2272656c61746564222c22746f223a2274222c22776879223a226e6577222c226163746f72223a2261222c2263726561746564223a22323032362d31312d3038227d USING utf8mb4));\nDELETE FROM edges WHERE id=CONVERT(0x64656c65746564 USING utf8mb4);"
         );
         assert_eq!(graph_changes(&after, &after)?, "");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::store::ReviewRequest;
+
+    #[test]
+    fn trait_accept_validates_merged_candidate_before_publishing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join(".tools/dolt");
+        let s = Store::open(&dir.path().join("store"), &binary, true)?;
+        let store: &dyn KnowledgeStore = &s;
+        let base = store.head("main")?;
+        let main = s.graph()?;
+        let mut proposal = Proposal {
+            branch: "proposal/trait-validation".into(),
+            base: base.clone(),
+            actor: "reviewer".into(),
+            status: "pending".into(),
+            reason: None,
+        };
+        let mut context = OperationContext {
+            op_id: "propose".into(),
+            args_hash: "hash".into(),
+            explicit_op_id: true,
+            actor: Some("reviewer".into()),
+            role: Role::Human,
+            dry_run: false,
+            command: json!({"propose":true}),
+            review: None,
+            recovery: None,
+        };
+        let result = json!({"proposal":proposal.branch,"count":0});
+        let mut changes = ChangeSet::from(Change::put("metadata", &proposal.branch, &proposal)?);
+        changes.push(Change::put("metadata", "candidate", &0)?);
+        assert_eq!(
+            store.propose(
+                &context,
+                ProposalWrite {
+                    changes: &changes,
+                    message: "propose through trait",
+                    target: &proposal.branch,
+                    start: Some("main"),
+                    proposal: &proposal,
+                    result: &result,
+                }
+            )?,
+            result
+        );
+        let proposed = store.head(&proposal.branch)?;
+        s.checkout("main")?;
+        context.op_id = "accept".into();
+        context.command = json!({"review":{"action":"accept"}});
+        context.review = Some(ReviewRequest {
+            action: "accept".into(),
+            token: Some("validated by caller".into()),
+            reason: None,
+        });
+        let mut validated = false;
+        let error = store
+            .accept(&context, &main, &proposal, (&base, &proposed), &mut || {
+                validated = true;
+                assert_eq!(s.one::<u32>("metadata", "candidate")?, Some(0));
+                bail!("candidate validation refused")
+            })
+            .unwrap_err();
+        assert!(validated);
+        assert!(error.to_string().contains("candidate validation refused"));
+        assert_eq!(store.head("main")?, base);
+        assert_eq!(store.head(&proposal.branch)?, proposed);
+        assert!(store.receipt("accept", "hash")?.is_none());
+        assert_eq!(s.one::<u32>("metadata", "candidate")?, None);
+        assert!(!s.root.join("review-journal.json").exists());
+
+        proposal.status = "rejected".into();
+        proposal.reason = Some("validation refused".into());
+        context.op_id = "reject".into();
+        context.command = json!({"review":{"action":"reject"}});
+        let result = json!({"proposal":proposal,"op_id":"reject"});
+        assert_eq!(store.reject(&context, &proposal, &result)?, result);
+        assert_eq!(store.head("main")?, base);
+        assert_eq!(
+            s.one::<Proposal>("metadata", &proposal.branch)?
+                .unwrap()
+                .status,
+            "rejected"
+        );
+        assert_eq!(store.receipt("reject", "hash")?, Some(result));
         Ok(())
     }
 }

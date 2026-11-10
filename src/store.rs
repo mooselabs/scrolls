@@ -1,5 +1,6 @@
 //! Typed knowledge changes, reads and graph assembly, independent of the backend.
-use crate::{model::*, source_import, storage::Store};
+pub use crate::review::{OperationContext, RecoveryRequest, ReviewRequest};
+use crate::{model::*, source_import};
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -83,6 +84,16 @@ impl ChangeSet {
     }
 }
 
+/// Inputs for publishing a new proposal. Existing-proposal writes use `commit`.
+pub struct ProposalWrite<'a> {
+    pub changes: &'a ChangeSet,
+    pub message: &'a str,
+    pub target: &'a str,
+    pub start: Option<&'a str>,
+    pub proposal: &'a Proposal,
+    pub result: &'a Value,
+}
+
 /// The read and write surface of the knowledge engine. Revisions and payloads keep their
 /// backend representation until the later ADR-0280 format-neutrality cut.
 ///
@@ -109,6 +120,29 @@ pub trait KnowledgeStore {
         actor: &str,
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<String>;
+    fn propose(&self, context: &OperationContext, write: ProposalWrite<'_>) -> Result<Value>;
+    fn reject(
+        &self,
+        context: &OperationContext,
+        proposal: &Proposal,
+        result: &Value,
+    ) -> Result<Value>;
+    fn accept(
+        &self,
+        context: &OperationContext,
+        main: &Graph,
+        proposal: &Proposal,
+        revisions: (&str, &str),
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Value>;
+    fn recover(&self, context: &OperationContext) -> Result<Value>;
+    fn resume(
+        &self,
+        context: &OperationContext,
+        main: &Graph,
+        op: &str,
+        hash: &str,
+    ) -> Result<Option<Value>>;
     fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>>;
     fn head(&self, reference: &str) -> Result<String>;
     fn revision(&self) -> Result<String>;
@@ -122,70 +156,6 @@ pub trait KnowledgeStore {
     fn diff(&self, from: &str, to: &str, table: &str) -> Result<String>;
     fn request_limit(&self) -> Option<usize>;
     fn shared(&self) -> bool;
-}
-
-impl KnowledgeStore for Store {
-    fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
-        self.transaction(&changes.to_sql(), message, actor)
-    }
-    fn commit_checked(
-        &self,
-        changes: &ChangeSet,
-        message: &str,
-        actor: &str,
-        owned: bool,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<String> {
-        self.commit_shared_checked(&changes.to_sql(), message, actor, owned, validate)
-    }
-    fn commit_markdown_checked(
-        &self,
-        changes: &ChangeSet,
-        message: &str,
-        actor: &str,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<String> {
-        self.commit_shared_markdown_checked(&changes.to_sql(), message, actor, validate)
-    }
-    fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
-        Store::receipt(self, op, hash)
-    }
-    fn head(&self, reference: &str) -> Result<String> {
-        Store::head(self, reference)
-    }
-    fn revision(&self) -> Result<String> {
-        Store::revision(self)
-    }
-    fn branches(&self) -> Result<Vec<String>> {
-        Store::branches(self)
-    }
-    fn merge_base(&self, from: &str, to: &str) -> Result<String> {
-        Store::merge_base(self, from, to)
-    }
-    fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
-        Store::read_rows(self, table, at)
-    }
-    fn one(&self, table: &str, id: &str, at: Option<&str>) -> Result<Option<String>> {
-        Store::read_one(self, table, id, at)
-    }
-    fn proposals(&self) -> Result<Vec<Proposal>> {
-        Store::proposals(self)
-    }
-    fn history(&self, at: &str, id: &str) -> Result<Vec<Value>> {
-        Store::history(self, at, id)
-    }
-    fn log(&self, at: &str) -> Result<Vec<Value>> {
-        Store::log(self, at)
-    }
-    fn diff(&self, from: &str, to: &str, table: &str) -> Result<String> {
-        Store::diff_text(self, from, to, table)
-    }
-    fn request_limit(&self) -> Option<usize> {
-        Store::shared_query_limit(self)
-    }
-    fn shared(&self) -> bool {
-        Store::is_shared(self)
-    }
 }
 
 fn one<T: DeserializeOwned>(
@@ -305,6 +275,34 @@ mod tests {
             _: &mut dyn FnMut() -> Result<()>,
         ) -> Result<String> {
             anyhow::bail!("unexpected Markdown commit")
+        }
+        fn propose(&self, _: &OperationContext, _: ProposalWrite<'_>) -> Result<Value> {
+            anyhow::bail!("unexpected proposal publication")
+        }
+        fn reject(&self, _: &OperationContext, _: &Proposal, _: &Value) -> Result<Value> {
+            anyhow::bail!("unexpected proposal rejection")
+        }
+        fn accept(
+            &self,
+            _: &OperationContext,
+            _: &Graph,
+            _: &Proposal,
+            _: (&str, &str),
+            _: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<Value> {
+            anyhow::bail!("unexpected proposal acceptance")
+        }
+        fn recover(&self, _: &OperationContext) -> Result<Value> {
+            anyhow::bail!("unexpected recovery")
+        }
+        fn resume(
+            &self,
+            _: &OperationContext,
+            _: &Graph,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Value>> {
+            anyhow::bail!("unexpected operation resume")
         }
         fn receipt(&self, _: &str, _: &str) -> Result<Option<Value>> {
             anyhow::bail!("unexpected receipt read")

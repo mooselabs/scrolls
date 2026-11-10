@@ -4,7 +4,7 @@ use crate::{
     policy, query,
     review::{receipt_changes, validate_merged_review, wrap},
     storage::{self, Store},
-    store::{Change, ChangeSet, KnowledgeStore},
+    store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -429,7 +429,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let context = cli.operation_context(&op, &hash)?;
     if matches!(cli.command, Cmd::Recover { resume: true, .. }) {
-        return storage::shared_review::recover(&store, &context);
+        return store.recover(&context);
     }
     if cli.command.mutation() {
         if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
@@ -440,15 +440,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
             };
         }
         if store.is_shared() && !cli.dry_run {
-            if let Some(result) =
-                storage::shared_review::resume(&store, &context, &before, &op, &hash)?
-            {
+            if let Some(result) = store.resume(&context, &before, &op, &hash)? {
                 return storage::shared_review::receipt_response(&store, result, branch);
             }
         }
     }
     if matches!(cli.command, Cmd::Recover { .. }) {
-        return storage::shared_review::recover(&store, &context);
+        return store.recover(&context);
     }
     if matches!(cli.command, Cmd::Review { .. }) {
         return review(cli, &store, &before, &op, &hash);
@@ -708,26 +706,8 @@ pub fn run(cli: &Cli) -> Result<Value> {
             )?);
         }
 
-        if let Some(p) = proposal {
-            changes.push(Change::put("metadata", &target, &p)?);
-            if store.is_shared() {
-                changes.extend(receipt_changes(
-                    &op,
-                    &hash,
-                    who,
-                    &serde_json::to_value(&cli.command)?,
-                    &result,
-                )?);
-                let result = storage::shared_review::publish_proposal(
-                    &store,
-                    &context,
-                    &p,
-                    &changes.to_sql(),
-                    &result,
-                )?;
-                return storage::shared_review::receipt_response(&store, result, &target);
-            }
-            store.run(&["checkout", "-b", &target])?;
+        if let Some(p) = &proposal {
+            changes.push(Change::put("metadata", &target, p)?);
         }
         changes.extend(receipt_changes(
             &op,
@@ -736,11 +716,26 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &serde_json::to_value(&cli.command)?,
             &result,
         )?);
-        store.commit(
-            &changes,
-            &format!("{} by {who}", serde_json::to_string(&cli.command)?),
-            who,
-        )?;
+        let message = format!("{} by {who}", serde_json::to_string(&cli.command)?);
+        if let Some(p) = &proposal {
+            let result = store.propose(
+                &context,
+                ProposalWrite {
+                    changes: &changes,
+                    message: &message,
+                    target: &target,
+                    start: None,
+                    proposal: p,
+                    result: &result,
+                },
+            )?;
+            return if store.is_shared() {
+                storage::shared_review::receipt_response(&store, result, &target)
+            } else {
+                wrap(&store, result, &target)
+            };
+        }
+        store.commit(&changes, &message, who)?;
         return wrap(&store, result, &target);
     }
     let revision = store.revision()?;
@@ -993,42 +988,13 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             .context("review reject requires --reason")?;
         proposal.status = "rejected".into();
         proposal.reason = Some(reason.into());
-        let mut result = json!({"proposal":proposal,"op_id":op});
-        if s.is_shared() {
-            result["branch"] = json!(name);
-            if cli.dry_run {
-                s.checkout(&name)?;
-                return wrap(s, json!({"dry_run":true,"result":result}), &name);
-            }
-            let result = storage::shared_review::reject(
-                s,
-                &cli.operation_context(op, hash)?,
-                &proposal,
-                &result,
-            )?;
-            return storage::shared_review::receipt_response(s, result, &name);
-        }
-        if !cli.dry_run {
-            s.checkout(&name)?;
-            let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
-            changes.extend(receipt_changes(
-                op,
-                hash,
-                who,
-                &serde_json::to_value(&cli.command)?,
-                &result,
-            )?);
-            s.commit(&changes, &format!("reject {name}: {reason}"), who)?;
-        }
-        return wrap(
-            s,
-            if cli.dry_run {
-                json!({"dry_run":true,"result":result})
-            } else {
-                result
-            },
-            &name,
-        );
+        let result = json!({"proposal":proposal,"op_id":op});
+        let result = s.reject(&cli.operation_context(op, hash)?, &proposal, &result)?;
+        return if s.is_shared() && !cli.dry_run {
+            storage::shared_review::receipt_response(s, result, &name)
+        } else {
+            wrap(s, result, &name)
+        };
     }
     let base = s.head("main")?;
     let proposal_revision = s.head(&name)?;
@@ -1040,63 +1006,14 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
     crate::review_token::ReviewToken::decode(token)
         .with_context(|| format!("run scrolls review {name} again and pass its review_token"))?
         .check(&name, &base, &proposal_revision)?;
-    if s.is_shared() {
-        let result = storage::shared_review::accept(
-            s,
-            &cli.operation_context(op, hash)?,
-            main_graph,
-            &proposal,
-            (&base, &proposal_revision),
-        )?;
-        return wrap(s, result, "main");
-    }
-    let temp = format!("review/{}", uuid::Uuid::new_v4().simple());
-    s.run(&["checkout", "-b", &temp, "main"])?;
-    s.journal_review(&temp, &base)?;
-    // The temporary branch is the only branch that may get merge conflicts or dirty state.
-    let outcome = (|| -> Result<Value> {
-        s.run(&["merge", "--no-commit", "--no-ff", &name])?;
-        let conflicts = s.sql("SELECT * FROM dolt_conflicts")?;
-        if !conflicts.is_empty() {
-            bail!("merge conflicts on {name}; main remains at {base}")
-        }
-        validate_merged_review(s, main_graph, who, cli.role)?;
-        if cli.dry_run {
-            return Ok(
-                json!({"dry_run":true,"validated":true,"proposal":name,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token}),
-            );
-        }
-        proposal.status = "accepted".into();
-        proposal.reason = reason.map(str::to_string);
-        let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
-        let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
-        changes.extend(receipt_changes(
-            op,
-            hash,
-            who,
-            &serde_json::to_value(&cli.command)?,
-            &result,
-        )?);
-        s.commit(&changes, &format!("accept {name} by {who}"), who)?;
-        if s.head("main")? != base {
-            bail!("main changed after validation; validated merge retained on {temp}")
-        }
-        s.checkout("main")?;
-        s.run(&["merge", "--ff-only", &temp])?;
-        Ok(result)
-    })();
-    // We own this temporary working set and can abandon it. Never reset main.
-    let active = s.sql("SELECT active_branch() AS branch")?;
-    if active[0]["branch"] == temp {
-        let _ = s.run(&["merge", "--abort"]);
-        s.run(&["reset", "--hard"])?;
-        s.run(&["checkout", "main"])?;
-    }
-    fs::remove_file(s.root.join("review-journal.json"))?;
-    if outcome.is_ok() {
-        s.run(&["branch", "-D", &temp])?;
-    }
-    wrap(s, outcome?, "main")
+    let result = s.accept(
+        &cli.operation_context(op, hash)?,
+        main_graph,
+        &proposal,
+        (&base, &proposal_revision),
+        &mut || validate_merged_review(s, main_graph, who, cli.role),
+    )?;
+    wrap(s, result, "main")
 }
 
 fn ensure_schema_revision(schema: &crate::schema::Schema, expect: &str) -> Result<()> {
