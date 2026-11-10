@@ -881,3 +881,80 @@ pub fn graph_changes(before: &Graph, after: &Graph) -> Result<String> {
     }
     Ok(sql)
 }
+
+#[cfg(test)]
+mod sql_text_tests {
+    use super::*;
+
+    #[test]
+    fn put_and_insert_sql_bytes() -> Result<()> {
+        assert_eq!(
+            put("metadata", "k'", &"é\n")?,
+            "REPLACE INTO metadata (id,payload) VALUES (CONVERT(0x6b27 USING utf8mb4),CONVERT(0x22c3a95c6e22 USING utf8mb4));\n"
+        );
+        assert_eq!(
+            insert("import_files", "k'", &"é\n")?,
+            "INSERT INTO import_files (id,payload) VALUES (CONVERT(0x6b27 USING utf8mb4),CONVERT(0x22c3a95c6e22 USING utf8mb4));\n"
+        );
+        assert_eq!(
+            put(
+                "operations",
+                "op",
+                &json!({"op_id":"op","args_hash":"h","actor":"a","command":"new","result":{"count":0},"committed_at":"2026-11-08"})
+            )?,
+            "REPLACE INTO operations (id,payload) VALUES (CONVERT(0x6f70 USING utf8mb4),CONVERT(0x7b226163746f72223a2261222c22617267735f68617368223a2268222c22636f6d6d616e64223a226e6577222c22636f6d6d69747465645f6174223a22323032362d31312d3038222c226f705f6964223a226f70222c22726573756c74223a7b22636f756e74223a307d7d USING utf8mb4));\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_sql_bytes() -> Result<()> {
+        let record = Record {
+            id: "r".into(),
+            kind: "note".into(),
+            title: "New".into(),
+            status: "".into(),
+            body: "quote ' and é\n".into(),
+            owner: "".into(),
+            confidence: "medium".into(),
+            created: "2026-11-08".into(),
+            last_reviewed: "2026-11-08".into(),
+            review_every: 0,
+            actor: "a".into(),
+            visibility: "internal".into(),
+            sync: "always".into(),
+            fields: json!({}),
+            revision: 2,
+            path: None,
+            frozen: false,
+            original: None,
+            aliases: vec![],
+            metadata: None,
+        };
+        let edge = Edge {
+            from: "r".into(),
+            rel: "related".into(),
+            to: "t".into(),
+            why: "new".into(),
+            actor: "a".into(),
+            created: "2026-11-08".into(),
+        };
+        let mut before = Graph::default();
+        let mut old = record.clone();
+        old.title = "Old".into();
+        before.records.insert("r".into(), old);
+        let mut old = edge.clone();
+        old.why = "old".into();
+        before.edges.insert("changed".into(), old);
+        before.edges.insert("deleted".into(), edge.clone());
+        let mut after = Graph::default();
+        after.records.insert("r".into(), record);
+        after.edges.insert("changed".into(), edge);
+        assert_eq!(
+            graph_changes(&before, &after)?,
+            "REPLACE INTO records (id,payload) VALUES (CONVERT(0x72 USING utf8mb4),CONVERT(0x7b226964223a2272222c226b696e64223a226e6f7465222c227469746c65223a224e6577222c22737461747573223a22222c22626f6479223a2271756f7465202720616e6420c3a95c6e222c226f776e6572223a22222c22636f6e666964656e6365223a226d656469756d222c2263726561746564223a22323032362d31312d3038222c226c6173745f7265766965776564223a22323032362d31312d3038222c227265766965775f6576657279223a302c226163746f72223a2261222c227669736962696c697479223a22696e7465726e616c222c2273796e63223a22616c77617973222c226669656c6473223a7b7d2c227265766973696f6e223a322c2270617468223a6e756c6c2c2266726f7a656e223a66616c73652c226f726967696e616c223a6e756c6c2c22616c6961736573223a5b5d7d USING utf8mb4));\nREPLACE INTO edges (id,payload) VALUES (CONVERT(0x6368616e676564 USING utf8mb4),CONVERT(0x7b2266726f6d223a2272222c2272656c223a2272656c61746564222c22746f223a2274222c22776879223a226e6577222c226163746f72223a2261222c2263726561746564223a22323032362d31312d3038227d USING utf8mb4));\nDELETE FROM edges WHERE id=CONVERT(0x64656c65746564 USING utf8mb4);"
+        );
+        assert_eq!(graph_changes(&after, &after)?, "");
+        Ok(())
+    }
+}
