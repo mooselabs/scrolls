@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-pub(crate) struct OperationContext {
+pub struct OperationContext {
     pub op_id: String,
     pub args_hash: String,
     // Recovery distinguishes caller-supplied IDs from resolved IDs.
@@ -23,13 +23,13 @@ pub(crate) struct OperationContext {
     pub recovery: Option<RecoveryRequest>,
 }
 
-pub(crate) struct ReviewRequest {
+pub struct ReviewRequest {
     pub action: String,
     pub token: Option<String>,
     pub reason: Option<String>,
 }
 
-pub(crate) struct RecoveryRequest {
+pub struct RecoveryRequest {
     pub operation: String,
     pub abandon: bool,
     pub resume: bool,
