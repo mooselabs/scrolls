@@ -2,9 +2,9 @@
 //! only a verified candidate is fast-forwarded into main.
 use super::{Store, literal, revision_literal};
 use crate::{
-    cli::{Cli, Cmd, Role},
-    model::{Graph, ImportInfo, Proposal, digest},
+    model::{Graph, ImportInfo, Proposal, Role, digest},
     mutation::Requirement,
+    review::OperationContext,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -505,15 +505,15 @@ pub(crate) fn receipt_response(s: &Store, result: Value, fallback: &str) -> Resu
         "invalid receipt branch"
     );
     s.select_shared(&branch)?;
-    crate::app::wrap(s, result, &branch)
+    crate::review::wrap(s, result, &branch)
 }
-fn existing(s: &Store, cli: &Cli, op: &str, hash: &str) -> Result<Option<Intent>> {
+fn existing(s: &Store, context: &OperationContext, op: &str, hash: &str) -> Result<Option<Intent>> {
     let i = read(s, op)?;
     if let Some(i) = &i {
         ensure!(
             i.args_hash == hash
-                && Some(i.actor.as_str()) == cli.actor.as_deref()
-                && i.role == cli.role,
+                && Some(i.actor.as_str()) == context.actor.as_deref()
+                && i.role == context.role,
             "--op-id {op} was already used with different arguments or attribution"
         );
     }
@@ -562,10 +562,10 @@ fn dry_candidate(
     proposal: &str,
     ours: &Snapshot,
     merged: &Snapshot,
-    cli: &Cli,
+    context: &OperationContext,
 ) -> Result<()> {
-    let who = cli.actor.as_deref().context("actor")?;
-    let role = cli.role;
+    let who = context.actor.as_deref().context("actor")?;
+    let role = context.role;
     let a = s.graph_at(base)?;
     let b = s.graph_at(proposal)?;
     let ma = payloads(s, "metadata", base)?;
@@ -659,7 +659,7 @@ fn dry_candidate(
             Some(&serde_json::from_str::<crate::markdown_import::Plan>(plan)?),
         )?;
     }
-    crate::app::validate_review_candidate(main, &g, &debt, &requirements, &routing, who, role)
+    crate::review::validate_review_candidate(main, &g, &debt, &requirements, &routing, who, role)
 }
 fn commit_changes(
     s: &Store,
@@ -813,13 +813,13 @@ fn publish_write(s: &Store, mut i: Intent) -> Result<Value> {
 }
 pub(crate) fn publish_proposal(
     s: &Store,
-    cli: &Cli,
+    context: &OperationContext,
     p: &Proposal,
     sql: &str,
-    op: &str,
-    hash: &str,
     result: &Value,
 ) -> Result<Value> {
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
     let before = Snapshot::read(s, Some(&p.base))?;
     let delta = changes(sql, op)?;
     check_import_publication(s, &delta, op)?;
@@ -831,8 +831,8 @@ pub(crate) fn publish_proposal(
         format: 1,
         op_id: op.into(),
         args_hash: hash.into(),
-        actor: cli.actor.clone().context("actor")?,
-        role: cli.role,
+        actor: context.actor.clone().context("actor")?,
+        role: context.role,
         result: result.clone(),
         plan: Plan::Write {
             kind: WriteKind::Propose,
@@ -854,24 +854,24 @@ pub(crate) fn publish_proposal(
 }
 pub(crate) fn reject(
     s: &Store,
-    cli: &Cli,
+    context: &OperationContext,
     p: &Proposal,
-    op: &str,
-    hash: &str,
     result: &Value,
 ) -> Result<Value> {
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
     let base = s.head(&p.branch)?;
     let before = Snapshot::read(s, Some(&base))?;
-    let actor = cli.actor.as_deref().context("actor")?;
+    let actor = context.actor.as_deref().context("actor")?;
     let sql = super::put("metadata", &p.branch, p)?
-        + &crate::app::receipt(op, hash, actor, &cli.command, result)?;
+        + &crate::review::receipt(op, hash, actor, &context.command, result)?;
     let delta = changes(&sql, op)?;
     let i = Intent {
         format: 1,
         op_id: op.into(),
         args_hash: hash.into(),
         actor: actor.into(),
-        role: cli.role,
+        role: context.role,
         result: result.clone(),
         plan: Plan::Write {
             kind: WriteKind::Reject,
@@ -888,23 +888,23 @@ pub(crate) fn reject(
     publish_write(s, i)
 }
 
-fn token(cli: &Cli) -> Result<&str> {
-    let Cmd::Review {
-        action,
-        review_token,
-        ..
-    } = &cli.command
-    else {
-        bail!("recovery input is not a review decision")
-    };
-    ensure!(action == "accept", "recovery input is not acceptance");
-    review_token
+fn token(context: &OperationContext) -> Result<&str> {
+    let review = context
+        .review
+        .as_ref()
+        .context("recovery input is not a review decision")?;
+    ensure!(
+        review.action == "accept",
+        "recovery input is not acceptance"
+    );
+    review
+        .token
         .as_deref()
         .context("review acceptance requires its original token")
 }
-fn confirm_accept_request(s: &Store, cli: &Cli, i: &Intent) -> Result<()> {
+fn confirm_accept_request(s: &Store, context: &OperationContext, i: &Intent) -> Result<()> {
     ensure!(
-        cli.role == Role::Human && i.role == Role::Human,
+        context.role == Role::Human && i.role == Role::Human,
         "proposal review decisions require --role human"
     );
     let Plan::Accept {
@@ -921,9 +921,9 @@ fn confirm_accept_request(s: &Store, cli: &Cli, i: &Intent) -> Result<()> {
     let original_token = i.result["review_token"]
         .as_str()
         .context("missing original review token")?;
-    if !matches!(cli.command, Cmd::Recover { resume: true, .. }) {
+    if !context.recovery.as_ref().is_some_and(|r| r.resume) {
         ensure!(
-            token(cli)? == original_token,
+            token(context)? == original_token,
             "recovery review token changed"
         );
     }
@@ -998,7 +998,12 @@ fn reset_owned(s: &Store, i: &Intent) -> Result<()> {
     super::session::SqlSession::clean(s.shared.as_ref().unwrap())?;
     s.select_shared(&previous)
 }
-fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<Value> {
+fn publish_accept(
+    s: &Store,
+    context: &OperationContext,
+    main: &Graph,
+    mut i: Intent,
+) -> Result<Value> {
     match &i.stage {
         Stage::Failed { message } => bail!("operation_failed: {message}"),
         Stage::Abandoning { .. } | Stage::Abandoned { .. } => {
@@ -1006,7 +1011,7 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
         }
         _ => {}
     }
-    confirm_accept_request(s, cli, &i)?;
+    confirm_accept_request(s, context, &i)?;
     let Plan::Accept {
         branch,
         base,
@@ -1043,7 +1048,7 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
     if candidate.is_none() && state == "candidate" {
         let revision = s.head(&branch)?;
         candidate_ok(s, &i, &revision)?;
-        crate::app::validate_merged_review(s, main, &i.actor, i.role)?;
+        crate::review::validate_merged_review(s, main, &i.actor, i.role)?;
         candidate = Some(revision);
     }
     if candidate.is_none() {
@@ -1080,7 +1085,7 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
                 Snapshot::read(s, None)?.hash()? == after,
                 "dirty_state: candidate differs from recorded changes"
             );
-            crate::app::validate_merged_review(s, main, &i.actor, i.role)
+            crate::review::validate_merged_review(s, main, &i.actor, i.role)
         });
         match committed {
             Ok(revision) => {
@@ -1112,7 +1117,7 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
     );
     candidate_ok(s, &i, &candidate)?;
     super::session::SqlSession::clean(s.shared.as_ref().unwrap())?;
-    crate::app::validate_merged_review(s, main, &i.actor, i.role)?;
+    crate::review::validate_merged_review(s, main, &i.actor, i.role)?;
     if !matches!(&i.stage,Stage::Candidate{revision}|Stage::Complete{revision} if revision==&candidate)
     {
         i.stage = Stage::Candidate {
@@ -1123,7 +1128,7 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
     // This durable candidate pointer precedes advancement of main. A receipt
     // confined to the temporary branch is never acknowledged as publication.
     s.select_shared("main")?;
-    confirm_accept_request(s, cli, &i)?;
+    confirm_accept_request(s, context, &i)?;
     s.sql(&format!("CALL DOLT_MERGE('--ff-only',{})",literal(&candidate)))
         .context("indeterminate_publication: reconcile the same operation ID; never refresh its token automatically")?;
     verify_receipt(s, &i.op_id, &i.args_hash)?;
@@ -1132,34 +1137,34 @@ fn publish_accept(s: &Store, cli: &Cli, main: &Graph, mut i: Intent) -> Result<V
 }
 pub(crate) fn accept(
     s: &Store,
-    cli: &Cli,
+    context: &OperationContext,
     main: &Graph,
     p: &Proposal,
     revisions: (&str, &str),
-    op: &str,
-    hash: &str,
 ) -> Result<Value> {
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
     let (base, proposal_revision) = revisions;
     let ancestor = s.merge_base(base, proposal_revision)?;
     let a = Snapshot::read(s, Some(&ancestor))?;
     let ours = Snapshot::read(s, Some(base))?;
     let theirs = Snapshot::read(s, Some(proposal_revision))?;
     let merged = merge(&a, &ours, &theirs)?;
-    let actor = cli.actor.as_deref().context("actor")?;
-    dry_candidate(s, main, base, proposal_revision, &ours, &merged, cli)?;
-    if cli.dry_run {
+    let actor = context.actor.as_deref().context("actor")?;
+    dry_candidate(s, main, base, proposal_revision, &ours, &merged, context)?;
+    if context.dry_run {
         return Ok(
-            json!({"dry_run":true,"validated":true,"proposal":p.branch,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(cli)?}),
+            json!({"dry_run":true,"validated":true,"proposal":p.branch,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(context)?}),
         );
     }
     let mut proposal = p.clone();
     proposal.status = "accepted".into();
-    if let Cmd::Review { reason, .. } = &cli.command {
-        proposal.reason = reason.clone();
+    if let Some(review) = &context.review {
+        proposal.reason = review.reason.clone();
     }
-    let result = json!({"branch":"main","proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(cli)?});
+    let result = json!({"branch":"main","proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(context)?});
     let sql = super::put("metadata", &p.branch, &proposal)?
-        + &crate::app::receipt(op, hash, actor, &cli.command, &result)?;
+        + &crate::review::receipt(op, hash, actor, &context.command, &result)?;
     let delta = changes(&sql, op)?;
     ensure!(
         !merged.rows["operations"].contains_key(op),
@@ -1170,7 +1175,7 @@ pub(crate) fn accept(
         op_id: op.into(),
         args_hash: hash.into(),
         actor: actor.into(),
-        role: cli.role,
+        role: context.role,
         result,
         plan: Plan::Accept {
             branch: format!("review/{}", uuid::Uuid::new_v4().simple()),
@@ -1190,21 +1195,21 @@ pub(crate) fn accept(
         "recovery_required: resume the reserved operation"
     );
     save(s, &i)?;
-    publish_accept(s, cli, main, i)
+    publish_accept(s, context, main, i)
 }
 pub(crate) fn resume(
     s: &Store,
-    cli: &Cli,
+    context: &OperationContext,
     main: &Graph,
     op: &str,
     hash: &str,
 ) -> Result<Option<Value>> {
-    let Some(i) = existing(s, cli, op, hash)? else {
+    let Some(i) = existing(s, context, op, hash)? else {
         return Ok(None);
     };
     let result = match &i.plan {
         Plan::Write { .. } => publish_write(s, i)?,
-        Plan::Accept { .. } => publish_accept(s, cli, main, i)?,
+        Plan::Accept { .. } => publish_accept(s, context, main, i)?,
         Plan::Abandon { .. } => finish_abandon(s, i)?,
     };
     Ok(Some(result))
@@ -1260,45 +1265,47 @@ fn finish_abandon(s: &Store, mut control: Intent) -> Result<Value> {
     s.select_shared(JOURNAL)?;
     Ok(control.result)
 }
-pub(crate) fn recover(s: &Store, cli: &Cli, op: &str, hash: &str) -> Result<Value> {
-    let Cmd::Recover {
-        operation,
-        abandon,
-        resume: requested_resume,
-        reason,
-    } = &cli.command
-    else {
-        bail!("not recovery")
-    };
+pub(crate) fn recover(s: &Store, context: &OperationContext) -> Result<Value> {
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
+    let recovery = context.recovery.as_ref().context("not recovery")?;
+    let operation = &recovery.operation;
+    let abandon = recovery.abandon;
+    let requested_resume = recovery.resume;
+    let reason = &recovery.reason;
     let mut original = read(s, operation)?
         .context("unknown shared operation; inspect its original command/receipt")?;
-    if *requested_resume && !cli.dry_run {
+    if requested_resume && !context.dry_run {
         ensure!(
-            cli.op_id.is_none(),
+            !context.explicit_op_id,
             "resume uses the original operation ID; omit --op-id"
         );
         ensure!(
-            Some(original.actor.as_str()) == cli.actor.as_deref() && original.role == cli.role,
+            Some(original.actor.as_str()) == context.actor.as_deref()
+                && original.role == context.role,
             "recovery attribution must match the original actor and role"
         );
         if let Some(result) = s.receipt(operation, &original.args_hash)? {
             return receipt_response(s, result, "main");
         }
         let main = s.graph()?;
-        let result = resume(s, cli, &main, operation, &original.args_hash)?
+        let result = resume(s, context, &main, operation, &original.args_hash)?
             .context("missing recovery intent")?;
         return receipt_response(s, result, "main");
     }
     let is_published = published(s, &original)?;
     let state = branch_state(s, &original)?;
-    if !abandon || cli.dry_run {
-        return crate::app::wrap(
+    if !abandon || context.dry_run {
+        return crate::review::wrap(
             s,
-            json!({"operation":operation,"stage":original.stage,"working_state":state,"published":is_published,"dry_run":cli.dry_run}),
+            json!({"operation":operation,"stage":original.stage,"working_state":state,"published":is_published,"dry_run":context.dry_run}),
             "main",
         );
     }
-    ensure!(cli.role == Role::Human, "abandonment requires --role human");
+    ensure!(
+        context.role == Role::Human,
+        "abandonment requires --role human"
+    );
     ensure!(
         !is_published,
         "already_published: abandonment cannot undo publication"
@@ -1334,8 +1341,8 @@ pub(crate) fn recover(s: &Store, cli: &Cli, op: &str, hash: &str) -> Result<Valu
         format: 1,
         op_id: op.into(),
         args_hash: hash.into(),
-        actor: cli.actor.clone().context("actor")?,
-        role: cli.role,
+        actor: context.actor.clone().context("actor")?,
+        role: context.role,
         result: json!({"branch":JOURNAL,"abandoned":operation,"reason":reason,"op_id":op}),
         plan: Plan::Abandon {
             operation: operation.clone(),

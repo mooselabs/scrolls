@@ -266,7 +266,13 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                 let result = json!({"identical_replay":true,"import":plan.summary["import"],"branch":"main","op_id":op});
                 if !cli.dry_run {
                     s.commit_checked(
-                        &crate::app::receipt_changes(op, &hash, actor, &cli.command, &result)?,
+                        &crate::review::receipt_changes(
+                            op,
+                            &hash,
+                            actor,
+                            &serde_json::to_value(&cli.command)?,
+                            &result,
+                        )?,
                         "record identical Markdown replay",
                         actor,
                         false,
@@ -310,11 +316,11 @@ pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             )?);
             changes.push(Change::put("metadata", "markdown_import", &plan)?);
             let result = json!({"import":i.info,"candidate_digest":plan.candidate_digest,"op_id":op,"branch":"main"});
-            changes.extend(crate::app::receipt_changes(
+            changes.extend(crate::review::receipt_changes(
                 op,
                 &hash,
                 actor,
-                &cli.command,
+                &serde_json::to_value(&cli.command)?,
                 &result,
             )?);
             let sql_bytes = changes.to_sql().len();
