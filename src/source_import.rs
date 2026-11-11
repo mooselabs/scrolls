@@ -3,12 +3,10 @@ use crate::model::import_types::tuple;
 // BKLG-20261108-6zdg: retain public importer paths for the model-owned types.
 pub use crate::model::import_types::{File, Member, Source};
 use crate::{
-    cli::*,
     model::*,
     policy,
     profile::{self, Profile},
-    storage::Store,
-    store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
+    store::{self, Change, ChangeSet, KnowledgeStore, OperationContext, ProposalWrite},
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -702,383 +700,379 @@ pub fn same(a: &Source, b: &Source) -> bool {
         && a.schema_hash == b.schema_hash
         && a.contract == b.contract
 }
-// A shared import retains one locked SQL connection from its first base read
-// through publication. Local imports keep their existing read/build/write path.
-enum ImportStore<'a> {
-    Shared(&'a Store),
-    Local(Store),
+fn envelope(data: Value) -> Value {
+    json!({"schema_version":2,"ok":true,"data":data})
 }
-impl std::ops::Deref for ImportStore<'_> {
-    type Target = Store;
-    fn deref(&self) -> &Store {
-        match self {
-            Self::Shared(s) => s,
-            Self::Local(s) => s,
+fn response(s: &dyn KnowledgeStore, data: Value) -> Result<Value> {
+    if s.shared() {
+        s.receipt_response(data, "main")
+    } else {
+        Ok(envelope(data))
+    }
+}
+pub fn validate_profile(s: &dyn KnowledgeStore, file: &Path) -> Result<Value> {
+    let rev = s.head("main")?;
+    let g = store::graph(s, Some(&rev))?;
+    let text = read_profile(file)?;
+    let p = Profile::parse(&text, &g.schema)?;
+    Ok(envelope(
+        json!({"valid":true,"profile":p,"schema_revision":g.schema.revision(),"compiled_hash":p.hash()?}),
+    ))
+}
+pub struct PlanRequest<'a> {
+    pub repository: &'a Path,
+    pub root: &'a str,
+    pub revision: &'a str,
+    pub source_id: &'a str,
+    pub profile: &'a str,
+    pub out: &'a Path,
+    pub actor: &'a str,
+    pub role: Role,
+    pub store_directory: Option<&'a Path>,
+}
+
+pub struct PlanBase {
+    store_id: String,
+    main_revision: String,
+    graph: Graph,
+}
+
+pub fn plan_base(s: &dyn KnowledgeStore) -> Result<PlanBase> {
+    let rev = s.head("main")?;
+    ensure!(
+        store::one::<u32>(s, "metadata", "schema", Some(&rev))?
+            == Some(if s.shared() { 5 } else { 4 }),
+        "store format 4 required; run migrate"
+    );
+    Ok(PlanBase {
+        store_id: store::one(s, "metadata", "store_id", Some(&rev))?
+            .context("missing store UUID")?,
+        main_revision: rev.clone(),
+        graph: store::graph(s, Some(&rev))?,
+    })
+}
+
+pub fn plan(base: PlanBase, request: PlanRequest<'_>) -> Result<Value> {
+    let PlanBase {
+        store_id,
+        main_revision,
+        graph: g,
+    } = base;
+    let PlanRequest {
+        repository: repo,
+        root,
+        revision: rev,
+        source_id,
+        out,
+        actor,
+        ..
+    } = request;
+    let source = source(
+        repo,
+        root,
+        rev,
+        source_id,
+        request.profile,
+        &g.schema,
+        actor,
+        request.role.name(),
+    )?;
+    let mut base = g.clone();
+    if let Some(existing) = base.import_sources.get(source_id) {
+        ensure!(
+            same(existing, &source),
+            "source_update_unsupported: source {source_id} already has a different snapshot; use an independent namespace"
+        );
+        remove_source(&mut base, source_id);
+    }
+    let candidate = build(&base, &source)?;
+    let changes = planned_changes(&candidate);
+    let mut plan = Plan {
+        format: 1,
+        store_id,
+        main_revision,
+        schema_hash: g.schema.revision(),
+        actor: actor.into(),
+        role: request.role.name().into(),
+        source: candidate.source,
+        limits: limits(),
+        changes,
+        digest: String::new(),
+    };
+    plan.seal()?;
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .canonicalize()?;
+    if let Some(directory) = request.store_directory {
+        ensure!(
+            !parent.starts_with(directory.canonicalize()?),
+            "invalid_plan_destination: plan must be outside the store"
+        );
+    }
+    write_plan(out, &plan)?;
+    Ok(envelope(
+        json!({"plan":out,"digest":plan.digest,"candidate_digest":plan.source.candidate_digest,"coverage":plan.source.coverage,"source":plan.source.source_id,"main_revision":plan.main_revision}),
+    ))
+}
+/// Attribution and the original command JSON supplied by an adapter.
+pub struct Invocation<'a> {
+    pub actor: &'a str,
+    pub role: Role,
+    pub op_id: Option<&'a str>,
+    pub dry_run: bool,
+    pub command: Value,
+}
+impl Invocation<'_> {
+    pub fn context(self, op: &str, hash: String) -> OperationContext {
+        OperationContext {
+            op_id: op.into(),
+            args_hash: hash,
+            explicit_op_id: self.op_id.is_some(),
+            actor: Some(self.actor.into()),
+            role: self.role,
+            dry_run: self.dry_run,
+            command: self.command,
+            review: None,
+            recovery: None,
         }
     }
 }
-fn shared_store(cli: &Cli) -> Result<Option<Store>> {
-    cli.connection
-        .as_ref()
-        .map(|connection| {
-            if matches!(
-                cli.command,
-                Cmd::Import {
-                    command: ImportCommand::Apply { .. }
-                }
-            ) && !cli.dry_run
-            {
-                Store::open_shared_recovery(
-                    connection,
-                    &cli.store,
-                    cli.op_id
-                        .as_deref()
-                        .context("import apply requires --op-id ID")?,
-                )
-            } else {
-                Store::open_shared(connection, &cli.store)
-            }
+pub struct ApplyRequest {
+    pub plan: Plan,
+    pub context: OperationContext,
+}
+impl ApplyRequest {
+    pub fn read(file: &Path, invocation: Invocation<'_>) -> Result<Self> {
+        ensure!(
+            fs::metadata(file)?.len() <= TOTAL_LIMIT,
+            "input_limit: plan exceeds 1 GiB"
+        );
+        let bytes = fs::read(file)?;
+        let plan: Plan = serde_json::from_slice(&bytes).context("stale_plan: invalid plan")?;
+        plan.verify()?;
+        ensure!(
+            invocation.actor == plan.actor && invocation.role.name() == plan.role,
+            "stale_plan: actor or role differs; replan"
+        );
+        let op = invocation
+            .op_id
+            .context("import apply requires --op-id ID")?;
+        let hash = digest(serde_json::to_vec(
+            &json!({"import_plan":plan.digest,"actor":invocation.actor,"role":invocation.role.name()}),
+        )?);
+        Ok(Self {
+            plan,
+            context: invocation.context(op, hash),
         })
-        .transpose()
-}
-fn import_store<'a>(
-    cli: &Cli,
-    shared: Option<&'a Store>,
-    readonly: bool,
-) -> Result<ImportStore<'a>> {
-    if let Some(s) = shared {
-        return Ok(ImportStore::Shared(s));
     }
+}
+/// Read-only inspection; the adapter drops its local read lock before building.
+pub enum ApplyPreparation {
+    Response(Value),
+    Retry(Value),
+    Build(Box<Graph>),
+}
+fn retry_preparation(context: &OperationContext, result: Value) -> ApplyPreparation {
+    if context.dry_run {
+        ApplyPreparation::Response(envelope(json!({"dry_run":true,"result":result})))
+    } else {
+        ApplyPreparation::Retry(result)
+    }
+}
+pub fn prepare_apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<ApplyPreparation> {
+    let plan = &request.plan;
+    let context = &request.context;
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
+    let rev = s.head("main")?;
     ensure!(
-        cli.connection.is_none(),
-        "shared import session missing; local fallback refused"
+        store::one::<String>(s, "metadata", "store_id", Some(&rev))?.as_deref()
+            == Some(&plan.store_id),
+        "stale_plan: wrong store UUID"
     );
-    Ok(ImportStore::Local(if readonly {
-        Store::open_readonly(&cli.store, &cli.dolt)?
-    } else {
-        Store::open(&cli.store, &cli.dolt, false)?
-    }))
-}
-fn response(s: &Store, data: Value) -> Result<Value> {
-    if s.is_shared() {
-        crate::storage::shared_review::receipt_response(s, data, "main")
-    } else {
-        Ok(json!({"schema_version":2,"ok":true,"data":data}))
+    // Completed operation retry precedes every stale-base and source-object check.
+    if let Some(result) = KnowledgeStore::receipt(s, op, hash)? {
+        return Ok(ApplyPreparation::Response(response(s, replay(s, result)?)?));
     }
-}
-/// Handle import profile commands before the ordinary opener, keeping planning read-only.
-pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
-    let envelope = |data: Value| json!({"schema_version":2,"ok":true,"data":data});
-    if let ImportCommand::Profiles { command } = command {
-        match command {
-            ProfileCommand::List => {
-                return Ok(envelope(
-                    json!({"profiles":[{"name":"pep","description":"Python Enhancement Proposals"},{"name":"handbook","description":"Markdown handbook"}]}),
-                ));
-            }
-            ProfileCommand::Show { name } => {
-                return Ok(envelope(
-                    json!({"name":name,"yaml":profile::bundled(name)?}),
-                ));
-            }
-            ProfileCommand::Validate { file } => {
-                let shared = shared_store(cli)?;
-                let s = import_store(cli, shared.as_ref(), true)?;
-                let rev = s.head("main")?;
-                let g = s.graph_at(&rev)?;
-                let text = read_profile(file)?;
-                let p = Profile::parse(&text, &g.schema)?;
-                return Ok(envelope(
-                    json!({"valid":true,"profile":p,"schema_revision":g.schema.revision(),"compiled_hash":p.hash()?}),
-                ));
-            }
+    let g = store::graph(s, Some(&rev))?;
+    if s.shared() && !context.dry_run {
+        if let Some(result) = KnowledgeStore::resume(s, context, &g, op, hash)? {
+            return Ok(ApplyPreparation::Response(response(s, result)?));
         }
     }
-    ensure!(
-        cli.proposal.is_none(),
-        "import only operates on main; omit --proposal"
-    );
-    let actor = cli
-        .actor
-        .as_deref()
-        .context("planning/apply requires --actor")?;
-    ensure!(
-        !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
-        "invalid actor"
-    );
-    let shared = shared_store(cli)?;
-    match command {
-        ImportCommand::Plan {
-            command:
-                PlanCommand::Git {
-                    repo,
-                    root,
-                    rev,
-                    source: source_id,
-                    profile: profile_name,
-                    profile_file,
-                    out,
-                },
-        } => {
-            let text = if let Some(name) = profile_name {
-                profile::bundled(name)?.to_string()
-            } else {
-                read_profile(
-                    profile_file
-                        .as_ref()
-                        .context("select --profile or --profile-file")?,
-                )?
-            };
-            let (store_id, main_revision, g) = {
-                let s = import_store(cli, shared.as_ref(), true)?;
-                let rev = s.head("main")?;
-                ensure!(
-                    s.one_at::<u32>("metadata", "schema", &rev)?
-                        == Some(if s.is_shared() { 5 } else { 4 }),
-                    "store format 4 required; run migrate"
-                );
-                (
-                    s.one_at::<String>("metadata", "store_id", &rev)?
-                        .context("missing store UUID")?,
-                    rev.clone(),
-                    s.graph_at(&rev)?,
-                )
-            };
-            let source = source(
-                repo,
-                root,
-                rev,
-                source_id,
-                &text,
-                &g.schema,
-                actor,
-                cli.role.name(),
-            )?;
-            let mut base = g.clone();
-            if let Some(existing) = base.import_sources.get(source_id) {
-                ensure!(
-                    same(existing, &source),
-                    "source_update_unsupported: source {source_id} already has a different snapshot; use an independent namespace"
-                );
-                remove_source(&mut base, source_id);
-            }
-            let candidate = build(&base, &source)?;
-            let changes = planned_changes(&candidate);
-            let mut plan = Plan {
-                format: 1,
-                store_id,
-                main_revision,
-                schema_hash: g.schema.revision(),
-                actor: actor.into(),
-                role: cli.role.name().into(),
-                source: candidate.source,
-                limits: limits(),
-                changes,
-                digest: String::new(),
-            };
-            plan.seal()?;
-            let parent = out
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."))
-                .canonicalize()?;
+    if let Some(existing) = g.import_sources.get(&plan.source.source_id) {
+        ensure!(
+            same(existing, &plan.source)
+                && existing.candidate_digest == plan.source.candidate_digest,
+            "source_update_unsupported: source already accepted with different content"
+        );
+        let result = json!({"identical_replay":true,"source":existing.source_id,"branch":"main","op_id":op,"original_op_id":existing.op_id});
+        return Ok(retry_preparation(context, result));
+    }
+    for proposal in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
+        let pending = store::graph(s, Some(&proposal.branch))?;
+        if let Some(existing) = pending.import_sources.get(&plan.source.source_id) {
             ensure!(
-                cli.connection.is_some() || !parent.starts_with(cli.store.canonicalize()?),
-                "invalid_plan_destination: plan must be outside the store"
+                same(existing, &plan.source)
+                    && existing.candidate_digest == plan.source.candidate_digest,
+                "source_update_unsupported: pending namespace has different snapshot; resolve {}",
+                proposal.branch
             );
-            write_plan(out, &plan)?;
-            Ok(envelope(
-                json!({"plan":out,"digest":plan.digest,"candidate_digest":plan.source.candidate_digest,"coverage":plan.source.coverage,"source":plan.source.source_id,"main_revision":plan.main_revision}),
-            ))
+            let receipt: Value =
+                store::one(s, "operations", &existing.op_id, Some(&proposal.branch))?
+                    .context("missing pending import receipt")?;
+            let mut result = receipt["result"].clone();
+            result["original_op_id"] = result["op_id"].clone();
+            result["op_id"] = json!(op);
+            return Ok(retry_preparation(context, result));
         }
-        ImportCommand::Apply { plan: file } => {
-            ensure!(
-                fs::metadata(file)?.len() <= TOTAL_LIMIT,
-                "input_limit: plan exceeds 1 GiB"
-            );
-            let bytes = fs::read(file)?;
-            let plan: Plan = serde_json::from_slice(&bytes).context("stale_plan: invalid plan")?;
-            plan.verify()?;
-            ensure!(
-                actor == plan.actor && cli.role.name() == plan.role,
-                "stale_plan: actor or role differs; replan"
-            );
-            let op = cli
-                .op_id
-                .as_deref()
-                .context("import apply requires --op-id ID")?;
-            let hash = digest(serde_json::to_vec(
-                &json!({"import_plan":plan.digest,"actor":actor,"role":cli.role.name()}),
-            )?);
-            let before = {
-                let s = import_store(cli, shared.as_ref(), true)?;
-                let rev = s.head("main")?;
+    }
+    if s.shared() {
+        s.check_import_reservation(&plan.source.source_id, op)?;
+    }
+    ensure!(
+        rev == plan.main_revision && g.schema.revision() == plan.schema_hash,
+        "stale_plan: main or schema changed; replan"
+    );
+    Ok(ApplyPreparation::Build(Box::new(g)))
+}
+pub enum PreparedApply {
+    Retry(Value),
+    Candidate {
+        before: Box<Graph>,
+        candidate: Box<Candidate>,
+    },
+}
+impl ApplyPreparation {
+    pub fn build(self, plan: &Plan) -> Result<PreparedApply> {
+        match self {
+            Self::Retry(result) => Ok(PreparedApply::Retry(result)),
+            Self::Build(before) => {
+                let candidate = build(&before, &plan.source)?;
                 ensure!(
-                    s.one_at::<String>("metadata", "store_id", &rev)?.as_deref()
-                        == Some(&plan.store_id),
-                    "stale_plan: wrong store UUID"
+                    candidate.source.candidate_digest == plan.source.candidate_digest
+                        && candidate.source.coverage == plan.source.coverage
+                        && planned_changes(&candidate) == plan.changes,
+                    "stale_plan: recomputed candidate differs; replan"
                 );
-                // Completed operation retry precedes every stale-base and source-object check.
-                if let Some(result) = KnowledgeStore::receipt(&*s, op, &hash)? {
-                    return response(&s, replay(&s, result)?);
-                }
-                let g = s.graph_at(&rev)?;
-                if s.is_shared() && !cli.dry_run {
-                    if let Some(result) = KnowledgeStore::resume(
-                        &*s,
-                        &cli.operation_context(op, &hash)?,
-                        &g,
-                        op,
-                        &hash,
-                    )? {
-                        return response(&s, result);
-                    }
-                }
-                if let Some(existing) = g.import_sources.get(&plan.source.source_id) {
-                    ensure!(
-                        same(existing, &plan.source)
-                            && existing.candidate_digest == plan.source.candidate_digest,
-                        "source_update_unsupported: source already accepted with different content"
-                    );
-                    let result = json!({"identical_replay":true,"source":existing.source_id,"branch":"main","op_id":op,"original_op_id":existing.op_id});
-                    drop(s);
-                    return noop_receipt(cli, shared.as_ref(), &plan, op, &hash, result);
-                }
-                for proposal in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
-                    let pending = s.graph_at(&proposal.branch)?;
-                    if let Some(existing) = pending.import_sources.get(&plan.source.source_id) {
-                        ensure!(
-                            same(existing, &plan.source)
-                                && existing.candidate_digest == plan.source.candidate_digest,
-                            "source_update_unsupported: pending namespace has different snapshot; resolve {}",
-                            proposal.branch
-                        );
-                        let receipt: Value = s
-                            .one_at("operations", &existing.op_id, &proposal.branch)?
-                            .context("missing pending import receipt")?;
-                        let mut result = receipt["result"].clone();
-                        result["original_op_id"] = result["op_id"].clone();
-                        result["op_id"] = json!(op);
-                        drop(s);
-                        return noop_receipt(cli, shared.as_ref(), &plan, op, &hash, result);
-                    }
-                }
-                if s.is_shared() {
-                    crate::storage::shared_review::check_import_reservation(
-                        &s,
-                        &plan.source.source_id,
-                        op,
-                    )?;
-                }
-                ensure!(
-                    rev == plan.main_revision && g.schema.revision() == plan.schema_hash,
-                    "stale_plan: main or schema changed; replan"
-                );
-                g
-            };
-            let mut candidate = build(&before, &plan.source)?;
-            ensure!(
-                candidate.source.candidate_digest == plan.source.candidate_digest
-                    && candidate.source.coverage == plan.source.coverage
-                    && planned_changes(&candidate) == plan.changes,
-                "stale_plan: recomputed candidate differs; replan"
-            );
-            let s = import_store(cli, shared.as_ref(), false)?;
-            s.checkout("main")?;
-            if let Some(result) = KnowledgeStore::receipt(&*s, op, &hash)? {
-                return response(&s, replay(&s, result)?);
+                Ok(PreparedApply::Candidate {
+                    before,
+                    candidate: Box::new(candidate),
+                })
             }
-            ensure!(
-                s.head("main")? == plan.main_revision
-                    && s.one::<String>("metadata", "store_id")?.as_deref() == Some(&plan.store_id),
-                "stale_plan: main changed during parsing; replan"
-            );
-            // Pending proposals do not advance main, so repeat namespace checks under the write lock.
-            for p in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
-                ensure!(
-                    !s.graph_at(&p.branch)?
-                        .import_sources
-                        .contains_key(&plan.source.source_id),
-                    "source_update_unsupported: namespace reserved by {}; retry to inspect the pending import",
-                    p.branch
-                );
-            }
-            let protected = candidate.source.coverage["review_required"] == true;
-            let target = if protected {
-                format!("proposal/{}", uuid::Uuid::new_v4().simple())
-            } else {
-                "main".into()
-            };
-            policy::validate_change(&before, &candidate.graph, &BTreeSet::new())?;
-            if !protected {
-                candidate
-                    .graph
-                    .schema
-                    .guards(&before, &candidate.graph, actor, cli.role.name())?;
-            }
-            let result = json!({"source":candidate.source.source_id,"branch":target,"op_id":op,"candidate_digest":candidate.source.candidate_digest,"coverage":candidate.source.coverage});
-            if cli.dry_run {
-                return Ok(envelope(json!({"dry_run":true,"result":result})));
-            }
-            candidate.source.imported_at = now();
-            candidate.source.op_id = op.into();
-            candidate
-                .graph
+            Self::Response(_) => bail!("import response already completed"),
+        }
+    }
+}
+pub fn apply(
+    s: &dyn KnowledgeStore,
+    request: &ApplyRequest,
+    prepared: PreparedApply,
+) -> Result<Value> {
+    let plan = &request.plan;
+    let context = &request.context;
+    let actor = plan.actor.as_str();
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
+    let (before, mut candidate) = match prepared {
+        PreparedApply::Retry(result) => return noop_receipt(s, request, result),
+        PreparedApply::Candidate { before, candidate } => (before, candidate),
+    };
+    s.select_branch("main")?;
+    if let Some(result) = KnowledgeStore::receipt(s, op, hash)? {
+        return response(s, replay(s, result)?);
+    }
+    ensure!(
+        s.head("main")? == plan.main_revision
+            && store::one::<String>(s, "metadata", "store_id", None)?.as_deref()
+                == Some(&plan.store_id),
+        "stale_plan: main changed during parsing; replan"
+    );
+    // Pending proposals do not advance main, so repeat namespace checks under the write lock.
+    for p in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
+        ensure!(
+            !store::graph(s, Some(&p.branch))?
                 .import_sources
-                .insert(candidate.source.source_id.clone(), candidate.source.clone());
-            let mut changes = ChangeSet::graph(&before, &candidate.graph)?;
-            changes.extend(candidate_changes(&candidate)?);
-            let proposal = protected.then(|| Proposal {
-                branch: target.clone(),
-                base: plan.main_revision.clone(),
-                actor: actor.into(),
-                status: "pending".into(),
-                reason: None,
-            });
-            if let Some(p) = &proposal {
-                changes.push(Change::put("metadata", &target, p)?);
-            }
-            changes.extend(crate::review::receipt_changes(
-                op,
-                &hash,
-                actor,
-                &serde_json::to_value(&cli.command)?,
-                &result,
-            )?);
-            let message = format!("import source {} by {actor}", candidate.source.source_id);
-            if let Some(p) = &proposal {
-                let published = s.propose(
-                    &cli.operation_context(op, &hash)?,
-                    ProposalWrite {
-                        changes: &changes,
-                        message: &message,
-                        target: &target,
-                        start: Some("main"),
-                        proposal: p,
-                        result: &result,
-                    },
-                )?;
-                return response(&s, published);
-            }
-            if s.is_shared() {
-                s.commit_checked(&changes, &message, actor, false, &mut || {
-                    let actual = s.graph()?;
-                    policy::validate_change(&before, &actual, &BTreeSet::new())?;
-                    crate::source_import::health(&actual, &s.import_files()?)?;
-                    actual
-                        .schema
-                        .guards(&before, &actual, actor, cli.role.name())?;
-                    Ok(())
-                })?;
-            } else {
-                s.commit(&changes, &message, actor)?;
-            }
-            response(&s, result)
-        }
-        _ => bail!("unsupported import command"),
+                .contains_key(&plan.source.source_id),
+            "source_update_unsupported: namespace reserved by {}; retry to inspect the pending import",
+            p.branch
+        );
     }
+    let protected = candidate.source.coverage["review_required"] == true;
+    let target = if protected {
+        format!("proposal/{}", uuid::Uuid::new_v4().simple())
+    } else {
+        "main".into()
+    };
+    policy::validate_change(&before, &candidate.graph, &BTreeSet::new())?;
+    if !protected {
+        candidate
+            .graph
+            .schema
+            .guards(&before, &candidate.graph, actor, context.role.name())?;
+    }
+    let result = json!({"source":candidate.source.source_id,"branch":target,"op_id":op,"candidate_digest":candidate.source.candidate_digest,"coverage":candidate.source.coverage});
+    if context.dry_run {
+        return Ok(envelope(json!({"dry_run":true,"result":result})));
+    }
+    candidate.source.imported_at = now();
+    candidate.source.op_id = op.into();
+    candidate
+        .graph
+        .import_sources
+        .insert(candidate.source.source_id.clone(), candidate.source.clone());
+    let mut changes = ChangeSet::graph(&before, &candidate.graph)?;
+    changes.extend(candidate_changes(&candidate)?);
+    let proposal = protected.then(|| Proposal {
+        branch: target.clone(),
+        base: plan.main_revision.clone(),
+        actor: actor.into(),
+        status: "pending".into(),
+        reason: None,
+    });
+    if let Some(p) = &proposal {
+        changes.push(Change::put("metadata", &target, p)?);
+    }
+    changes.extend(crate::review::receipt_changes(
+        op,
+        hash,
+        actor,
+        &context.command,
+        &result,
+    )?);
+    let message = format!("import source {} by {actor}", candidate.source.source_id);
+    if let Some(p) = &proposal {
+        let published = s.propose(
+            context,
+            ProposalWrite {
+                changes: &changes,
+                message: &message,
+                target: &target,
+                start: Some("main"),
+                proposal: p,
+                result: &result,
+            },
+        )?;
+        return response(s, published);
+    }
+    if s.shared() {
+        s.commit_checked(&changes, &message, actor, false, &mut || {
+            let actual = store::graph(s, None)?;
+            policy::validate_change(&before, &actual, &BTreeSet::new())?;
+            crate::source_import::health(&actual, &store::import_files(s, None)?)?;
+            actual
+                .schema
+                .guards(&before, &actual, actor, context.role.name())?;
+            Ok(())
+        })?;
+    } else {
+        s.commit(&changes, &message, actor)?;
+    }
+    response(s, result)
 }
-fn read_profile(path: &Path) -> Result<String> {
+pub fn read_profile(path: &Path) -> Result<String> {
     let meta = fs::metadata(path)?;
     ensure!(
         meta.len() <= profile::METADATA_LIMIT as u64,
@@ -1086,7 +1080,7 @@ fn read_profile(path: &Path) -> Result<String> {
     );
     Ok(fs::read_to_string(path)?)
 }
-fn replay(s: &Store, mut result: Value) -> Result<Value> {
+fn replay(s: &dyn KnowledgeStore, mut result: Value) -> Result<Value> {
     if let Some(branch) = result["branch"].as_str() {
         if let Some(p) = s.proposals()?.iter().find(|p| p.branch == branch) {
             result["proposal_status"] = json!(p.status);
@@ -1201,24 +1195,17 @@ pub fn health(g: &Graph, files: &[File]) -> Result<Value> {
     )
 }
 
-fn noop_receipt(
-    cli: &Cli,
-    shared: Option<&Store>,
-    plan: &Plan,
-    op: &str,
-    hash: &str,
-    result: Value,
-) -> Result<Value> {
-    if cli.dry_run {
-        return Ok(json!({"schema_version":2,"ok":true,"data":{"dry_run":true,"result":result}}));
-    }
-    let s = import_store(cli, shared, false)?;
-    s.checkout("main")?;
-    if let Some(existing) = KnowledgeStore::receipt(&*s, op, hash)? {
-        return response(&s, replay(&s, existing)?);
+fn noop_receipt(s: &dyn KnowledgeStore, request: &ApplyRequest, result: Value) -> Result<Value> {
+    let plan = &request.plan;
+    let context = &request.context;
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
+    s.select_branch("main")?;
+    if let Some(existing) = KnowledgeStore::receipt(s, op, hash)? {
+        return response(s, replay(s, existing)?);
     }
     ensure!(
-        s.one::<String>("metadata", "store_id")?.as_deref() == Some(&plan.store_id),
+        store::one::<String>(s, "metadata", "store_id", None)?.as_deref() == Some(&plan.store_id),
         "stale_plan: wrong store"
     );
     let branch = result["branch"].as_str().context("replay branch")?;
@@ -1230,7 +1217,7 @@ fn noop_receipt(
             "stale_plan: proposal changed; retry with a fresh plan"
         );
     }
-    let g = s.graph_at(branch)?;
+    let g = store::graph(s, Some(branch))?;
     let source = g
         .import_sources
         .get(&plan.source.source_id)
@@ -1239,21 +1226,15 @@ fn noop_receipt(
         same(source, &plan.source) && source.candidate_digest == plan.source.candidate_digest,
         "source_update_unsupported: source differs"
     );
-    let changes = crate::review::receipt_changes(
-        op,
-        hash,
-        &plan.actor,
-        &serde_json::to_value(&cli.command)?,
-        &result,
-    )?;
+    let changes = crate::review::receipt_changes(op, hash, &plan.actor, &context.command, &result)?;
     // A receipt changes no captured data. Keeping it on the source branch preserves proposal isolation.
-    s.checkout(branch)?;
+    s.select_branch(branch)?;
     s.commit(
         &changes,
         "record identical source import retry",
         &plan.actor,
     )?;
-    response(&s, replay(&s, result)?)
+    response(s, replay(s, result)?)
 }
 
 fn planned_changes(candidate: &Candidate) -> Value {
