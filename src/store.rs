@@ -158,7 +158,7 @@ pub trait KnowledgeStore {
     fn shared(&self) -> bool;
 }
 
-fn one<T: DeserializeOwned>(
+pub(crate) fn one<T: DeserializeOwned>(
     store: &dyn KnowledgeStore,
     table: &str,
     id: &str,

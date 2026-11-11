@@ -1,8 +1,7 @@
 //! Explicit Beads I/O. Graph reads never start a subprocess.
 use crate::{
-    cli::{BeadsCommand, Cli, Target},
     model::*,
-    storage::Store,
+    store::{self, KnowledgeStore},
     work_ref::*,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -16,6 +15,37 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+/// Explicit inputs from a transport; command serialization is publication identity.
+pub struct Request<'a> {
+    pub dry_run: bool,
+    pub actor: Option<&'a str>,
+    pub op_id: Option<&'a str>,
+    pub proposal: Option<&'a str>,
+    pub command: &'a Operation,
+}
+
+#[derive(Debug, Serialize)]
+pub enum Operation {
+    Bind {
+        name: String,
+        directory: PathBuf,
+        bd: PathBuf,
+        timeout: u64,
+    },
+    List,
+    Refs {
+        reference: String,
+    },
+    Refresh(Target),
+    Publish(Target),
+}
+
+#[derive(Debug, Serialize)]
+pub struct Target {
+    pub reference: Option<String>,
+    pub all: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Binding {
@@ -254,11 +284,17 @@ fn targets(g: &Graph, local: &Local, target: &Target) -> Result<BTreeSet<BeadRef
         .map(|e| BeadRef::parse(&e.to))
         .collect()
 }
-pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> Result<Value> {
-    let mut local = Local::load(&store.root)?;
+pub fn run(
+    store: &dyn KnowledgeStore,
+    root: &Path,
+    graph: &Graph,
+    request: &Request<'_>,
+) -> Result<Value> {
+    let command = request.command;
+    let mut local = Local::load(root)?;
     let revision = store.revision()?;
     match command {
-        BeadsCommand::Bind {
+        Operation::Bind {
             name,
             directory,
             bd,
@@ -288,23 +324,23 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                     "cannot rebind a name to another project"
                 );
             }
-            let result = json!({"name":name,"binding":binding,"dry_run":cli.dry_run});
+            let result = json!({"name":name,"binding":binding,"dry_run":request.dry_run});
             local.bindings.insert(name.clone(), binding);
-            if !cli.dry_run {
-                local.save(&store.root)?;
+            if !request.dry_run {
+                local.save(root)?;
             }
             Ok(result)
         }
-        BeadsCommand::List => Ok(
+        Operation::List => Ok(
             json!({"bindings":local.bindings,"cache":local.cache,"publications":local.publications}),
         ),
-        BeadsCommand::Refs { reference } => {
+        Operation::Refs { reference } => {
             let reference = local.resolve(reference)?.uri();
             Ok(
                 json!({"reference":reference,"bead":local.summary(&reference),"documents":refs(graph,&reference)}),
             )
         }
-        BeadsCommand::Refresh(target) => {
+        Operation::Refresh(target) => {
             let mut results = vec![];
             for reference in targets(graph, &local, target)? {
                 let uri = reference.uri();
@@ -323,22 +359,23 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                 results.push(summary.clone());
                 local.cache.insert(uri, summary);
             }
-            if !cli.dry_run {
-                local.save(&store.root)?;
+            if !request.dry_run {
+                local.save(root)?;
             }
             Ok(
-                json!({"failed":results.iter().filter(|r|r["error"].is_string()).count(),"results":results,"dry_run":cli.dry_run}),
+                json!({"failed":results.iter().filter(|r|r["error"].is_string()).count(),"results":results,"dry_run":request.dry_run}),
             )
         }
-        BeadsCommand::Publish(target) => {
-            ensure!(cli.proposal.is_none(), "publish uses main; omit --proposal");
-            let actor = cli
+        Operation::Publish(target) => {
+            ensure!(
+                request.proposal.is_none(),
+                "publish uses main; omit --proposal"
+            );
+            let actor = request
                 .actor
-                .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .context("publish requires --actor NAME")?;
-            let store_id: String = store
-                .one("metadata", "store_id")?
+            let store_id: String = store::one(store, "metadata", "store_id", None)?
                 .context("run scrolls migrate first")?;
             let key = format!("scrolls/{}", uuid::Uuid::parse_str(&store_id)?.simple());
             let mut targets = targets(graph, &local, target)?;
@@ -374,27 +411,27 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                     }
                 }
             }
-            let op = cli
+            let op = request
                 .op_id
-                .clone()
+                .map(str::to_owned)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let hash = digest(serde_json::to_vec(
                 &json!({"command":command,"actor":actor,"revision":revision}),
             )?);
             // Detect collisions with both graph-operation and publication receipts.
-            let _ = crate::store::KnowledgeStore::receipt(store, &op, &hash)?;
+            let _ = store.receipt(&op, &hash)?;
             if let Some(old) = local.operations.get(&op) {
                 ensure!(
                     old["hash"] == hash,
                     "--op-id already used with different arguments or Scrolls revision"
                 );
             }
-            if !cli.dry_run {
+            if !request.dry_run {
                 local.operations.insert(
                     op.clone(),
                     json!({"hash":hash,"revision":revision,"started_at":now()}),
                 );
-                local.save(&store.root)?;
+                local.save(root)?;
             }
             for reference in targets {
                 let uri = reference.uri();
@@ -426,7 +463,7 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                     } else {
                         "update"
                     };
-                    if !cli.dry_run && !equal {
+                    if !request.dry_run && !equal {
                         let mut args = vec!["update".into(), reference.issue_id.clone()];
                         if desired.is_null() {
                             args.extend(["--unset-metadata".into(), key.clone()]);
@@ -444,25 +481,25 @@ pub fn run(cli: &Cli, store: &Store, graph: &Graph, command: &BeadsCommand) -> R
                         );
                     }
                     Ok(
-                        json!({"reference":uri,"action":action,"projection":if equal { current.clone() } else { desired },"verified":!cli.dry_run,"source_commit":revision}),
+                        json!({"reference":uri,"action":action,"projection":if equal { current.clone() } else { desired },"verified":!request.dry_run,"source_commit":revision}),
                     )
                 })();
                 let row = match outcome {
                     Ok(row) => row,
                     Err(e) => json!({"reference":uri,"error":format!("{e:#}")}),
                 };
-                if !cli.dry_run {
+                if !request.dry_run {
                     local
                         .publications
                         .insert(uri, json!({"op_id":op,"attempted_at":now(),"result":row}));
-                    local.save(&store.root)?;
+                    local.save(root)?;
                 }
                 results.push(row);
             }
-            let result = json!({"op_id":op,"source_commit":revision,"results":results,"failed":results.iter().filter(|r| r["error"].is_string()).count(),"dry_run":cli.dry_run});
-            if !cli.dry_run {
+            let result = json!({"op_id":op,"source_commit":revision,"results":results,"failed":results.iter().filter(|r| r["error"].is_string()).count(),"dry_run":request.dry_run});
+            if !request.dry_run {
                 local.operations.get_mut(&op).unwrap()["result"] = result.clone();
-                local.save(&store.root)?;
+                local.save(root)?;
             }
             Ok(result)
         }

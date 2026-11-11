@@ -1,13 +1,20 @@
 //! Shared document projections and explicitly bound, declarative predicates.
 use crate::{
-    cli::Filters,
     model::*,
     schema::{Direction, neighbor},
 };
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
+#[derive(Debug, Serialize, Default)]
+pub struct Filters {
+    pub kind: Option<String>,
+    pub status: Option<String>,
+    pub owner: Option<String>,
+    pub field: Vec<String>,
+}
+
 pub fn projection(r: &Record) -> Result<Value> {
     let mut v = serde_json::to_value(r)?;
     v.as_object_mut().unwrap().remove("original");

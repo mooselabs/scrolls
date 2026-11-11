@@ -1104,6 +1104,37 @@ impl KnowledgeStore for Store {
     }
 }
 
+pub(crate) fn validate_merged_review(
+    s: &Store,
+    main_graph: &Graph,
+    who: &str,
+    role: Role,
+) -> Result<()> {
+    let merged = s.graph()?;
+    crate::markdown_import::health(s, &merged, None)?;
+    crate::source_import::health(&merged, &s.import_files()?)?;
+    let debt = s
+        .one::<ImportInfo>("metadata", "import")?
+        .map(|i| i.lint_debt)
+        .unwrap_or_default();
+    let mut requirements = vec![];
+    for row in s.merged_review_guards()? {
+        requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(
+            row["payload"].as_str().context("guard payload")?,
+        )?);
+    }
+    let routing = s.one::<Value>("metadata", "routing")?.unwrap_or(json!({}));
+    crate::review::validate_review_candidate(
+        main_graph,
+        &merged,
+        &debt,
+        &requirements,
+        &routing,
+        who,
+        role,
+    )
+}
+
 #[cfg(test)]
 mod sql_text_tests {
     use super::*;

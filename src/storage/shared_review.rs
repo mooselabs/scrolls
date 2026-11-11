@@ -1048,7 +1048,7 @@ fn publish_accept(
     if candidate.is_none() && state == "candidate" {
         let revision = s.head(&branch)?;
         candidate_ok(s, &i, &revision)?;
-        crate::review::validate_merged_review(s, main, &i.actor, i.role)?;
+        crate::storage::validate_merged_review(s, main, &i.actor, i.role)?;
         candidate = Some(revision);
     }
     if candidate.is_none() {
@@ -1085,7 +1085,7 @@ fn publish_accept(
                 Snapshot::read(s, None)?.hash()? == after,
                 "dirty_state: candidate differs from recorded changes"
             );
-            crate::review::validate_merged_review(s, main, &i.actor, i.role)
+            crate::storage::validate_merged_review(s, main, &i.actor, i.role)
         });
         match committed {
             Ok(revision) => {
@@ -1117,7 +1117,7 @@ fn publish_accept(
     );
     candidate_ok(s, &i, &candidate)?;
     super::session::SqlSession::clean(s.shared.as_ref().unwrap())?;
-    crate::review::validate_merged_review(s, main, &i.actor, i.role)?;
+    crate::storage::validate_merged_review(s, main, &i.actor, i.role)?;
     if !matches!(&i.stage,Stage::Candidate{revision}|Stage::Complete{revision} if revision==&candidate)
     {
         i.stage = Stage::Candidate {

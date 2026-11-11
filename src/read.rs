@@ -1,16 +1,14 @@
 //! Typed knowledge reads shared by CLI and HTTP. No audit, recovery or mutation.
 use crate::{
     beads::Local,
-    cli::Filters,
     model::*,
-    query,
+    query::{self, Filters},
     schema::Direction,
-    storage::Store,
     store::{self, KnowledgeStore},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::collections::BTreeSet;
 
 pub enum Operation<'a> {
     Schema,
@@ -117,104 +115,6 @@ impl View<'_> {
                 at,
             } => query::evaluate_expression(g, self.routing, expression, actor, paths, at),
         }
-    }
-}
-
-#[derive(Clone)]
-pub struct Config {
-    pub store: PathBuf,
-    pub dolt: PathBuf,
-    pub connection: Option<PathBuf>,
-    pub branch: String,
-    pub actor: String,
-}
-impl Config {
-    pub fn from_cli(cli: &crate::cli::Cli) -> Self {
-        Self {
-            store: cli.store.clone(),
-            dolt: cli.dolt.clone(),
-            connection: cli.connection.clone(),
-            branch: cli.proposal.clone().unwrap_or_else(|| "main".into()),
-            actor: cli.actor.clone().unwrap_or_else(|| "reader".into()),
-        }
-    }
-}
-
-/// Owns the operation's lock/session. Every application row is read at an
-/// immutable commit; dropping this value releases admission to CLI writers.
-pub struct Snapshot {
-    pub store: Store,
-    pub graph: Graph,
-    pub local: Local,
-    pub routing: Value,
-    pub store_id: String,
-    pub branch: String,
-    pub revision: String,
-    pub actor: String,
-}
-impl Snapshot {
-    pub fn open(config: &Config) -> Result<Self> {
-        let store = if let Some(path) = &config.connection {
-            Store::open_shared(path, &config.store)?
-        } else {
-            Store::open_readonly_wait(&config.store, &config.dolt, Some(Duration::from_secs(5)))?
-        };
-        if store.is_shared() {
-            crate::storage::shared_review::check_readable(&store)?;
-        }
-        ensure!(
-            config.branch == "main" || config.branch.starts_with("proposal/"),
-            "unknown selected proposal"
-        );
-        ensure!(
-            store.branches()?.contains(&config.branch),
-            "unknown selected proposal"
-        );
-        let revision = store.head(&config.branch)?;
-        let format = store.one_at::<u32>("metadata", "schema", &revision)?;
-        ensure!(
-            format == Some(if store.is_shared() { 5 } else { 4 }),
-            "unsupported store format; explicit migration required"
-        );
-        if store.is_shared() {
-            store.check_versioned_inventory(&revision)?;
-        }
-        let store_id: String = store
-            .one_at("metadata", "store_id", &revision)?
-            .context("missing store identity")?;
-        uuid::Uuid::parse_str(&store_id)?;
-        let graph = store.graph_at(&revision)?;
-        graph.schema.validate()?;
-        let local = if store.is_shared() {
-            Local::default()
-        } else {
-            Local::load(&store.root)?
-        };
-        let routing = store
-            .one_at("metadata", "routing", &revision)?
-            .unwrap_or(json!({}));
-        Ok(Self {
-            store,
-            graph,
-            local,
-            routing,
-            store_id,
-            branch: config.branch.clone(),
-            revision,
-            actor: config.actor.clone(),
-        })
-    }
-    pub fn view(&self) -> View<'_> {
-        View {
-            graph: &self.graph,
-            routing: &self.routing,
-            local: &self.local,
-            store_id: Some(&self.store_id),
-            actor: &self.actor,
-        }
-    }
-    pub fn envelope(&self, data: Value) -> Value {
-        json!({"schema_version":2,"ok":true,"store_id":self.store_id,"branch":self.branch,"revision":self.revision,"schema_revision":self.graph.schema.revision(),"data":data})
     }
 }
 

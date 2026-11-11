@@ -1,6 +1,10 @@
 // BKLG-20261108-6zdg: retain the public CLI path while the model owns Role.
 pub use crate::model::Role;
-use crate::schema::Direction;
+use crate::{query::Filters, schema::Direction};
+// BKLG-20261110-7en6: retain the public CLI format path for existing Rust callers.
+pub use crate::render::Format;
+// BKLG-20261110-7en6: retain public CLI paths while Beads owns its command inputs.
+pub use crate::beads::{Operation as BeadsCommand, Target};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -58,6 +62,225 @@ impl ValueEnum for Direction {
         }))
     }
 }
+impl ValueEnum for Format {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Native, Self::Liskov]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Native => "native",
+            Self::Liskov => "liskov",
+        }))
+    }
+}
+
+impl Args for Filters {
+    fn group_id() -> Option<clap::Id> {
+        Some("Filters".into())
+    }
+
+    fn augment_args(mut command: clap::Command) -> clap::Command {
+        for (name, value) in [
+            ("kind", "KIND"),
+            ("status", "STATUS"),
+            ("owner", "OWNER"),
+            ("field", "FIELD"),
+        ] {
+            command = command.arg(
+                clap::Arg::new(name)
+                    .long(name)
+                    .value_name(value)
+                    .value_parser(clap::value_parser!(String))
+                    .action(if name == "field" {
+                        clap::ArgAction::Append
+                    } else {
+                        clap::ArgAction::Set
+                    }),
+            );
+        }
+        command.group(
+            clap::ArgGroup::new("Filters")
+                .multiple(true)
+                .args(["kind", "status", "owner", "field"]),
+        )
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
+}
+
+impl clap::FromArgMatches for Filters {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let mut filters = Self::default();
+        filters.update_from_arg_matches(matches)?;
+        Ok(filters)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        for (name, field) in [
+            ("kind", &mut self.kind),
+            ("status", &mut self.status),
+            ("owner", &mut self.owner),
+        ] {
+            if matches.contains_id(name) {
+                *field = matches.get_one::<String>(name).cloned();
+            }
+        }
+        if let Some(fields) = matches.get_many::<String>("field") {
+            self.field = fields.cloned().collect();
+        }
+        Ok(())
+    }
+}
+
+impl Args for Target {
+    fn group_id() -> Option<clap::Id> {
+        Some("Target".into())
+    }
+
+    fn augment_args(command: clap::Command) -> clap::Command {
+        command
+            .arg(
+                clap::Arg::new("reference")
+                    .value_name("REFERENCE")
+                    .value_parser(clap::value_parser!(String))
+                    .required_unless_present("all")
+                    .conflicts_with("all"),
+            )
+            .arg(
+                clap::Arg::new("all")
+                    .long("all")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .group(
+                clap::ArgGroup::new("Target")
+                    .multiple(true)
+                    .args(["reference", "all"]),
+            )
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
+}
+
+impl clap::FromArgMatches for Target {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            reference: matches.get_one::<String>("reference").cloned(),
+            all: matches.get_flag("all"),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        if matches.contains_id("reference") {
+            self.reference = matches.get_one::<String>("reference").cloned();
+        }
+        if matches.contains_id("all") {
+            self.all = matches.get_flag("all");
+        }
+        Ok(())
+    }
+}
+
+impl Subcommand for BeadsCommand {
+    fn augment_subcommands(command: clap::Command) -> clap::Command {
+        command
+            .subcommand(
+                clap::Command::new("bind")
+                    .arg(clap::Arg::new("name").value_name("NAME").required(true))
+                    .arg(
+                        clap::Arg::new("directory")
+                            .long("directory")
+                            .value_name("DIRECTORY")
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .required(true),
+                    )
+                    .arg(
+                        clap::Arg::new("bd")
+                            .long("bd")
+                            .value_name("BD")
+                            .value_parser(clap::value_parser!(PathBuf))
+                            .default_value("bd"),
+                    )
+                    .arg(
+                        clap::Arg::new("timeout")
+                            .long("timeout")
+                            .value_name("TIMEOUT")
+                            .value_parser(clap::value_parser!(u64))
+                            .default_value("30"),
+                    ),
+            )
+            .subcommand(clap::Command::new("list"))
+            .subcommand(
+                clap::Command::new("refs").arg(
+                    clap::Arg::new("reference")
+                        .value_name("REFERENCE")
+                        .required(true),
+                ),
+            )
+            .subcommand(Target::augment_args(clap::Command::new("refresh")))
+            .subcommand(Target::augment_args(clap::Command::new("publish")))
+    }
+
+    fn augment_subcommands_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_subcommands(command)
+    }
+
+    fn has_subcommand(name: &str) -> bool {
+        matches!(name, "bind" | "list" | "refs" | "refresh" | "publish")
+    }
+}
+
+impl clap::FromArgMatches for BeadsCommand {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let Some((name, args)) = matches.subcommand() else {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::MissingSubcommand,
+                "a Beads command is required",
+            ));
+        };
+        Ok(match name {
+            "bind" => Self::Bind {
+                name: args
+                    .get_one::<String>("name")
+                    .expect("required name")
+                    .clone(),
+                directory: args
+                    .get_one::<PathBuf>("directory")
+                    .expect("required directory")
+                    .clone(),
+                bd: args.get_one::<PathBuf>("bd").expect("default bd").clone(),
+                timeout: *args.get_one::<u64>("timeout").expect("default timeout"),
+            },
+            "list" => Self::List,
+            "refs" => Self::Refs {
+                reference: args
+                    .get_one::<String>("reference")
+                    .expect("required reference")
+                    .clone(),
+            },
+            "refresh" => Self::Refresh(Target::from_arg_matches(args)?),
+            "publish" => Self::Publish(Target::from_arg_matches(args)?),
+            _ => {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::InvalidSubcommand,
+                    "unknown Beads command",
+                ));
+            }
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        if matches.subcommand().is_some() {
+            *self = Self::from_arg_matches(matches)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Args)]
 pub struct Body {
     #[arg(long, conflicts_with = "body_file")]
@@ -327,11 +550,6 @@ pub enum ImportCommand {
         rev: String,
     },
 }
-#[derive(Debug, Clone, Copy, Serialize, ValueEnum, PartialEq)]
-pub enum Format {
-    Native,
-    Liskov,
-}
 impl Cmd {
     pub fn mutation(&self) -> bool {
         matches!(
@@ -362,43 +580,6 @@ impl Cmd {
     }
 }
 
-#[derive(Debug, Serialize, Subcommand)]
-pub enum BeadsCommand {
-    Bind {
-        name: String,
-        #[arg(long)]
-        directory: PathBuf,
-        #[arg(long, default_value = "bd")]
-        bd: PathBuf,
-        #[arg(long, default_value_t = 30)]
-        timeout: u64,
-    },
-    List,
-    Refs {
-        reference: String,
-    },
-    Refresh(Target),
-    Publish(Target),
-}
-#[derive(Debug, Serialize, Args)]
-pub struct Target {
-    #[arg(required_unless_present = "all", conflicts_with = "all")]
-    pub reference: Option<String>,
-    #[arg(long)]
-    pub all: bool,
-}
-
-#[derive(Debug, Serialize, Args, Default)]
-pub struct Filters {
-    #[arg(long)]
-    pub kind: Option<String>,
-    #[arg(long)]
-    pub status: Option<String>,
-    #[arg(long)]
-    pub owner: Option<String>,
-    #[arg(long)]
-    pub field: Vec<String>,
-}
 #[derive(Debug, Serialize, Subcommand)]
 pub enum SchemaCommand {
     Show,
@@ -467,6 +648,127 @@ pub enum BackupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_formats_and_default_keep_engine_serialization() {
+        for (flags, expected, serialized) in [
+            (
+                vec!["--format", "native"],
+                crate::render::Format::Native,
+                "\"Native\"",
+            ),
+            (
+                vec!["--format", "liskov"],
+                crate::render::Format::Liskov,
+                "\"Liskov\"",
+            ),
+            (vec![], crate::render::Format::Native, "\"Native\""),
+        ] {
+            let cli = Cli::try_parse_from(
+                ["scrolls", "render", "--out", "export"]
+                    .into_iter()
+                    .chain(flags),
+            )
+            .unwrap();
+            let Cmd::Render { format, .. } = cli.command else {
+                panic!("expected render command");
+            };
+            assert_eq!(format, expected);
+            assert_eq!(serde_json::to_string(&format).unwrap(), serialized);
+        }
+    }
+
+    #[test]
+    fn list_and_search_parse_engine_filters_in_field_order() {
+        for command in ["list", "search"] {
+            let mut args = vec!["scrolls", command];
+            if command == "search" {
+                args.push("terms");
+            }
+            args.extend([
+                "--kind", "K", "--status", "S", "--owner", "O", "--field", "a=b", "--field", "c=d",
+            ]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let filters: crate::query::Filters = match cli.command {
+                Cmd::List { filters } | Cmd::Search { filters, .. } => filters,
+                _ => panic!("expected record filters"),
+            };
+            assert_eq!(filters.kind.as_deref(), Some("K"));
+            assert_eq!(filters.status.as_deref(), Some("S"));
+            assert_eq!(filters.owner.as_deref(), Some("O"));
+            assert_eq!(filters.field, ["a=b", "c=d"]);
+        }
+    }
+
+    #[test]
+    fn beads_publish_keeps_existing_operation_identity() {
+        let cli = Cli::try_parse_from(["scrolls", "beads", "publish", "work:bd-a"]).unwrap();
+        let Cmd::Beads { command } = cli.command else {
+            panic!("expected Beads command");
+        };
+        // This is the pre-extraction command representation persisted in operations.
+        let expected = serde_json::json!({"Publish":{"reference":"work:bd-a","all":false}});
+        assert_eq!(serde_json::to_value(&command).unwrap(), expected);
+        let fingerprint =
+            serde_json::json!({"command":command,"actor":"alice","revision":"previous-revision"});
+        assert_eq!(
+            crate::model::digest(serde_json::to_vec(&fingerprint).unwrap()),
+            "310dca777221a6fe11f59e4d37625d1917ec193548caf3e186ccdf1819eaec19"
+        );
+    }
+
+    #[test]
+    fn beads_inputs_keep_cli_defaults_and_target_rules() {
+        use serde_json::json;
+        for (args, expected) in [
+            (
+                vec!["bind", "work", "--directory", "repo"],
+                json!({"Bind":{"name":"work","directory":"repo","bd":"bd","timeout":30}}),
+            ),
+            (
+                vec![
+                    "bind",
+                    "work",
+                    "--directory",
+                    "repo",
+                    "--bd",
+                    "custom",
+                    "--timeout",
+                    "12",
+                ],
+                json!({"Bind":{"name":"work","directory":"repo","bd":"custom","timeout":12}}),
+            ),
+            (vec!["list"], json!("List")),
+            (
+                vec!["refs", "work:bd-a"],
+                json!({"Refs":{"reference":"work:bd-a"}}),
+            ),
+            (
+                vec!["refresh", "work:bd-a"],
+                json!({"Refresh":{"reference":"work:bd-a","all":false}}),
+            ),
+            (
+                vec!["refresh", "--all"],
+                json!({"Refresh":{"reference":null,"all":true}}),
+            ),
+            (
+                vec!["publish", "--all"],
+                json!({"Publish":{"reference":null,"all":true}}),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["scrolls", "beads"].into_iter().chain(args)).unwrap();
+            let Cmd::Beads { command } = cli.command else {
+                panic!("expected Beads command");
+            };
+            assert_eq!(serde_json::to_value(command).unwrap(), expected);
+        }
+        for command in ["refresh", "publish"] {
+            assert!(Cli::try_parse_from(["scrolls", "beads", command]).is_err());
+            assert!(
+                Cli::try_parse_from(["scrolls", "beads", command, "work:bd-a", "--all"]).is_err()
+            );
+        }
+    }
 
     fn walk_direction(args: &[&str]) -> Direction {
         let cli = Cli::try_parse_from(args).unwrap();
