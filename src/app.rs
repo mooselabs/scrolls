@@ -6,7 +6,7 @@ use crate::{
     storage::{self, Store, validate_merged_review},
     store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -127,11 +127,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
         bail!("recover is a shared-store command; use --connection");
     }
     if let Cmd::Import { command } = &cli.command {
-        if crate::markdown_import::handles(command)? {
-            return crate::markdown_import::run(cli, command);
+        if handles_markdown_import(command)? {
+            return run_markdown_import(cli, command);
         }
         if !matches!(command, ImportCommand::Markdown { .. }) {
-            return crate::source_import::run(cli, command);
+            return run_source_import(cli, command);
         }
     }
     if matches!(
@@ -206,7 +206,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if cli.proposal.is_some() {
         proposal_name(&store, branch)?;
     }
-    store.checkout(branch)?;
+    KnowledgeStore::select_branch(&store, branch)?;
     let selected_format = store
         .one::<u32>("metadata", "schema")?
         .context("missing store format")?;
@@ -1028,4 +1028,300 @@ fn ensure_schema_revision(schema: &crate::schema::Schema, expect: &str) -> Resul
         bail!("stale schema revision; run schema show and retry with a fresh --op-id");
     }
     Ok(())
+}
+
+// A shared import retains one locked SQL connection from its first base read
+// through publication. Local imports keep their existing read/build/write path.
+enum ImportStore<'a> {
+    Shared(&'a Store),
+    Local(Store),
+}
+impl std::ops::Deref for ImportStore<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Shared(s) => s,
+            Self::Local(s) => s,
+        }
+    }
+}
+fn shared_import_store(cli: &Cli) -> Result<Option<Store>> {
+    cli.connection
+        .as_ref()
+        .map(|connection| {
+            if matches!(
+                cli.command,
+                Cmd::Import {
+                    command: ImportCommand::Apply { .. }
+                }
+            ) && !cli.dry_run
+            {
+                Store::open_shared_recovery(
+                    connection,
+                    &cli.store,
+                    cli.op_id
+                        .as_deref()
+                        .context("import apply requires --op-id ID")?,
+                )
+            } else {
+                Store::open_shared(connection, &cli.store)
+            }
+        })
+        .transpose()
+}
+fn import_store<'a>(
+    cli: &Cli,
+    shared: Option<&'a Store>,
+    readonly: bool,
+) -> Result<ImportStore<'a>> {
+    if let Some(s) = shared {
+        return Ok(ImportStore::Shared(s));
+    }
+    ensure!(
+        cli.connection.is_none(),
+        "shared import session missing; local fallback refused"
+    );
+    Ok(ImportStore::Local(if readonly {
+        Store::open_readonly(&cli.store, &cli.dolt)?
+    } else {
+        Store::open(&cli.store, &cli.dolt, false)?
+    }))
+}
+
+fn handles_markdown_import(command: &ImportCommand) -> Result<bool> {
+    Ok(match command {
+        ImportCommand::Plan {
+            command: PlanCommand::Markdown { .. },
+        } => true,
+        ImportCommand::Apply { plan } => crate::markdown_import::is_markdown_plan(plan)?,
+        _ => false,
+    })
+}
+fn import_invocation(cli: &Cli) -> Result<crate::source_import::Invocation<'_>> {
+    Ok(crate::source_import::Invocation {
+        actor: cli
+            .actor
+            .as_deref()
+            .context("planning/apply requires --actor")?,
+        role: cli.role,
+        op_id: cli.op_id.as_deref(),
+        dry_run: cli.dry_run,
+        command: serde_json::to_value(&cli.command)?,
+    })
+}
+fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
+    use crate::source_import::{self, ApplyPreparation, ApplyRequest, PlanRequest};
+    let envelope = |data: Value| json!({"schema_version":2,"ok":true,"data":data});
+    if let ImportCommand::Profiles { command } = command {
+        return match command {
+            ProfileCommand::List => Ok(envelope(
+                json!({"profiles":[{"name":"pep","description":"Python Enhancement Proposals"},{"name":"handbook","description":"Markdown handbook"}]}),
+            )),
+            ProfileCommand::Show { name } => Ok(envelope(
+                json!({"name":name,"yaml":crate::profile::bundled(name)?}),
+            )),
+            ProfileCommand::Validate { file } => {
+                let shared = shared_import_store(cli)?;
+                let s = import_store(cli, shared.as_ref(), true)?;
+                source_import::validate_profile(&*s, file)
+            }
+        };
+    }
+    ensure!(
+        cli.proposal.is_none(),
+        "import only operates on main; omit --proposal"
+    );
+    let actor = cli
+        .actor
+        .as_deref()
+        .context("planning/apply requires --actor")?;
+    ensure!(
+        !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
+        "invalid actor"
+    );
+    let shared = shared_import_store(cli)?;
+    match command {
+        ImportCommand::Plan {
+            command:
+                PlanCommand::Git {
+                    repo,
+                    root,
+                    rev,
+                    source,
+                    profile,
+                    profile_file,
+                    out,
+                },
+        } => {
+            let text = if let Some(name) = profile {
+                crate::profile::bundled(name)?.to_string()
+            } else {
+                source_import::read_profile(
+                    profile_file
+                        .as_ref()
+                        .context("select --profile or --profile-file")?,
+                )?
+            };
+            let base = {
+                let s = import_store(cli, shared.as_ref(), true)?;
+                source_import::plan_base(&*s)?
+            };
+            source_import::plan(
+                base,
+                PlanRequest {
+                    repository: repo,
+                    root,
+                    revision: rev,
+                    source_id: source,
+                    profile: &text,
+                    out,
+                    actor,
+                    role: cli.role,
+                    store_directory: cli.connection.is_none().then_some(cli.store.as_path()),
+                },
+            )
+        }
+        ImportCommand::Apply { plan } => {
+            let request = ApplyRequest::read(plan, import_invocation(cli)?)?;
+            let prepared = {
+                let s = import_store(cli, shared.as_ref(), true)?;
+                source_import::prepare_apply(&*s, &request)?
+            };
+            if let ApplyPreparation::Response(result) = prepared {
+                return Ok(result);
+            }
+            let prepared = prepared.build(&request.plan)?;
+            let s = import_store(cli, shared.as_ref(), false)?;
+            source_import::apply(&*s, &request, prepared)
+        }
+        _ => bail!("unsupported import command"),
+    }
+}
+fn run_markdown_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
+    use crate::markdown_import::{self, ApplyRequest, PlanRequest};
+    let connection = cli
+        .connection
+        .as_ref()
+        .context("editable Markdown plan/apply requires --connection")?;
+    ensure!(
+        cli.proposal.is_none(),
+        "Markdown bootstrap operates on main; omit --proposal"
+    );
+    ensure!(
+        cli.role == Role::Human,
+        "Markdown bootstrap requires --role human"
+    );
+    let actor = cli
+        .actor
+        .as_deref()
+        .context("Markdown planning/apply requires --actor")?;
+    ensure!(
+        !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
+        "invalid actor"
+    );
+    match command {
+        ImportCommand::Plan {
+            command:
+                PlanCommand::Markdown {
+                    dir,
+                    rev,
+                    git_web_url,
+                    out,
+                },
+        } => {
+            markdown_import::web_url(git_web_url)?;
+            let s = Store::open_shared(connection, &cli.store)?;
+            markdown_import::plan(
+                &s,
+                PlanRequest {
+                    directory: dir,
+                    revision: rev,
+                    git_web_url,
+                    out,
+                    actor,
+                    role: cli.role,
+                },
+            )
+        }
+        ImportCommand::Apply { plan } => {
+            let request = ApplyRequest::read(plan, import_invocation(cli)?)?;
+            let s = if cli.dry_run {
+                Store::open_shared(connection, &cli.store)?
+            } else {
+                Store::open_shared_recovery(connection, &cli.store, &request.context.op_id)?
+            };
+            markdown_import::apply(&s, &request)
+        }
+        _ => bail!("unsupported editable Markdown command"),
+    }
+}
+
+#[cfg(test)]
+mod import_adapter_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn error(cli: &Cli) -> String {
+        format!("{:#}", run(cli).unwrap_err())
+    }
+
+    #[test]
+    fn source_import_preserves_validation_and_session_open_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = directory.path().join("plan.json");
+        fs::write(&plan, "{}").unwrap();
+        let mut cli =
+            Cli::try_parse_from(["scrolls", "import", "apply", plan.to_str().unwrap()]).unwrap();
+        cli.actor = None;
+        assert_eq!(error(&cli), "planning/apply requires --actor");
+        cli.actor = Some("invalid\nactor".into());
+        assert_eq!(error(&cli), "invalid actor");
+        cli.actor = Some("reader".into());
+        cli.proposal = Some("proposal/test".into());
+        assert_eq!(error(&cli), "import only operates on main; omit --proposal");
+        cli.proposal = None;
+        cli.store = directory.path().join("missing-store");
+        assert!(error(&cli).starts_with("stale_plan: invalid plan"));
+        cli.connection = Some(directory.path().join("missing-connection"));
+        assert_eq!(
+            error(&cli),
+            "shared writes require --op-id for cross-client reconciliation"
+        );
+        assert!(!cli.store.exists());
+    }
+
+    #[test]
+    fn markdown_import_preserves_validation_before_opening_shared_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut cli = Cli::try_parse_from([
+            "scrolls",
+            "import",
+            "plan",
+            "markdown",
+            ".",
+            "--rev",
+            "HEAD",
+            "--git-web-url",
+            "invalid",
+            "--out",
+            "plan.json",
+        ])
+        .unwrap();
+        cli.actor = None;
+        assert_eq!(
+            error(&cli),
+            "editable Markdown plan/apply requires --connection"
+        );
+        cli.connection = Some(directory.path().join("missing-connection"));
+        assert_eq!(error(&cli), "Markdown bootstrap requires --role human");
+        cli.role = Role::Human;
+        assert_eq!(error(&cli), "Markdown planning/apply requires --actor");
+        cli.actor = Some("invalid\nactor".into());
+        assert_eq!(error(&cli), "invalid actor");
+        cli.actor = Some("reader".into());
+        assert_eq!(
+            error(&cli),
+            "Markdown import requires an explicit https://github.com/OWNER/REPO web URL"
+        );
+    }
 }

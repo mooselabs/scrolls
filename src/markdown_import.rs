@@ -1,10 +1,8 @@
 //! Reviewed, one-shot editable Markdown bootstrap. Captured sources keep their own protocol.
 use crate::{
-    cli::*,
     import::{GitEntry, Imported},
     model::*,
-    storage::{self, Store},
-    store::{Change, ChangeSet, KnowledgeStore},
+    store::{self, Change, ChangeSet, KnowledgeStore, OperationContext},
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -71,24 +69,15 @@ impl Plan {
         Ok(())
     }
 }
-pub fn handles(command: &ImportCommand) -> Result<bool> {
-    Ok(match command {
-        ImportCommand::Plan {
-            command: PlanCommand::Markdown { .. },
-        } => true,
-        ImportCommand::Apply { plan } => {
-            ensure!(
-                fs::metadata(plan)?.len() <= crate::source_import::TOTAL_LIMIT,
-                "input_limit: plan exceeds 1 GiB"
-            );
-            let v: Value =
-                serde_json::from_slice(&fs::read(plan)?).context("stale_plan: invalid plan")?;
-            v.get("kind").is_some()
-        }
-        _ => false,
-    })
+pub fn is_markdown_plan(plan: &Path) -> Result<bool> {
+    ensure!(
+        fs::metadata(plan)?.len() <= crate::source_import::TOTAL_LIMIT,
+        "input_limit: plan exceeds 1 GiB"
+    );
+    let v: Value = serde_json::from_slice(&fs::read(plan)?).context("stale_plan: invalid plan")?;
+    Ok(v.get("kind").is_some())
 }
-fn web_url(url: &str) -> Result<()> {
+pub fn web_url(url: &str) -> Result<()> {
     let rest = url
         .strip_prefix("https://github.com/")
         .context("Markdown import requires an explicit https://github.com/OWNER/REPO web URL")?;
@@ -126,229 +115,214 @@ fn candidate_digest(i: &Imported) -> Result<String> {
         &json!({"records":i.graph.records,"edges":i.graph.edges,"files":i.files,"info":i.info,"routing":i.routing}),
     )?))
 }
-fn empty(s: &Store, g: &Graph) -> Result<()> {
+fn empty(s: &dyn KnowledgeStore, g: &Graph) -> Result<()> {
     ensure!(
         g.records.is_empty()
             && g.edges.is_empty()
             && g.import_sources.is_empty()
             && g.import_members.is_empty()
-            && s.rows::<Value>("source_files")?.is_empty()
-            && s.one::<Value>("metadata", "import")?.is_none()
-            && s.one::<Value>("metadata", "markdown_import")?.is_none(),
+            && s.rows("source_files", None)?
+                .into_iter()
+                .map(|(_, payload)| serde_json::from_str::<Value>(&payload))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .is_empty()
+            && store::one::<Value>(s, "metadata", "import", None)?.is_none()
+            && store::one::<Value>(s, "metadata", "markdown_import", None)?.is_none(),
         "Markdown bootstrap requires an empty document/source store"
     );
     ensure!(
         s.proposals()?.iter().all(|p| p.status != "pending"),
         "Markdown bootstrap refuses pending proposals"
     );
-    storage::shared_review::check_bootstrap_ready(s)?;
+    s.check_bootstrap_ready()?;
     ensure!(
         g.schema.revision() == crate::schema::Schema::default().revision(),
         "Markdown bootstrap requires the bundled knowledge schema"
     );
     Ok(())
 }
-fn response(s: &Store, data: Value) -> Result<Value> {
-    storage::shared_review::receipt_response(s, data, "main")
+fn response(s: &dyn KnowledgeStore, data: Value) -> Result<Value> {
+    s.receipt_response(data, "main")
 }
-pub fn run(cli: &Cli, command: &ImportCommand) -> Result<Value> {
-    let connection = cli
-        .connection
-        .as_ref()
-        .context("editable Markdown plan/apply requires --connection")?;
-    ensure!(
-        cli.proposal.is_none(),
-        "Markdown bootstrap operates on main; omit --proposal"
-    );
-    ensure!(
-        cli.role == Role::Human,
-        "Markdown bootstrap requires --role human"
-    );
-    let actor = cli
-        .actor
-        .as_deref()
-        .context("Markdown planning/apply requires --actor")?;
-    ensure!(
-        !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
-        "invalid actor"
-    );
-    match command {
-        ImportCommand::Plan {
-            command:
-                PlanCommand::Markdown {
-                    dir,
-                    rev,
-                    git_web_url,
-                    out,
-                },
-        } => {
-            web_url(git_web_url)?;
-            let s = Store::open_shared(connection, &cli.store)?;
-            let before = s.graph()?;
-            empty(&s, &before)?;
-            let mut i = crate::import::import_selected(dir, rev, actor, true)?;
-            let timestamp = now();
-            normalize(&mut i, &timestamp)?;
-            let root = Path::new(&i.info.repository);
-            let inventory = crate::import::inventory(root, &i.info.commit)?;
-            let mut plan = Plan {
-                kind: KIND.into(),
-                contract: CONTRACT.into(),
-                store_id: s
-                    .one("metadata", "store_id")?
-                    .context("missing store UUID")?,
-                main_revision: s.head("main")?,
-                schema_hash: before.schema.revision(),
-                actor: actor.into(),
-                role: cli.role.name().into(),
-                directory: dir.canonicalize()?,
-                commit: i.info.commit.clone(),
-                prefix: i.info.prefix.clone(),
-                git_web_url: git_web_url.clone(),
-                timestamp,
-                inventory,
-                record_ids: i.graph.records.keys().cloned().collect(),
-                candidate_digest: candidate_digest(&i)?,
-                summary: Value::Null,
-                digest: String::new(),
-            };
-            let references = crate::markdown_links::report(&i.files, &plan)?;
-            plan.summary = json!({"import":i.info,"frozen":i.graph.records.values().filter(|r|r.frozen).count(),"source_bytes":i.files.iter().map(|f|STANDARD.decode(&f.bytes).map(|v|v.len())).collect::<std::result::Result<Vec<_>,_>>()?.iter().sum::<usize>(),"references":references,"limits":crate::source_import::limits()});
-            plan.seal()?;
-            crate::source_import::write_json_plan(out, &plan)?;
-            response(
-                &s,
-                json!({"plan":out,"digest":plan.digest,"candidate_digest":plan.candidate_digest,"main_revision":plan.main_revision,"summary":plan.summary}),
-            )
-        }
-        ImportCommand::Apply { plan: file } => {
-            ensure!(
-                fs::metadata(file)?.len() <= crate::source_import::TOTAL_LIMIT,
-                "input_limit: plan exceeds 1 GiB"
-            );
-            let plan: Plan = serde_json::from_slice(&fs::read(file)?)
-                .context("stale_plan: invalid Markdown plan")?;
-            plan.verify()?;
-            ensure!(
-                actor == plan.actor && cli.role.name() == plan.role,
-                "stale_plan: actor/role changed"
-            );
-            let op = cli
-                .op_id
-                .as_deref()
-                .context("import apply requires --op-id ID")?;
-            let hash = digest(serde_json::to_vec(
-                &json!({"markdown_plan":plan.digest,"actor":actor,"role":plan.role}),
-            )?);
-            let s = if cli.dry_run {
-                Store::open_shared(connection, &cli.store)?
-            } else {
-                Store::open_shared_recovery(connection, &cli.store, op)?
-            };
-            ensure!(
-                s.one::<String>("metadata", "store_id")?.as_deref() == Some(&plan.store_id),
-                "stale_plan: wrong store UUID"
-            );
-            if let Some(result) = KnowledgeStore::receipt(&s, op, &hash)? {
-                return response(&s, result);
-            }
-            storage::shared_review::check_identity(&s, op, &hash)?;
-            let before = s.graph()?;
-            if let Some(existing) = s.one::<Plan>("metadata", "markdown_import")? {
-                ensure!(
-                    existing.candidate_digest == plan.candidate_digest
-                        && existing.git_web_url == plan.git_web_url
-                        && existing.commit == plan.commit
-                        && existing.prefix == plan.prefix,
-                    "source_update_unsupported: changed Markdown snapshot requires a fresh store"
-                );
-                health(&s, &before, None)?;
-                let result = json!({"identical_replay":true,"import":plan.summary["import"],"branch":"main","op_id":op});
-                if !cli.dry_run {
-                    s.commit_checked(
-                        &crate::review::receipt_changes(
-                            op,
-                            &hash,
-                            actor,
-                            &serde_json::to_value(&cli.command)?,
-                            &result,
-                        )?,
-                        "record identical Markdown replay",
-                        actor,
-                        false,
-                        &mut || Ok(()),
-                    )?;
-                }
-                return response(
-                    &s,
-                    if cli.dry_run {
-                        json!({"dry_run":true,"result":result})
-                    } else {
-                        result
-                    },
-                );
-            }
-            ensure!(
-                s.head("main")? == plan.main_revision
-                    && before.schema.revision() == plan.schema_hash,
-                "stale_plan: main or schema changed; replan"
-            );
-            empty(&s, &before)?;
-            let mut i = crate::import::import_selected(&plan.directory, &plan.commit, actor, true)?;
-            normalize(&mut i, &plan.timestamp)?;
-            ensure!(
-                candidate_digest(&i)? == plan.candidate_digest
-                    && crate::import::inventory(Path::new(&i.info.repository), &plan.commit)?
-                        == plan.inventory
-                    && i.graph.records.keys().cloned().collect::<Vec<_>>() == plan.record_ids,
-                "stale_plan: pinned Markdown candidate changed"
-            );
-            let mut changes = ChangeSet::graph(&before, &i.graph)?;
-            for f in &i.files {
-                changes.push(Change::put("source_files", &f.path, f)?);
-            }
-            changes.push(Change::put("metadata", "import", &i.info)?);
-            changes.push(Change::put("metadata", "routing", &i.routing)?);
-            changes.push(Change::put(
-                "metadata",
-                "import_edges",
-                &i.graph.edges.values().collect::<Vec<_>>(),
-            )?);
-            changes.push(Change::put("metadata", "markdown_import", &plan)?);
-            let result = json!({"import":i.info,"candidate_digest":plan.candidate_digest,"op_id":op,"branch":"main"});
-            changes.extend(crate::review::receipt_changes(
-                op,
-                &hash,
-                actor,
-                &serde_json::to_value(&cli.command)?,
-                &result,
-            )?);
-            let sql_bytes = changes.to_sql().len();
-            ensure!(
-                sql_bytes
-                    <= s.shared_query_limit()
-                        .context("missing shared SQL budget")?,
-                "input_limit: encoded Markdown SQL request exceeds the shared packet budget"
-            );
-            if cli.dry_run {
-                return response(
-                    &s,
-                    json!({"dry_run":true,"result":result,"sql_bytes":sql_bytes,"shared_query_bytes":s.shared_query_limit()}),
-                );
-            }
-            s.commit_markdown_checked(&changes, "bootstrap editable Markdown", actor, &mut || {
-                let actual = s.graph()?;
-                health(&s, &actual, None)?;
-                ensure!(
-                    actual.records == i.graph.records && actual.edges == i.graph.edges,
-                    "Markdown bootstrap readback mismatch"
-                );
-                Ok(())
-            })?;
-            response(&s, result)
-        }
-        _ => anyhow::bail!("unsupported editable Markdown command"),
+pub struct PlanRequest<'a> {
+    pub directory: &'a Path,
+    pub revision: &'a str,
+    pub git_web_url: &'a str,
+    pub out: &'a Path,
+    pub actor: &'a str,
+    pub role: Role,
+}
+pub fn plan(s: &dyn KnowledgeStore, request: PlanRequest<'_>) -> Result<Value> {
+    let PlanRequest {
+        directory: dir,
+        revision: rev,
+        git_web_url,
+        out,
+        actor,
+        ..
+    } = request;
+    let before = store::graph(s, None)?;
+    empty(s, &before)?;
+    let mut i = crate::import::import_selected(dir, rev, actor, true)?;
+    let timestamp = now();
+    normalize(&mut i, &timestamp)?;
+    let root = Path::new(&i.info.repository);
+    let inventory = crate::import::inventory(root, &i.info.commit)?;
+    let mut plan = Plan {
+        kind: KIND.into(),
+        contract: CONTRACT.into(),
+        store_id: store::one(s, "metadata", "store_id", None)?.context("missing store UUID")?,
+        main_revision: s.head("main")?,
+        schema_hash: before.schema.revision(),
+        actor: actor.into(),
+        role: request.role.name().into(),
+        directory: dir.canonicalize()?,
+        commit: i.info.commit.clone(),
+        prefix: i.info.prefix.clone(),
+        git_web_url: git_web_url.into(),
+        timestamp,
+        inventory,
+        record_ids: i.graph.records.keys().cloned().collect(),
+        candidate_digest: candidate_digest(&i)?,
+        summary: Value::Null,
+        digest: String::new(),
+    };
+    let references = crate::markdown_links::report(&i.files, &plan)?;
+    plan.summary = json!({"import":i.info,"frozen":i.graph.records.values().filter(|r|r.frozen).count(),"source_bytes":i.files.iter().map(|f|STANDARD.decode(&f.bytes).map(|v|v.len())).collect::<std::result::Result<Vec<_>,_>>()?.iter().sum::<usize>(),"references":references,"limits":crate::source_import::limits()});
+    plan.seal()?;
+    crate::source_import::write_json_plan(out, &plan)?;
+    response(
+        s,
+        json!({"plan":out,"digest":plan.digest,"candidate_digest":plan.candidate_digest,"main_revision":plan.main_revision,"summary":plan.summary}),
+    )
+}
+pub struct ApplyRequest {
+    pub plan: Plan,
+    pub context: OperationContext,
+}
+impl ApplyRequest {
+    pub fn read(file: &Path, invocation: crate::source_import::Invocation<'_>) -> Result<Self> {
+        ensure!(
+            fs::metadata(file)?.len() <= crate::source_import::TOTAL_LIMIT,
+            "input_limit: plan exceeds 1 GiB"
+        );
+        let plan: Plan = serde_json::from_slice(&fs::read(file)?)
+            .context("stale_plan: invalid Markdown plan")?;
+        plan.verify()?;
+        ensure!(
+            invocation.actor == plan.actor && invocation.role.name() == plan.role,
+            "stale_plan: actor/role changed"
+        );
+        let op = invocation
+            .op_id
+            .context("import apply requires --op-id ID")?;
+        let hash = digest(serde_json::to_vec(
+            &json!({"markdown_plan":plan.digest,"actor":invocation.actor,"role":plan.role}),
+        )?);
+        Ok(Self {
+            plan,
+            context: invocation.context(op, hash),
+        })
     }
+}
+pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
+    let plan = &request.plan;
+    let context = &request.context;
+    let actor = plan.actor.as_str();
+    let op = context.op_id.as_str();
+    let hash = context.args_hash.as_str();
+    ensure!(
+        store::one::<String>(s, "metadata", "store_id", None)?.as_deref() == Some(&plan.store_id),
+        "stale_plan: wrong store UUID"
+    );
+    if let Some(result) = KnowledgeStore::receipt(s, op, hash)? {
+        return response(s, result);
+    }
+    s.check_identity(op, hash)?;
+    let before = store::graph(s, None)?;
+    if let Some(existing) = store::one::<Plan>(s, "metadata", "markdown_import", None)? {
+        ensure!(
+            existing.candidate_digest == plan.candidate_digest
+                && existing.git_web_url == plan.git_web_url
+                && existing.commit == plan.commit
+                && existing.prefix == plan.prefix,
+            "source_update_unsupported: changed Markdown snapshot requires a fresh store"
+        );
+        health(s, &before, None)?;
+        let result = json!({"identical_replay":true,"import":plan.summary["import"],"branch":"main","op_id":op});
+        if !context.dry_run {
+            s.commit_checked(
+                &crate::review::receipt_changes(op, hash, actor, &context.command, &result)?,
+                "record identical Markdown replay",
+                actor,
+                false,
+                &mut || Ok(()),
+            )?;
+        }
+        return response(
+            s,
+            if context.dry_run {
+                json!({"dry_run":true,"result":result})
+            } else {
+                result
+            },
+        );
+    }
+    ensure!(
+        s.head("main")? == plan.main_revision && before.schema.revision() == plan.schema_hash,
+        "stale_plan: main or schema changed; replan"
+    );
+    empty(s, &before)?;
+    let mut i = crate::import::import_selected(&plan.directory, &plan.commit, actor, true)?;
+    normalize(&mut i, &plan.timestamp)?;
+    ensure!(
+        candidate_digest(&i)? == plan.candidate_digest
+            && crate::import::inventory(Path::new(&i.info.repository), &plan.commit)?
+                == plan.inventory
+            && i.graph.records.keys().cloned().collect::<Vec<_>>() == plan.record_ids,
+        "stale_plan: pinned Markdown candidate changed"
+    );
+    let mut changes = ChangeSet::graph(&before, &i.graph)?;
+    for f in &i.files {
+        changes.push(Change::put("source_files", &f.path, f)?);
+    }
+    changes.push(Change::put("metadata", "import", &i.info)?);
+    changes.push(Change::put("metadata", "routing", &i.routing)?);
+    changes.push(Change::put(
+        "metadata",
+        "import_edges",
+        &i.graph.edges.values().collect::<Vec<_>>(),
+    )?);
+    changes.push(Change::put("metadata", "markdown_import", &plan)?);
+    let result = json!({"import":i.info,"candidate_digest":plan.candidate_digest,"op_id":op,"branch":"main"});
+    changes.extend(crate::review::receipt_changes(
+        op,
+        hash,
+        actor,
+        &context.command,
+        &result,
+    )?);
+    let sql_bytes = s.encoded_request_size(&changes);
+    ensure!(
+        sql_bytes <= s.request_limit().context("missing shared SQL budget")?,
+        "input_limit: encoded Markdown SQL request exceeds the shared packet budget"
+    );
+    if context.dry_run {
+        return response(
+            s,
+            json!({"dry_run":true,"result":result,"sql_bytes":sql_bytes,"shared_query_bytes":s.request_limit()}),
+        );
+    }
+    s.commit_markdown_checked(&changes, "bootstrap editable Markdown", actor, &mut || {
+        let actual = store::graph(s, None)?;
+        health(s, &actual, None)?;
+        ensure!(
+            actual.records == i.graph.records && actual.edges == i.graph.edges,
+            "Markdown bootstrap readback mismatch"
+        );
+        Ok(())
+    })?;
+    response(s, result)
 }
 /// Check original bytes and the complete imported baseline, independently of current edits.
 pub fn health_content(

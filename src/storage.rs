@@ -893,6 +893,24 @@ pub fn graph_changes(before: &Graph, after: &Graph) -> Result<String> {
 }
 
 impl KnowledgeStore for Store {
+    fn select_branch(&self, branch: &str) -> Result<()> {
+        self.checkout(branch)
+    }
+    fn receipt_response(&self, data: Value, branch: &str) -> Result<Value> {
+        shared_review::receipt_response(self, data, branch)
+    }
+    fn check_import_reservation(&self, source: &str, op: &str) -> Result<()> {
+        shared_review::check_import_reservation(self, source, op)
+    }
+    fn check_identity(&self, op: &str, hash: &str) -> Result<()> {
+        shared_review::check_identity(self, op, hash)
+    }
+    fn check_bootstrap_ready(&self) -> Result<()> {
+        shared_review::check_bootstrap_ready(self)
+    }
+    fn encoded_request_size(&self, changes: &ChangeSet) -> usize {
+        changes.to_sql().len()
+    }
     fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
         self.transaction(&changes.to_sql(), message, actor)
     }

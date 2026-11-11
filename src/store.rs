@@ -101,6 +101,15 @@ pub struct ProposalWrite<'a> {
 /// writes in its open transaction. `Some(at)` selects that ref or revision.
 /// Rows are `(id, JSON payload)` pairs; their order is supplied by the backend.
 pub trait KnowledgeStore {
+    /// Select main or a public proposal as the session's current view.
+    fn select_branch(&self, branch: &str) -> Result<()>;
+    /// Preserve the shared receipt/recovery envelope for an importer response.
+    fn receipt_response(&self, data: Value, branch: &str) -> Result<Value>;
+    fn check_import_reservation(&self, source: &str, op: &str) -> Result<()>;
+    fn check_identity(&self, op: &str, hash: &str) -> Result<()>;
+    fn check_bootstrap_ready(&self) -> Result<()>;
+    /// Size of this backend's encoded atomic request, before transport limits.
+    fn encoded_request_size(&self, changes: &ChangeSet) -> usize;
     fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()>;
     /// Commit on the shared session, validating its uncommitted view before
     /// persistence. `owned` retains the existing temporary-working-set policy.
@@ -254,6 +263,24 @@ mod tests {
         tables: BTreeMap<String, Vec<(String, String)>>,
     }
     impl KnowledgeStore for Fixture {
+        fn select_branch(&self, _: &str) -> Result<()> {
+            anyhow::bail!("unexpected branch selection")
+        }
+        fn receipt_response(&self, _: Value, _: &str) -> Result<Value> {
+            anyhow::bail!("unexpected importer response")
+        }
+        fn check_import_reservation(&self, _: &str, _: &str) -> Result<()> {
+            anyhow::bail!("unexpected import reservation")
+        }
+        fn check_identity(&self, _: &str, _: &str) -> Result<()> {
+            anyhow::bail!("unexpected operation identity")
+        }
+        fn check_bootstrap_ready(&self) -> Result<()> {
+            anyhow::bail!("unexpected bootstrap check")
+        }
+        fn encoded_request_size(&self, _: &ChangeSet) -> usize {
+            panic!("unexpected request encoding")
+        }
         fn commit(&self, _: &ChangeSet, _: &str, _: &str) -> Result<()> {
             anyhow::bail!("unexpected commit")
         }

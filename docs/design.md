@@ -80,3 +80,26 @@ across mutations, schemas and acceptance. Local notes and relationships can cite
 captured records. Native export keeps original source subtrees and executable
 modes, plus normalized views, source links and reference assertions. Generic
 sources cannot use Liskov export. Changed-source reconciliation is deferred.
+
+## Engine and store boundary
+
+The engine modules are `model`, `schema`, `store`, `policy`, `mutation`, `query`,
+`triggers`, `presentation`, `work_ref`, `profile`, `review`, `review_token`, `read`,
+`render`, `import`, `source_import`, `markdown_import`, `markdown_links` and
+`beads`. They accept typed requests and reach stored knowledge through
+`KnowledgeStore` in `src/store.rs`. Its branch selection chooses main or a named
+proposal as the session view for subsequent unpinned reads and commits.
+
+The Dolt backend lives in `src/storage.rs` and `src/storage/`. It owns SQL
+encoding, request sizing, branch checkout, transactions and the shared recovery
+protocol. The CLI adapter (`src/cli.rs`, `src/main.rs`, `src/app.rs`) and HTTP
+adapter (`src/http.rs`) open concrete stores and translate external requests.
+Importer adaptation lives in `src/app.rs`: local source imports release their
+read-only store before building and opening the write-locked store; shared
+imports retain one session from the first base read through publication.
+
+The engine keeps intentional I/O: Git reads of pinned import sources, the render
+export directory, Beads `bd` calls and `beads.json`, and plan and profile files.
+`source_import::persist` and `review::receipt` retain SQL-text wrappers for tests
+and the shared protocol. The adapters keep concrete Dolt maintenance operations,
+and revisions, proposal branch names and diff text still carry Dolt's shape.
