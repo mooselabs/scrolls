@@ -1,4 +1,4 @@
-format: 1
+format: 2
 instructions: 'Use new, edit, status, link and unlink. Related records are references;
   follow them explicitly. Use batch for coupled graph changes. Example: [{op: new,
   handle: response, kind: answer, title: Response, body: Yes}, {op: link, from: "$response",
@@ -306,7 +306,7 @@ relations:
     - "*"
     affects: both
     external:
-    - beads
+    - work
     - text
     - glob
     - url
@@ -315,7 +315,7 @@ relations:
     to: []
     affects: source
     external:
-    - beads
+    - work
   implemented_by:
     from:
     - decision
@@ -324,7 +324,7 @@ relations:
     to: []
     affects: both
     external:
-    - beads
+    - work
   produced_by:
     from:
     - evidence
@@ -334,7 +334,7 @@ relations:
     to: []
     affects: both
     external:
-    - beads
+    - work
   related:
     from: *id002
     to: *id003
@@ -342,4 +342,4 @@ relations:
 
 body_links:
   local: related
-  beads: related_work
+  work: related_work

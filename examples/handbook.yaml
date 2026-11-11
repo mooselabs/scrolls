@@ -1,4 +1,4 @@
-format: 1
+format: 2
 instructions: >-
   Create pages with new page; use batch to attach chapters atomically.
   Publish pages with status ID published --expect REV and review the proposal.

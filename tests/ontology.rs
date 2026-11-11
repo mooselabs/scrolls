@@ -210,3 +210,53 @@ fn already_accepted_answers_cannot_be_swapped_around_owner_guards() {
             .any(|r| r.check("bob", "human").is_err())
     );
 }
+
+#[test]
+fn ontology_format_two_names_the_work_target() {
+    let bundled = Schema::default();
+    assert_eq!(bundled.format, 2);
+    let mut value = serde_json::to_value(&bundled).unwrap();
+    assert!(Schema::parse(&value.to_string()).is_ok());
+    value["relations"]["related_work"]["external"] = json!(["beads"]);
+    assert!(
+        Schema::parse(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown external type")
+    );
+    value = serde_json::to_value(&bundled).unwrap();
+    value["format"] = json!(1);
+    value["body_links"] = json!({"local":"related"});
+    assert!(
+        Schema::parse(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown external type")
+    );
+    value["format"] = json!(3);
+    assert!(
+        Schema::parse(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported ontology format")
+    );
+    for example in [
+        include_str!("../examples/handbook.yaml"),
+        include_str!("../examples/research.yaml"),
+    ] {
+        assert_eq!(Schema::parse(example).unwrap().format, 2);
+    }
+    value = serde_json::to_value(bundled).unwrap();
+    value["body_links"] = json!({"beads":"related_work"});
+    assert!(
+        Schema::parse(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown body link type")
+    );
+    // Format 1 historically allowed unused keys; loading it must keep that meaning.
+    let mut old = Schema::parse(include_str!("fixtures/knowledge-format-1.yaml")).unwrap();
+    old.body_links
+        .insert("unused".into(), "related_work".into());
+    assert!(Schema::parse(&serde_json::to_string(&old).unwrap()).is_ok());
+}

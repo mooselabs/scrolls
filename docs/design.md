@@ -7,13 +7,25 @@ the bundled knowledge ontology; `examples/handbook.yaml` and
 
 The active ontology is a typed configuration in Dolt metadata. YAML (or JSON,
 a YAML subset) is its authoring and exchange representation. Configuration
-format 1 defines kinds, fields, lifecycle transitions, actor write policy,
+format 2 defines kinds, fields, lifecycle transitions, actor write policy,
 ownership guards, endpoint rules, cardinality, cycle restrictions, instructions,
 and ordered startup pins. A deterministic content digest identifies the schema
 revision. `schema apply --expect` always creates a reviewed proposal. Acceptance
 merges into a temporary branch, validates the resulting configuration and graph
 against current main, then advances main atomically. No transformation migrations
 or silent kind/field renames are provided.
+
+Format 2 names the generic external work target `work`; standalone Scrolls resolves
+it to the same canonical `beads://` references as format 1's `beads` target. The
+format-specific name is selected in `Schema`, shared by relation validation,
+link resolution and body-link extraction. Format 1 remains readable and writable
+without normalization: stored ontology JSON and its content digest change only
+through explicit configuration writes. Ontology format is independent of store
+format (4 local, 5 shared), import-profile format and Markdown-plan format. New
+stores and migration from store formats below 3 install the bundled format-2
+ontology; migrating a later store preserves its configured ontology. The
+[ontology upgrade guide](ontology-format-2.md) describes reviewed conversion and
+older-writer limitations.
 
 Records retain stable IDs, revisions, attribution, optional domain metadata,
 custom JSON fields, original imported snapshots, paths and aliases. Field rules

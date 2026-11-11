@@ -432,3 +432,61 @@ fn bead_context_is_direct_references_including_notes_and_history() {
         serde_json::json!([])
     );
 }
+
+#[test]
+fn format_one_beads_is_the_work_target() {
+    use scrolls::{
+        beads::{Binding, Local},
+        mutation,
+        schema::Schema,
+    };
+    let schema = Schema::parse(include_str!("fixtures/knowledge-format-1.yaml")).unwrap();
+    let revision = schema.revision();
+    let stored = serde_json::to_string(&schema).unwrap();
+    let loaded: Schema = serde_json::from_str(&stored).unwrap();
+    assert_eq!(loaded.revision(), revision);
+    assert_eq!(loaded.format, 1);
+    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
+    let mut local = Local::default();
+    local.bindings.insert(
+        "work".into(),
+        Binding {
+            project_id: "00000000-0000-4000-8000-000000000001".into(),
+            directory: Default::default(),
+            bd: Default::default(),
+            timeout: 1,
+        },
+    );
+    // Both ontology names resolve the same local binding and canonical target.
+    for schema in [loaded, Schema::default()] {
+        let mut g = Graph {
+            schema,
+            ..Default::default()
+        };
+        let note = g
+            .schema
+            .new_record("note", "Work", &format!("[work]({target})"), "alice")
+            .unwrap();
+        let id = note.id.clone();
+        g.records.insert(id.clone(), note);
+        policy::extract_links(&mut g, &id, "alice");
+        assert_eq!(g.edges.len(), 1);
+        let edge = g.edges.values().next().unwrap();
+        assert_eq!(edge.rel, "related_work");
+        assert_eq!(edge.to, target);
+        policy::edge_valid(&g, edge).unwrap();
+        g.edges.clear();
+        let ops = mutation::parse(
+            &serde_json::json!([
+                {"op":"link", "from":id, "rel":"related_work", "to":"work:bd-a", "expect":1}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let (after, _, _) = mutation::apply(&g, &ops, "alice", &local).unwrap();
+        assert_eq!(after.edges.len(), 1);
+        assert_eq!(after.edges.values().next().unwrap().to, target);
+        assert_eq!(after.schema.revision(), g.schema.revision());
+        assert!(policy::lint(&after).is_empty());
+    }
+}

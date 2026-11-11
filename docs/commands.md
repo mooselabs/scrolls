@@ -80,20 +80,28 @@ can propose a guarded change; the human reviewer must satisfy the original guard
 
 See the complete [bundled schema](../schemas/knowledge.yaml),
 [handbook](../examples/handbook.yaml), and [research](../examples/research.yaml).
-`format: 1` is required. Each kind defines `initial`, `states`, `transitions`,
+An explicit `format` is required: use `format: 2` for new ontologies.
+`format: 1` remains supported with its original meaning; other formats are refused. Each kind defines `initial`, `states`, `transitions`,
 `write: {human: direct|proposal, agent: direct|proposal}`, `fields`,
 `additional_fields`, optional `guards` and `cardinality`.
 
 Fields define `type`, `required`, `default`, `values` (enum), `items` (list),
 `minimum` (number), `nonempty` (string), and `glob` (string/list of globs).
 Relations define `from`/`to` kind lists (`'*'` means any), `external`
-(`beads`, `glob`, `url`, `text`), `affects: source|both`, `reason`, `self_link`,
+(`work`, `glob`, `url`, `text` in format 2), `affects: source|both`, `reason`, `self_link`,
 `cycles`, and `same_kind`. An empty endpoint list permits no local kind.
 Cardinality defines `name`, `relation`, `direction`, `min`, `max`, optional
 `status`/`related_status`, and `skip_frozen`. A guard defines target state `to`,
 `human`, and optionally `relation`/`direction`; absent a relation it uses the
-record owner. Configured `body_links` maps `local`/`beads` to source-only
+record owner. Configured `body_links` maps `local`/`work` to source-only
 relations for automatic Markdown link assertions. Custom schemas may omit it.
+The `work` target accepts canonical `beads://PROJECT-UUID/FULL-ISSUE-ID` references
+and resolves locally bound `NAME:ID` on link/unlink. Body `](beads://…)` links use
+`body_links.work`. In format 1, both the external type and body-link key are named
+`beads` instead of `work`. Each format rejects the other's external type; format 2
+also rejects unknown body-link keys. Existing stored
+references and format-1 schema revisions are unchanged. See the
+[ontology format-2 upgrade guide](ontology-format-2.md).
 `envelope_fields` optionally constrains confidence, review_every and last_reviewed.
 `instructions` is authored text and `pins` is an ordered list of IDs or aliases,
 resolved and deduplicated on application.

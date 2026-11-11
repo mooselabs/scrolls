@@ -230,14 +230,22 @@ impl Schema {
     pub fn revision(&self) -> String {
         crate::model::digest(serde_json::to_vec(self).expect("schema serializes"))
     }
+    /// Ontology spelling of the work target; the stored reference stays unchanged.
+    pub(crate) fn work_target(&self) -> &'static str {
+        if self.format == 1 { "beads" } else { "work" }
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.format == 1,
+            matches!(self.format, 1 | 2),
             "unsupported ontology format {}",
             self.format
         );
         ensure!(!self.kinds.is_empty(), "schema requires kinds");
-        for rel in self.body_links.values() {
+        for (target, rel) in &self.body_links {
+            ensure!(
+                self.format == 1 || ["local", self.work_target()].contains(&target.as_str()),
+                "unknown body link type {target}"
+            );
             ensure!(
                 self.relations.contains_key(rel),
                 "unknown body link relation {rel}"
@@ -312,7 +320,7 @@ impl Schema {
             }
             for e in &r.external {
                 ensure!(
-                    ["beads", "glob", "text", "url"].contains(&e.as_str()),
+                    [self.work_target(), "glob", "text", "url"].contains(&e.as_str()),
                     "{name}: unknown external type {e}"
                 );
             }

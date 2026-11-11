@@ -46,7 +46,7 @@ pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
                 crate::work_ref::BeadRef::parse(&e.to)?.uri() == e.to,
                 "non-canonical Beads reference"
             );
-            "beads"
+            g.schema.work_target()
         } else if let Some(glob) = e.to.strip_prefix("glob:") {
             crate::triggers::glob(&e.from, &e.rel, glob)?;
             "glob"
@@ -268,10 +268,10 @@ pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
         let target = crate::work_ref::BeadRef::parse(&cap[1])
             .map(|r| r.uri())
             .unwrap_or_else(|_| cap[1].into());
-        if g.schema.body_links.contains_key("beads")
+        if g.schema.body_links.contains_key(g.schema.work_target())
             && !g.edges.values().any(|e| e.from == id && e.to == target)
         {
-            let rel = g.schema.body_links["beads"].clone();
+            let rel = g.schema.body_links[g.schema.work_target()].clone();
             g.add_edge(id, &rel, &target, "body link", actor);
         }
     }

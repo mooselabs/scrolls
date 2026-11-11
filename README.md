@@ -88,7 +88,11 @@ and choose new IDs for new work.
 
 Initialize a custom ontology with `scrolls init --schema examples/research.yaml`.
 Use `schema show`, `schema validate FILE`, and reviewed `schema apply FILE --expect REV`
-to inspect and evolve it. See the [migration guide](docs/migration-0.2.md).
+to inspect and evolve it. The bundled and example ontologies use `format: 2`,
+whose generic `work` target uses canonical `beads://` references in standalone Scrolls.
+Format-1 ontologies retain their `beads` target name and original revision until
+explicitly applied as format 2. See the [ontology upgrade guide](docs/ontology-format-2.md)
+and the [store migration guide](docs/migration-0.2.md).
 
 ## Features
 
