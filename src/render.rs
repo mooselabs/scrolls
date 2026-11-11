@@ -1,12 +1,18 @@
 use crate::{
-    cli::Format,
     import::{safe_path, strings},
     model::*,
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub enum Format {
+    Native,
+    Liskov,
+}
+
 fn original(r: &Record) -> Result<Option<Record>> {
     r.original
         .clone()

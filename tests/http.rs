@@ -192,14 +192,14 @@ impl Fixture {
             .into()
     }
     fn state(&self) -> Value {
-        let config = scrolls::read::Config {
+        let config = scrolls::http::Config {
             store: self.dir.path().join("store"),
             dolt: dolt(),
             connection: self.shared.then(|| self.dir.path().join("connection.json")),
             branch: "main".into(),
             actor: "alice".into(),
         };
-        let snap = scrolls::read::Snapshot::open(&config).unwrap();
+        let snap = scrolls::http::Snapshot::open(&config).unwrap();
         let mut rows = BTreeMap::new();
         for branch in snap.store.branches().unwrap() {
             for table in [

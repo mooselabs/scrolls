@@ -2,8 +2,8 @@ use crate::{
     cli::*,
     model::*,
     policy, query,
-    review::{receipt_changes, validate_merged_review, wrap},
-    storage::{self, Store},
+    review::{receipt_changes, wrap},
+    storage::{self, Store, validate_merged_review},
     store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
 };
 use anyhow::{Context, Result, bail};
@@ -359,7 +359,14 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if matches!(command, BeadsCommand::Publish(_)) {
             actor(cli)?;
         }
-        let data = crate::beads::run(cli, &store, &before, command)?;
+        let request = crate::beads::Request {
+            dry_run: cli.dry_run,
+            actor: cli.actor.as_deref(),
+            op_id: cli.op_id.as_deref(),
+            proposal: cli.proposal.as_deref(),
+            command,
+        };
+        let data = crate::beads::run(&store, &store.root, &before, &request)?;
         let failed = data["failed"].as_u64().unwrap_or(0) > 0;
         let mut result = wrap(&store, data, branch)?;
         if failed {
