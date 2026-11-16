@@ -371,7 +371,7 @@ fn relocation_empty_sets_and_aliases_precede_beads_shorthand() {
         .get_mut("related")
         .unwrap()
         .external
-        .push("beads".into());
+        .push("work".into());
     let note = g
         .schema
         .new_record("note", "chapter:one", "local", "alice")
