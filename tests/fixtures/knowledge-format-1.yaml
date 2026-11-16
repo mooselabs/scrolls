@@ -1,0 +1,345 @@
+format: 1
+instructions: 'Use new, edit, status, link and unlink. Related records are references;
+  follow them explicitly. Use batch for coupled graph changes. Example: [{op: new,
+  handle: response, kind: answer, title: Response, body: Yes}, {op: link, from: "$response",
+  rel: answers, to: QUESTION_ID, expect_to: 1}]. To accept: [{op: status, id: ANSWER_ID,
+  state: accepted, expect: 1}, {op: status, id: QUESTION_ID, state: answered, expect:
+  2}]. The question owner reviews acceptance. Supersession uses a status mutation
+  plus a supersedes link in one batch.'
+pins: []
+envelope_fields:
+  confidence:
+    type: enum
+    values:
+    - high
+    - medium
+    - low
+    required: true
+    default: medium
+  review_every:
+    type: integer
+    minimum: 1
+    required: true
+    default: 90
+kinds:
+  decision:
+    description: Decision document
+    initial: proposed
+    states:
+    - proposed
+    - accepted
+    - superseded
+    - retired
+    transitions:
+      proposed:
+      - accepted
+      - retired
+      accepted:
+      - superseded
+      - retired
+    additional_fields: true
+    write:
+      human: proposal
+      agent: proposal
+    cardinality:
+    - name: missing-support
+      relation: supports
+      direction: incoming
+      min: 1
+  knowledge:
+    description: Knowledge document
+    initial: draft
+    states:
+    - draft
+    - current
+    - stale
+    - retired
+    transitions: &id001
+      draft:
+      - current
+      - retired
+      current:
+      - stale
+      - retired
+      stale:
+      - current
+      - retired
+    additional_fields: true
+    write:
+      human: proposal
+      agent: proposal
+    cardinality:
+    - name: missing-support
+      relation: supports
+      direction: incoming
+      min: 1
+  primer:
+    description: Primer document
+    initial: draft
+    states:
+    - draft
+    - current
+    - stale
+    - retired
+    transitions: *id001
+    additional_fields: true
+    write:
+      human: proposal
+      agent: proposal
+    cardinality:
+    - name: missing-support
+      relation: supports
+      direction: incoming
+      min: 1
+  evidence:
+    description: Evidence document
+    initial: captured
+    states:
+    - captured
+    - archived
+    transitions:
+      captured:
+      - archived
+    additional_fields: true
+    write:
+      human: direct
+      agent: direct
+  question:
+    description: Question document
+    initial: open
+    states:
+    - open
+    - answered
+    - withdrawn
+    transitions:
+      open:
+      - answered
+      - withdrawn
+    additional_fields: true
+    write:
+      human: direct
+      agent: direct
+    cardinality:
+    - name: accepted-answer
+      relation: answers
+      direction: incoming
+      status: answered
+      related_status: accepted
+      min: 1
+      max: 1
+      skip_frozen: true
+    guards:
+    - to: answered
+      human: true
+  answer:
+    description: Answer document
+    initial: offered
+    states:
+    - offered
+    - accepted
+    - declined
+    transitions:
+      offered:
+      - accepted
+      - declined
+    additional_fields: true
+    write:
+      human: direct
+      agent: proposal
+    cardinality:
+    - name: answer-question
+      relation: answers
+      direction: outgoing
+      min: 1
+      max: 1
+    guards:
+    - to: accepted
+      human: true
+      relation: answers
+      direction: outgoing
+  doctrine:
+    description: Doctrine document
+    initial: proposed
+    states:
+    - proposed
+    - active
+    - retired
+    transitions:
+      proposed:
+      - active
+      - retired
+      active:
+      - retired
+    additional_fields: true
+    write:
+      human: proposal
+      agent: proposal
+    fields:
+      glob:
+        type: json
+        glob: true
+      scope_clause:
+        type: string
+        nonempty: true
+  entity:
+    description: Entity document
+    initial: active
+    states:
+    - active
+    - retired
+    transitions:
+      active:
+      - retired
+    additional_fields: true
+    write:
+      human: proposal
+      agent: proposal
+  collection:
+    description: Collection document
+    initial: current
+    states:
+    - current
+    - stale
+    transitions:
+      current:
+      - stale
+      stale:
+      - current
+    additional_fields: true
+    write:
+      human: direct
+      agent: direct
+  note:
+    description: Note document
+    initial: recorded
+    states:
+    - recorded
+    transitions: {}
+    additional_fields: true
+    write:
+      human: direct
+      agent: direct
+relations:
+  supports:
+    from:
+    - evidence
+    to:
+    - knowledge
+    - primer
+    - decision
+    affects: both
+  derived_from:
+    from:
+    - knowledge
+    - primer
+    to:
+    - knowledge
+    - primer
+    - evidence
+    affects: both
+  supersedes:
+    from: &id002
+    - '*'
+    to: &id003
+    - '*'
+    affects: both
+    same_kind: true
+    self_link: false
+    cycles: false
+    reason: true
+  contradicts:
+    from:
+    - knowledge
+    - primer
+    - decision
+    to:
+    - knowledge
+    - primer
+    - decision
+    affects: both
+    reason: true
+  about:
+    from: *id002
+    to:
+    - entity
+    affects: source
+  applies_to:
+    from:
+    - doctrine
+    to:
+    - entity
+    affects: both
+    external:
+    - glob
+  asks_about:
+    from:
+    - question
+    to: *id003
+    affects: source
+  answers:
+    from:
+    - answer
+    to:
+    - question
+    affects: both
+  promoted_to:
+    from:
+    - answer
+    - evidence
+    to:
+    - decision
+    - knowledge
+    - primer
+    affects: both
+  depends_on:
+    from:
+    - decision
+    to:
+    - decision
+    affects: both
+    reason: true
+    cycles: false
+  blocks:
+    from:
+    - question
+    to:
+    - "*"
+    affects: both
+    external:
+    - beads
+    - text
+    - glob
+    - url
+  related_work:
+    from: *id002
+    to: []
+    affects: source
+    external:
+    - beads
+  implemented_by:
+    from:
+    - decision
+    - knowledge
+    - primer
+    to: []
+    affects: both
+    external:
+    - beads
+  produced_by:
+    from:
+    - evidence
+    - knowledge
+    - primer
+    - note
+    to: []
+    affects: both
+    external:
+    - beads
+  related:
+    from: *id002
+    to: *id003
+    affects: source
+
+body_links:
+  local: related
+  beads: related_work

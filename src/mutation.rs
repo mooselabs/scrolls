@@ -211,7 +211,7 @@ pub fn apply(
                 {
                     g.resolve(to)?
                 } else if to.starts_with("beads://")
-                    || (rule.external.iter().any(|e| e == "beads")
+                    || (rule.external.iter().any(|e| e == g.schema.work_target())
                         && to.contains(':')
                         && !to.starts_with("glob:")
                         && !to.starts_with("http"))

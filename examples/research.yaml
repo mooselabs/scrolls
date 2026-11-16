@@ -1,4 +1,4 @@
-format: 1
+format: 2
 instructions: >-
   Capture trials and hypotheses. Use batch to create a hypothesis and attach a
   corroborates relationship from its trial. Review before relying on results.

@@ -2574,3 +2574,156 @@ fn imported_file_key_collision_never_overwrites_another_tuple() {
     assert!(s.one::<Value>("operations", "collision").unwrap().is_none());
     s.clean().unwrap();
 }
+
+#[test]
+fn format_one_store_migrates_to_ontology_format_two() {
+    use scrolls::schema::Schema;
+    let old = Schema::parse(include_str!("fixtures/knowledge-format-1.yaml")).unwrap();
+    let old_revision = old.revision();
+    let f = Fixture::new();
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        s.transaction(
+            &put("metadata", "ontology", &old).unwrap(),
+            "format-1 ontology fixture",
+            "test",
+        )
+        .unwrap();
+    }
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/knowledge-format-1.yaml");
+    f.ok(&["schema", "validate", fixture_path.to_str().unwrap()]);
+    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
+    let note = f.ok(&["new", "note", "--title", "Linked work", "--body", "facts"]);
+    let id = note["id"].as_str().unwrap();
+    f.ok(&["link", id, "related_work", target, "--expect", "1"]);
+    f.ok(&[
+        "new",
+        "note",
+        "--title",
+        "Body work",
+        "--body",
+        &format!("[work]({target})"),
+    ]);
+    assert_eq!(f.ok(&["schema", "show"])["schema_revision"], old_revision);
+    let exported = f.command(&["schema", "export"]).output().unwrap();
+    assert!(exported.status.success());
+    assert_eq!(
+        Schema::parse(std::str::from_utf8(&exported.stdout).unwrap()).unwrap(),
+        old
+    );
+    let pending = f.ok(&[
+        "new",
+        "entity",
+        "--title",
+        "Before ontology apply",
+        "--body",
+        "",
+    ]);
+    let pending_branch = pending["branch"].as_str().unwrap();
+    let (before, edges) = {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        let graph = s.graph().unwrap();
+        assert_eq!(graph.schema, old);
+        assert_eq!(graph.edges.len(), 2);
+        (
+            s.revision().unwrap(),
+            serde_json::to_vec(&graph.edges).unwrap(),
+        )
+    };
+    let bundled_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schemas/knowledge.yaml");
+    let proposed = f.ok(&[
+        "schema",
+        "apply",
+        bundled_path.to_str().unwrap(),
+        "--expect",
+        &old_revision,
+    ]);
+    assert_eq!(f.ok(&["schema", "show"])["schema_revision"], old_revision);
+    let branch = proposed["branch"].as_str().unwrap();
+    f.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &f.review_token(branch),
+    ]);
+    let fresh = Fixture::new();
+    let active = f.ok(&["schema", "show"]);
+    assert_eq!(
+        active["schema_revision"],
+        fresh.ok(&["schema", "show"])["schema_revision"]
+    );
+    assert_eq!(active["schema_revision"], Schema::default().revision());
+    assert_eq!(active["schema"]["format"], 2);
+    assert_eq!(
+        f.ok(&["--proposal", pending_branch, "schema", "show"])["schema_revision"],
+        old_revision
+    );
+    f.ok(&[
+        "--proposal",
+        pending_branch,
+        "show",
+        pending["id"].as_str().unwrap(),
+    ]);
+    f.ok(&[
+        "--proposal",
+        pending_branch,
+        "new",
+        "note",
+        "--title",
+        "Still writable",
+        "--body",
+        &format!("[work]({target})"),
+    ]);
+    assert_eq!(
+        f.ok(&["--proposal", pending_branch, "schema", "show"])["schema_revision"],
+        old_revision
+    );
+    {
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        s.checkout("main").unwrap();
+        assert_eq!(
+            serde_json::to_vec(&s.graph().unwrap().edges).unwrap(),
+            edges
+        );
+        let historical = s.graph_at(&before).unwrap();
+        assert_eq!(historical.schema.revision(), old_revision);
+        assert_eq!(serde_json::to_vec(&historical.edges).unwrap(), edges);
+    }
+    assert!(f.ok(&["lint"])["errors"].as_array().unwrap().is_empty());
+    assert_eq!(f.ok(&["doctor"])["schema_version"], 4);
+
+    // Explicit initialization from a format-1 file stays supported too.
+    let initialized = Fixture {
+        dir: tempfile::tempdir().unwrap(),
+    };
+    initialized.ok(&["init", "--schema", fixture_path.to_str().unwrap()]);
+    assert_eq!(
+        initialized.ok(&["schema", "show"])["schema_revision"],
+        old_revision
+    );
+    // Applying a format-1 file is reviewed without converting its contents.
+    let active = fresh.ok(&["schema", "show"]);
+    let proposed = fresh.ok(&[
+        "schema",
+        "apply",
+        fixture_path.to_str().unwrap(),
+        "--expect",
+        active["schema_revision"].as_str().unwrap(),
+    ]);
+    let branch = proposed["branch"].as_str().unwrap();
+    fresh.ok(&[
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &fresh.review_token(branch),
+    ]);
+    assert_eq!(
+        fresh.ok(&["schema", "show"])["schema_revision"],
+        old_revision
+    );
+}
