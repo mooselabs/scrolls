@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+const OPTIONAL_ENVELOPE_FIELDS: [&str; 3] = ["confidence", "review_every", "last_reviewed"];
 fn yes() -> bool {
     true
 }
@@ -22,6 +23,41 @@ pub struct Schema {
     pub instructions: String,
     #[serde(default)]
     pub pins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<Invariant>,
+}
+/// A named, deterministic requirement on records selected by kind and predicate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Invariant {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    #[serde(default)]
+    pub when: Option<crate::query::Expr>,
+    pub require: crate::query::Expr,
+    #[serde(default)]
+    pub skip_frozen: bool,
+}
+impl Invariant {
+    pub(crate) fn violated(&self, g: &Graph, r: &Record) -> bool {
+        if (self.skip_frozen && r.frozen)
+            || (!self.kinds.is_empty() && !self.kinds.contains(&r.kind))
+        {
+            return false;
+        }
+        // Evaluation errors fail closed, retaining the stable record:rule identity.
+        let verdict = (|| -> Result<bool> {
+            if let Some(when) = &self.when {
+                if !crate::query::matches_invariant(when, g, r)? {
+                    return Ok(true);
+                }
+            }
+            crate::query::matches_invariant(&self.require, g, r)
+        })();
+        !verdict.unwrap_or(false)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -325,10 +361,50 @@ impl Schema {
                 );
             }
         }
+        let mut names = BTreeSet::new();
+        for invariant in &self.invariants {
+            (|| -> Result<()> {
+                ensure!(self.format == 2, "invariants require ontology format 2");
+                ensure!(
+                    !invariant.name.is_empty()
+                        && invariant
+                            .name
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+                    "invariant name must contain only letters, numbers, underscores or hyphens"
+                );
+                ensure!(names.insert(&invariant.name), "duplicate invariant name");
+                ensure!(
+                    !["invalid-status", "required-fields"].contains(&invariant.name.as_str())
+                        && !OPTIONAL_ENVELOPE_FIELDS.contains(&invariant.name.as_str())
+                        && !invariant.name.ends_with("-cycle"),
+                    "invariant name collides with built-in lint rule"
+                );
+                ensure!(
+                    !self
+                        .kinds
+                        .values()
+                        .any(|k| k.cardinality.iter().any(|c| c.name == invariant.name)),
+                    "invariant name collides with cardinality"
+                );
+                ensure!(
+                    !invariant.kinds.is_empty() || invariant.when.is_some(),
+                    "invariant requires kinds or when"
+                );
+                for kind in &invariant.kinds {
+                    self.kind(kind)?;
+                }
+                if let Some(when) = &invariant.when {
+                    crate::query::validate_invariant_expression(when, self)?;
+                }
+                crate::query::validate_invariant_expression(&invariant.require, self)
+            })()
+            .with_context(|| format!("invariant {}", invariant.name))?;
+        }
         for (f, def) in &self.envelope_fields {
             def.definition().with_context(|| format!("envelope.{f}"))?;
             ensure!(
-                ["confidence", "review_every", "last_reviewed"].contains(&f.as_str()),
+                OPTIONAL_ENVELOPE_FIELDS.contains(&f.as_str()),
                 "unsupported optional envelope field {f}"
             );
             if let Some(v) = &def.default {
