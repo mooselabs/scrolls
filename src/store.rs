@@ -63,6 +63,73 @@ impl ChangeSet {
     pub fn extend(&mut self, other: Self) {
         self.changes.extend(other.changes);
     }
+    pub(crate) fn changes_graph(&self) -> bool {
+        self.changes.iter().any(|c| match c {
+            Change::Put { table, id, .. } | Change::Insert { table, id, .. } => {
+                matches!(
+                    table.as_str(),
+                    "records" | "edges" | "import_sources" | "import_members"
+                ) || (table == "metadata" && id == "ontology")
+            }
+            Change::DeleteEdge { .. } => true,
+        })
+    }
+    /// Apply typed after-images under the local store lock, avoiding another set
+    /// of Dolt processes. Identity checks match graph assembly from stored rows.
+    pub(crate) fn candidate(&self, before: &Graph) -> Result<Graph> {
+        let mut graph = before.clone();
+        for change in &self.changes {
+            let (table, id, payload) = match change {
+                Change::Put { table, id, payload } | Change::Insert { table, id, payload } => {
+                    (table.as_str(), id, payload)
+                }
+                Change::DeleteEdge { id } => {
+                    graph.edges.remove(id);
+                    continue;
+                }
+            };
+            match table {
+                "records" => {
+                    let mut r: Record = serde_json::from_str(payload)?;
+                    anyhow::ensure!(
+                        r.id == *id,
+                        "stored_row_identity: invalid keyed row in records"
+                    );
+                    r.normalize_metadata();
+                    graph.records.insert(id.clone(), r);
+                }
+                "edges" => {
+                    let e: Edge = serde_json::from_str(payload)?;
+                    anyhow::ensure!(
+                        e.key() == *id,
+                        "stored_row_identity: invalid keyed row in edges"
+                    );
+                    graph.edges.insert(id.clone(), e);
+                }
+                "metadata" if id == "ontology" => graph.schema = serde_json::from_str(payload)?,
+                "import_sources" => {
+                    let source: source_import::Source = serde_json::from_str(payload)?;
+                    anyhow::ensure!(
+                        source.source_id == *id,
+                        "source_ownership: invalid keyed row in import_sources"
+                    );
+                    graph.import_sources.insert(id.clone(), source);
+                }
+                "import_members" => {
+                    let member: source_import::Member = serde_json::from_str(payload)?;
+                    anyhow::ensure!(
+                        member.row_key() == *id,
+                        "source_ownership: invalid keyed row in import_members"
+                    );
+                    graph
+                        .import_members
+                        .insert(member.record_id.clone(), member);
+                }
+                _ => {}
+            }
+        }
+        Ok(graph)
+    }
     pub fn graph(before: &Graph, after: &Graph) -> Result<Self> {
         let mut changes = Self::default();
         for (id, r) in &after.records {
@@ -100,6 +167,13 @@ pub struct ProposalWrite<'a> {
 /// `at: None` always selects the session's current view, including uncommitted
 /// writes in its open transaction. `Some(at)` selects that ref or revision.
 /// Rows are `(id, JSON payload)` pairs; their order is supplied by the backend.
+///
+/// Every write changing records, edges or the ontology MUST call
+/// `policy::validate_change` against its destination's before and committed graphs
+/// inside the same exclusive lock or transaction. This includes proposal publication,
+/// acceptance and recovery. Refusal must preserve all branch heads. Authority and
+/// import health checks remain additional caller obligations. Receipt-only writes
+/// may skip validation. Only `bootstrap` may establish new import lint debt.
 pub trait KnowledgeStore {
     /// Select main or a public proposal as the session's current view.
     fn select_branch(&self, branch: &str) -> Result<()>;
@@ -121,8 +195,10 @@ pub trait KnowledgeStore {
         owned: bool,
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<String>;
-    /// The shared Markdown bulk transport keeps the same atomic validation.
-    fn commit_markdown_checked(
+    /// Initial legacy or Markdown import into an empty store. Validate with exactly
+    /// the imported graph's lint as debt, recorded in the same atomic write. The
+    /// shared backend uses its Markdown bulk transport; no other write can add debt.
+    fn bootstrap(
         &self,
         changes: &ChangeSet,
         message: &str,
@@ -294,7 +370,7 @@ mod tests {
         ) -> Result<String> {
             anyhow::bail!("unexpected checked commit")
         }
-        fn commit_markdown_checked(
+        fn bootstrap(
             &self,
             _: &ChangeSet,
             _: &str,

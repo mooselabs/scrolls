@@ -411,35 +411,70 @@ impl Schema {
             == Affects::Source)
     }
     pub fn validate_record(&self, r: &Record) -> Result<()> {
-        let k = self
-            .kind(&r.kind)
-            .with_context(|| format!("record {}", r.id))?;
-        ensure!(k.states.contains(&r.status), "{}:invalid-status", r.id);
-        ensure!(
-            !r.title.trim().is_empty() && !r.owner.trim().is_empty(),
-            "{}:required-fields",
-            r.id
-        );
-        let fields = r.fields.as_object().context("fields must be an object")?;
-        for (name, def) in &k.fields {
-            match fields.get(name) {
-                Some(v) => def
-                    .validate(v)
-                    .with_context(|| format!("{}:field:{name}", r.id))?,
-                None => ensure!(!def.required, "{}:required-field:{name}", r.id),
-            }
+        match self.record_errors(r).into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        if !k.additional_fields {
-            for f in fields.keys() {
-                ensure!(k.fields.contains_key(f), "{}:unknown-field:{f}", r.id);
+    }
+    /// All field-rule failures, in validation order. Lint and atomic write
+    /// validation use this same owner so one broken field cannot hide another.
+    pub(crate) fn record_errors(&self, r: &Record) -> Vec<anyhow::Error> {
+        let k = match self
+            .kind(&r.kind)
+            .with_context(|| format!("record {}", r.id))
+        {
+            Ok(kind) => kind,
+            Err(error) => return vec![error],
+        };
+        let mut errors = vec![];
+        let mut check = |result: Result<()>| {
+            if let Err(error) = result {
+                errors.push(error);
+            }
+        };
+        check((|| {
+            ensure!(k.states.contains(&r.status), "{}:invalid-status", r.id);
+            Ok(())
+        })());
+        check((|| {
+            ensure!(
+                !r.title.trim().is_empty() && !r.owner.trim().is_empty(),
+                "{}:required-fields",
+                r.id
+            );
+            Ok(())
+        })());
+        let fields = r.fields.as_object();
+        check(fields.map(|_| ()).context("fields must be an object"));
+        if let Some(fields) = fields {
+            for (name, def) in &k.fields {
+                check(match fields.get(name) {
+                    Some(v) => def
+                        .validate(v)
+                        .with_context(|| format!("{}:field:{name}", r.id)),
+                    None => (|| {
+                        ensure!(!def.required, "{}:required-field:{name}", r.id);
+                        Ok(())
+                    })(),
+                });
+            }
+            if !k.additional_fields {
+                for f in fields.keys() {
+                    check((|| {
+                        ensure!(k.fields.contains_key(f), "{}:unknown-field:{f}", r.id);
+                        Ok(())
+                    })());
+                }
             }
         }
         let envelope = json!({"confidence":r.confidence,"review_every":r.review_every,"last_reviewed":r.last_reviewed});
         for (name, def) in &self.envelope_fields {
-            def.validate(&envelope[name])
-                .with_context(|| format!("{}:{name}", r.id))?;
+            check(
+                def.validate(&envelope[name])
+                    .with_context(|| format!("{}:{name}", r.id)),
+            );
         }
-        Ok(())
+        errors
     }
     /// Authority is always read from the original graph, never the proposed graph.
     pub fn guards(&self, before: &Graph, after: &Graph, actor: &str, role: &str) -> Result<()> {

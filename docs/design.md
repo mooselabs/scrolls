@@ -134,3 +134,29 @@ export directory, Beads `bd` calls and `beads.json`, and plan and profile files.
 `source_import::persist` and `review::receipt` retain SQL-text wrappers for tests
 and the shared protocol. The adapters keep concrete Dolt maintenance operations,
 and revisions, proposal branch names and diff text still carry Dolt's shape.
+
+## Atomic graph validation
+
+The enforcement point is the `KnowledgeStore` write, not the command.
+`policy::validate_change` is the single backend-neutral graph check, with no SQL
+or backend calls. It compares a destination's before graph to its candidate,
+including field rules, frozen history, cardinality, endpoints, links, cycles,
+`Schema::validate` and pin resolution. Existing violations are tolerated only
+for the same rule and record; changed rules are checked against existing rows.
+Guards, write/review authority, review tokens and importer health are separate.
+
+`commit`, `commit_checked`, proposal publication and acceptance enforce the
+check, including shared recovery/resume of a graph write. Local writes assemble
+typed after-images under the process's exclusive store lock. Local acceptance
+checks the merged candidate against current main before publishing it. Shared
+writes check the transaction's actual graph before its Dolt commit, under the
+database-wide publication lock. Raw Dolt SQL and migration maintenance remain
+below this engine contract.
+
+`bootstrap` is the sole debt-creating write: the legacy initial import and shared
+Markdown bootstrap require an empty store and record exactly the imported
+graph's lint as `lint_debt` in the same write, using it as the tolerated baseline.
+Ordinary writes cannot create import debt. Receipt-only replays/rejections/retries
+may skip the graph check. Refusal leaves branch heads unchanged and carries the
+`graph_write_refused` diagnostic and lint identities documented in
+[commands](commands.md#graph-write-refusals).

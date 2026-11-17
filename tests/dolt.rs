@@ -2730,3 +2730,245 @@ fn format_one_store_migrates_to_ontology_format_two() {
         old_revision
     );
 }
+
+#[test]
+fn knowledge_store_write_refuses_invalid_graph_and_preserves_heads() {
+    use scrolls::{
+        model::Record,
+        store::{Change, ChangeSet, KnowledgeStore, OperationContext, ProposalWrite},
+    };
+    let f = Fixture::new();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    let base = store.head("main").unwrap();
+    let record = Record::new("knowledge", "unsupported", "body", "alice").unwrap();
+    let changes = ChangeSet::from(Change::put("records", &record.id, &record).unwrap());
+    let error = store
+        .commit(&changes, "invalid direct write", "alice")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{}:missing-support", record.id)),
+        "{error:#}"
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+    assert!(s.graph().unwrap().records.is_empty());
+    let mut invalid_schema = s.graph().unwrap().schema;
+    invalid_schema.pins.push("sc-unknown-pin".into());
+    let ontology = ChangeSet::from(Change::put("metadata", "ontology", &invalid_schema).unwrap());
+    let error = store
+        .commit(&ontology, "unresolved ontology pin", "alice")
+        .unwrap_err();
+    assert!(error.to_string().contains("ontology:pin:sc-unknown-pin"));
+    assert_eq!(store.head("main").unwrap(), base);
+    let info = scrolls::model::ImportInfo {
+        repository: "fixture".into(),
+        commit: "fixture".into(),
+        prefix: "docs".into(),
+        files: 0,
+        markdown: 0,
+        untyped: 0,
+        lint_debt: [format!("{}:missing-support", record.id)].into(),
+    };
+    let mut disguised = changes.clone();
+    disguised.push(Change::put("metadata", "import", &info).unwrap());
+    assert!(
+        store
+            .commit(&disguised, "not a bootstrap", "alice")
+            .unwrap_err()
+            .to_string()
+            .contains("only bootstrap")
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+
+    let proposal = scrolls::model::Proposal {
+        branch: "proposal/invalid-direct".into(),
+        base: base.clone(),
+        actor: "alice".into(),
+        status: "pending".into(),
+        reason: None,
+    };
+    let context = OperationContext {
+        op_id: "direct-write".into(),
+        args_hash: "direct-hash".into(),
+        explicit_op_id: true,
+        actor: Some("alice".into()),
+        role: scrolls::model::Role::Human,
+        dry_run: false,
+        command: json!({"propose":true}),
+        review: None,
+        recovery: None,
+    };
+    let branches = store.branches().unwrap();
+    let error = store
+        .propose(
+            &context,
+            ProposalWrite {
+                changes: &changes,
+                message: "invalid proposal",
+                target: &proposal.branch,
+                start: Some("main"),
+                proposal: &proposal,
+                result: &json!({}),
+            },
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("missing-support"));
+    assert_eq!(store.branches().unwrap(), branches);
+    assert_eq!(store.head("main").unwrap(), base);
+}
+
+#[test]
+fn cli_graph_write_refusal_is_structured() {
+    let f = Fixture::new();
+    let (ok, value) = f.call(&[
+        "new",
+        "knowledge",
+        "--title",
+        "Unsupported",
+        "--body",
+        "body",
+    ]);
+    assert!(!ok);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["diagnostic"]["code"], "graph_write_refused");
+    let violations = value["error"]["diagnostic"]["violations"]
+        .as_array()
+        .unwrap();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.as_str().unwrap().starts_with("sc-")
+                && v.as_str().unwrap().ends_with(":missing-support")),
+        "{value}"
+    );
+}
+
+#[test]
+fn knowledge_store_accept_checks_graph_even_when_caller_approves() {
+    use scrolls::{
+        model::{Proposal, Record, Role},
+        store::{KnowledgeStore, OperationContext, ReviewRequest},
+    };
+    let f = Fixture::new();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    let base = store.head("main").unwrap();
+    let main = s.graph().unwrap();
+    let proposal = Proposal {
+        branch: "proposal/unchecked".into(),
+        base: base.clone(),
+        actor: "alice".into(),
+        status: "pending".into(),
+        reason: None,
+    };
+    let record = Record::new("knowledge", "unchecked", "body", "alice").unwrap();
+    s.run(&["checkout", "-b", &proposal.branch]).unwrap();
+    // Simulate an external Dolt writer, outside the engine's write contract.
+    s.transaction(
+        &(put("records", &record.id, &record).unwrap()
+            + &put("metadata", &proposal.branch, &proposal).unwrap()),
+        "external proposal",
+        "alice",
+    )
+    .unwrap();
+    let proposed = store.head(&proposal.branch).unwrap();
+    s.checkout("main").unwrap();
+    let context = OperationContext {
+        op_id: "accept-unchecked".into(),
+        args_hash: "unchecked-hash".into(),
+        explicit_op_id: true,
+        actor: Some("alice".into()),
+        role: Role::Human,
+        dry_run: false,
+        command: json!({"review":{"action":"accept"}}),
+        review: Some(ReviewRequest {
+            action: "accept".into(),
+            token: Some("caller approves".into()),
+            reason: None,
+        }),
+        recovery: None,
+    };
+    let error = store
+        .accept(&context, &main, &proposal, (&base, &proposed), &mut || {
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{}:missing-support", record.id)),
+        "{error:#}"
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+    assert_eq!(store.head(&proposal.branch).unwrap(), proposed);
+    assert!(
+        store
+            .receipt("accept-unchecked", "unchecked-hash")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn bootstrap_retains_legacy_lint_debt_while_checking_all_fields() {
+    use scrolls::{
+        model::{ImportInfo, Record},
+        store::{Change, ChangeSet, KnowledgeStore},
+    };
+    let f = Fixture::new();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    let mut schema = s.graph().unwrap().schema;
+    let required =
+        serde_yaml::from_str::<scrolls::schema::Field>("type: string\nrequired: true").unwrap();
+    for field in ["aaa", "bbb"] {
+        schema
+            .kinds
+            .get_mut("evidence")
+            .unwrap()
+            .fields
+            .insert(field.into(), required.clone());
+    }
+    store
+        .commit(
+            &ChangeSet::from(Change::put("metadata", "ontology", &schema).unwrap()),
+            "configure fixture",
+            "alice",
+        )
+        .unwrap();
+    let mut candidate = s.graph().unwrap();
+    let record = Record::new("evidence", "legacy field debt", "body", "alice").unwrap();
+    candidate.records.insert(record.id.clone(), record.clone());
+    let debt = scrolls::policy::lint(&candidate, &scrolls::beads::Local::default());
+    assert_eq!(debt, [format!("{}:required-field:aaa", record.id)].into());
+    let info = ImportInfo {
+        repository: "fixture".into(),
+        commit: "fixture".into(),
+        prefix: "docs".into(),
+        files: 0,
+        markdown: 0,
+        untyped: 0,
+        lint_debt: debt.clone(),
+    };
+    let mut changes = ChangeSet::from(Change::put("records", &record.id, &record).unwrap());
+    changes.push(Change::put("metadata", "import", &info).unwrap());
+    store
+        .bootstrap(&changes, "initial import", "alice", &mut || Ok(()))
+        .unwrap();
+    assert_eq!(
+        s.one::<ImportInfo>("metadata", "import")
+            .unwrap()
+            .unwrap()
+            .lint_debt,
+        debt
+    );
+    let base = store.head("main").unwrap();
+    assert!(
+        store
+            .bootstrap(&changes, "second bootstrap", "alice", &mut || Ok(()))
+            .is_err()
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+}

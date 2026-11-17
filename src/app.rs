@@ -520,10 +520,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &serde_json::to_value(&cli.command)?,
             &result,
         )?);
-        store.commit(
+        store.bootstrap(
             &changes,
             &format!("import {} by {}", imported.info.commit, actor(cli)?),
             actor(cli)?,
+            &mut || Ok(()),
         )?;
         return wrap(&store, result, branch);
     }
@@ -654,9 +655,6 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
         }
         policy::validate_change(&before, &graph, &debt, &local)?;
-        for pin in &graph.schema.pins {
-            graph.resolve(pin)?;
-        }
         let guarded =
             crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())
                 .is_err();

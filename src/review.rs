@@ -6,7 +6,6 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
 pub struct OperationContext {
     pub op_id: String,
@@ -67,7 +66,6 @@ pub(crate) fn wrap(store: &dyn KnowledgeStore, data: Value, branch: &str) -> Res
 pub(crate) fn validate_review_candidate(
     main_graph: &Graph,
     merged: &Graph,
-    debt: &BTreeSet<String>,
     requirements: &[crate::mutation::Requirement],
     routing: &Value,
     authority: (&str, Role),
@@ -82,11 +80,7 @@ pub(crate) fn validate_review_candidate(
             bail!("stale_plan: import schema changed; reject proposal and create a new plan");
         }
     }
-    policy::validate_change(main_graph, merged, debt, work)?;
-    merged.schema.validate()?;
-    for pin in &merged.schema.pins {
-        merged.resolve(pin)?;
-    }
+    policy::validate_change(main_graph, merged, &Default::default(), work)?;
     main_graph
         .schema
         .guards(main_graph, merged, who, role.name())?;
