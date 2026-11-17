@@ -27,7 +27,8 @@ from the supplied adapter. Work relations are selected from the ontology's
 The active ontology is a typed configuration in Dolt metadata. YAML (or JSON,
 a YAML subset) is its authoring and exchange representation. Configuration
 format 2 defines kinds, fields, lifecycle transitions, actor write policy,
-ownership guards, endpoint rules, cardinality, cycle restrictions, instructions,
+ownership guards, endpoint rules, cardinality, named declarative invariants,
+cycle restrictions, instructions,
 and ordered startup pins. A deterministic content digest identifies the schema
 revision. `schema apply --expect` always creates a reviewed proposal. Acceptance
 merges into a temporary branch, validates the resulting configuration and graph

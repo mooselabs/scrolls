@@ -211,7 +211,7 @@ pub fn select<'a>(
         .take(limit)
         .collect())
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Expr {
     All {
@@ -253,7 +253,7 @@ pub enum Expr {
         value: Value,
     },
 }
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Compare {
     Eq,
@@ -503,6 +503,82 @@ fn validate_expression(expr: &Expr, schema: &crate::schema::Schema) -> Result<()
         _ => {}
     }
     Ok(())
+}
+/// Validate the replay-safe subset of the query language used by ontology rules.
+pub(crate) fn validate_invariant_expression(
+    expr: &Expr,
+    schema: &crate::schema::Schema,
+) -> Result<()> {
+    fn deterministic(expr: &Expr, schema: &crate::schema::Schema) -> Result<()> {
+        fn literal(value: &Value) -> Result<()> {
+            match value {
+                Value::String(s) => {
+                    ensure!(s != "$now" && s != "$actor", "invariants cannot bind {s}")
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        literal(value)?;
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.values() {
+                        literal(value)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        match expr {
+            Expr::All { args } | Expr::Any { args } => {
+                for arg in args {
+                    deterministic(arg, schema)?;
+                }
+            }
+            Expr::Not { arg } => deterministic(arg, schema)?,
+            Expr::Relation { predicate, .. } => {
+                if let Some(predicate) = predicate {
+                    deterministic(predicate, schema)?;
+                }
+            }
+            Expr::Compare { field, value, .. } => {
+                literal(value)?;
+                if field == "kind" {
+                    if let Some(kind) = value.as_str() {
+                        schema.kind(kind)?;
+                    }
+                }
+            }
+            Expr::DatePlus { days, value, .. } => {
+                literal(days)?;
+                literal(value)?;
+            }
+            Expr::PathGlob { .. } => anyhow::bail!("path_glob is not deterministic for invariants"),
+            Expr::Applicability => {
+                anyhow::bail!("applicability is not deterministic for invariants")
+            }
+            Expr::Exists { .. } => {}
+        }
+        Ok(())
+    }
+    deterministic(expr, schema)?;
+    validate_expression(expr, schema)
+}
+
+/// Ontology rules have no ambient actor, clock, paths or routing input.
+pub(crate) fn matches_invariant(expr: &Expr, g: &Graph, r: &Record) -> Result<bool> {
+    matches(
+        expr,
+        g,
+        r,
+        &Bindings {
+            actor: "",
+            paths: &[],
+            at: chrono::DateTime::UNIX_EPOCH,
+            routing: &Value::Null,
+        },
+        &mut BTreeSet::new(),
+    )
 }
 pub fn evaluate(
     g: &Graph,

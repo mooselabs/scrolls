@@ -743,3 +743,42 @@ fn a_historical_field_failure_does_not_hide_a_new_field_rule() {
         [format!("{}:required-field:bbb", record.id)].into()
     );
 }
+
+#[test]
+fn invariant_tolerance_uses_definition_and_fails_closed_on_evaluation_errors() {
+    use serde_json::json;
+    let work = scrolls::beads::Local::default();
+    let mut before = Graph::default();
+    let mut value = serde_json::to_value(&before.schema).unwrap();
+    value["invariants"] = json!([{"name":"has-score", "description":"A score of zero is valid", "kinds":["evidence"],
+        "require":{"op":"compare","field":"fields.score","cmp":"ge","value":0}}]);
+    before.schema = scrolls::schema::Schema::parse(&value.to_string()).unwrap();
+    let mut record = before
+        .schema
+        .new_record("evidence", "Legacy", "", "alice")
+        .unwrap();
+    record.id = "sc-legacy".into();
+    before.records.insert(record.id.clone(), record.clone());
+    assert!(policy::lint(&before, &work).contains("sc-legacy:has-score"));
+    let mut after = before.clone();
+    let unrelated = after
+        .schema
+        .new_record("note", "Unrelated", "", "alice")
+        .unwrap();
+    after.records.insert(unrelated.id.clone(), unrelated);
+    policy::validate_change(&before, &after, &Default::default(), &work).unwrap();
+    after.schema.invariants[0].description = "Changed definition".into();
+    assert!(policy::validate_change(&before, &after, &Default::default(), &work).is_err());
+    let mut repaired = before.clone();
+    repaired.records.get_mut("sc-legacy").unwrap().fields["score"] = json!(0);
+    assert!(!policy::lint(&repaired, &work).contains("sc-legacy:has-score"));
+    assert!(policy::validate_change(&repaired, &before, &Default::default(), &work).is_err());
+    // A failing selection expression must not silently exclude a record.
+    before.schema.invariants[0].when = Some(before.schema.invariants[0].require.clone());
+    before.schema.invariants[0].require =
+        serde_json::from_value(json!({"op":"all","args":[]})).unwrap();
+    assert!(policy::lint(&before, &work).contains("sc-legacy:has-score"));
+    before.schema.invariants[0].skip_frozen = true;
+    before.records.get_mut("sc-legacy").unwrap().frozen = true;
+    assert!(!policy::lint(&before, &work).contains("sc-legacy:has-score"));
+}

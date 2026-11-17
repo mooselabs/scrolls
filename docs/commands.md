@@ -102,6 +102,49 @@ and resolves locally bound `NAME:ID` on link/unlink. Body `](beads://…)` links
 also rejects unknown body-link keys. Existing stored
 references and format-1 schema revisions are unchanged. See the
 [ontology format-2 upgrade guide](ontology-format-2.md).
+Format 2 also accepts top-level `invariants`, a list of named requirements.
+Each entry has `name`, `description`, `require` (a query predicate), and a
+selection: `kinds` (nonempty kind list), `when` (query predicate), or both.
+With both, the record must match both. `skip_frozen: true` excludes frozen
+records; the default is false. Names use letters, numbers, underscores or
+hyphens, must be unique, and must not match any cardinality name.
+
+For example, add this section to the handbook ontology to require every
+published public page to have an outgoing chapter pointing at another published page:
+
+```yaml
+invariants:
+  - name: published-chapter
+    description: Published public pages link to a published chapter
+    kinds: [page]
+    when:
+      op: all
+      args:
+        - {op: compare, field: status, cmp: eq, value: published}
+        - {op: compare, field: fields.audience, cmp: eq, value: public}
+    require:
+      op: relation
+      relation: chapter
+      direction: outgoing
+      min: 1
+      where: {op: compare, field: status, cmp: eq, value: published}
+    skip_frozen: true
+```
+
+Predicates use the query language below, including nested `all`, `any`, `not`,
+`exists`, `compare`, `relation` and `date_plus`. Invariants reject `$now`,
+`$actor`, `path_glob` and `applicability` anywhere in their predicates; they
+have no clock, actor, routing or path input. No other operator is excluded.
+Kind selectors (including literal `kind` comparisons) and relations must be
+configured. A predicate evaluation error counts as a violation.
+
+Lint reports each failed requirement as `RECORD_ID:INVARIANT_NAME`. Writes
+that introduce a violation are refused with `graph_write_refused`, including
+schema changes. Existing violations are tolerated only for the same record
+and an unchanged invariant definition. `schema validate FILE` previews the same
+check without writing. An absent or empty list is omitted when storing the
+ontology, preserving existing schema revisions.
+
 `envelope_fields` optionally constrains confidence, review_every and last_reviewed.
 `instructions` is authored text and `pins` is an ordered list of IDs or aliases,
 resolved and deduplicated on application.

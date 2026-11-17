@@ -3108,3 +3108,156 @@ fn cli_does_not_reuse_recorded_lint_debt_after_support_is_repaired() {
     let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
     assert_eq!(s.head("main").unwrap(), base);
 }
+
+#[test]
+fn named_invariants_refuse_new_violations_and_changed_rules_atomically() {
+    use scrolls::{
+        model::ImportInfo,
+        schema::Schema,
+        store::{Change, ChangeSet, KnowledgeStore},
+    };
+    let f = Fixture {
+        dir: tempfile::tempdir().unwrap(),
+    };
+    let mut config =
+        serde_json::to_value(Schema::parse(include_str!("../examples/handbook.yaml")).unwrap())
+            .unwrap();
+    config["invariants"] = json!([
+        {"name":"page-body", "description":"Pages have text", "kinds":["page"],
+         "require":{"op":"compare","field":"body","cmp":"ne","value":""}, "skip_frozen":true},
+        {"name":"public-chapter", "description":"Public pages link to a staff chapter", "kinds":["page"],
+         "when":{"op":"compare","field":"fields.audience","cmp":"eq","value":"public"},
+         "require":{"op":"relation","relation":"chapter","min":1,
+                    "where":{"op":"compare","field":"fields.audience","cmp":"eq","value":"staff"}}, "skip_frozen":true}
+    ]);
+    let file = f.batch_file(config.clone());
+    f.ok(&["init", "--schema", file.to_str().unwrap()]);
+    // Bootstrap is the sole writer allowed to establish historical debt.
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let mut graph = s.graph().unwrap();
+    let mut legacy = graph
+        .schema
+        .new_record("page", "Legacy", "", "alice")
+        .unwrap();
+    legacy.fields["audience"] = json!("public");
+    let mut frozen = legacy.clone();
+    frozen.id = "sc-frozen".into();
+    frozen.frozen = true;
+    graph.records.insert(legacy.id.clone(), legacy.clone());
+    graph.records.insert(frozen.id.clone(), frozen.clone());
+    let debt = scrolls::policy::lint(&graph, &scrolls::beads::Local::default());
+    assert_eq!(
+        debt,
+        [
+            format!("{}:page-body", legacy.id),
+            format!("{}:public-chapter", legacy.id)
+        ]
+        .into()
+    );
+    let info = ImportInfo {
+        repository: "fixture".into(),
+        commit: "fixture".into(),
+        prefix: "docs".into(),
+        files: 0,
+        markdown: 0,
+        untyped: 0,
+        lint_debt: debt.clone(),
+    };
+    let mut changes = ChangeSet::from(Change::put("records", &legacy.id, &legacy).unwrap());
+    changes.push(Change::put("records", &frozen.id, &frozen).unwrap());
+    changes.push(Change::put("metadata", "import", &info).unwrap());
+    s.bootstrap(&changes, "historical invariant debt", "alice", &mut || {
+        Ok(())
+    })
+    .unwrap();
+    let base = s.head("main").unwrap();
+    drop(s);
+    for (args, rule) in [
+        (
+            vec!["new", "page", "--title", "Empty", "--body", ""],
+            "page-body",
+        ),
+        (
+            vec![
+                "new",
+                "page",
+                "--title",
+                "Public",
+                "--body",
+                "body",
+                "--field",
+                "audience=public",
+            ],
+            "public-chapter",
+        ),
+    ] {
+        let (ok, value) = f.call(&args);
+        assert!(!ok, "{value}");
+        assert_eq!(value["error"]["diagnostic"]["code"], "graph_write_refused");
+        assert!(
+            value["error"]["diagnostic"]["violations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap().starts_with("sc-")
+                    && v.as_str().unwrap().ends_with(&format!(":{rule}"))),
+            "{value}"
+        );
+        let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+        assert_eq!(s.head("main").unwrap(), base);
+    }
+    // The unchanged violations on another record are tolerated by an ordinary write.
+    f.ok(&["new", "page", "--title", "Unrelated", "--body", "body"]);
+    let lint = f.ok(&["lint"]);
+    assert!(lint["errors"].as_array().unwrap().is_empty(), "{lint}");
+    assert_eq!(lint["historical_debt"], json!(debt));
+    // A relation predicate works on the candidate graph, including batched records.
+    f.batch(json!([
+        {"op":"new","kind":"page","handle":"public","title":"Public","body":"body","fields":{"audience":"public"}},
+        {"op":"new","kind":"page","handle":"staff","title":"Staff","body":"body"},
+        {"op":"link","from":"$public","rel":"chapter","to":"$staff"}
+    ]));
+    let active = f.ok(&["schema", "show"]);
+    let base = Store::open(&f.dir.path().join("store"), &dolt(), false)
+        .unwrap()
+        .head("main")
+        .unwrap();
+    for changed in [false, true] {
+        let mut next = config.clone();
+        let name = if changed {
+            next["invariants"][0]["description"] = json!("Redefined under the same name");
+            "page-body"
+        } else {
+            next["invariants"].as_array_mut().unwrap().push(json!({
+                "name":"new-rule", "description":"New requirement", "kinds":["page"],
+                "require":{"op":"compare","field":"title","cmp":"ne","value":"Legacy"}
+            }));
+            "new-rule"
+        };
+        let path = f.batch_file(next);
+        for args in [
+            vec!["schema", "validate", path.to_str().unwrap()],
+            vec![
+                "schema",
+                "apply",
+                path.to_str().unwrap(),
+                "--expect",
+                active["schema_revision"].as_str().unwrap(),
+            ],
+        ] {
+            let (ok, value) = f.call(&args);
+            assert!(!ok, "{value}");
+            assert_eq!(value["error"]["diagnostic"]["code"], "graph_write_refused");
+            assert!(
+                value["error"]["diagnostic"]["violations"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(format!("{}:{name}", legacy.id))),
+                "{value}"
+            );
+            assert_eq!(f.ok(&["schema", "show"]), active);
+            let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+            assert_eq!(s.head("main").unwrap(), base);
+        }
+    }
+}

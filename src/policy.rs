@@ -107,6 +107,11 @@ fn lint_graph(
                 }
             }
         }
+        for invariant in &g.schema.invariants {
+            if invariant.violated(g, r) {
+                out.insert(format!("{}:{}", r.id, invariant.name));
+            }
+        }
         for cap in re
             .captures_iter(&r.body)
             .filter(|_| !g.import_members.contains_key(&r.id))
@@ -204,6 +209,13 @@ fn same_rule(before: &Graph, after: &Graph, violation: &str) -> bool {
         return false;
     };
     if old.kind != new.kind {
+        return false;
+    }
+    let old_invariant = before.schema.invariants.iter().find(|i| i.name == rule);
+    let new_invariant = after.schema.invariants.iter().find(|i| i.name == rule);
+    if (old_invariant.is_some() || new_invariant.is_some())
+        && (old_invariant.is_none() || old_invariant != new_invariant)
+    {
         return false;
     }
     if rule.starts_with("body-link:") {

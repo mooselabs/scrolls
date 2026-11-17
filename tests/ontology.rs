@@ -265,3 +265,164 @@ fn ontology_format_two_names_the_work_target() {
         .insert("unused".into(), "related_work".into());
     assert!(Schema::parse(&serde_json::to_string(&old).unwrap()).is_ok());
 }
+
+#[test]
+fn invariant_free_revision_baselines() {
+    // Captured from this packet's merge base, 2fc9b22, before adding invariants.
+    for (text, revision) in [
+        (
+            include_str!("../schemas/knowledge.yaml"),
+            "9843cecc9fa704c0ec73077c5a0e55f6b5300211c711baa26bba5290c6fc80cc",
+        ),
+        (
+            include_str!("../examples/handbook.yaml"),
+            "dca9183dae47a800d13de00edb84f78905f801d757fd01ea34225dc6ff592385",
+        ),
+        (
+            include_str!("../examples/research.yaml"),
+            "093f953cacd7e185e58b4e793566756ad50d02de333e3aa52b20da9fdef0c65b",
+        ),
+    ] {
+        let schema = Schema::parse(text).unwrap();
+        assert_eq!(schema.revision(), revision);
+        assert!(
+            serde_json::to_value(&schema)
+                .unwrap()
+                .get("invariants")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn named_invariants_validate_their_selection_and_predicates() {
+    let base = serde_json::to_value(Schema::default()).unwrap();
+    let rule = json!({"name":"named-rule", "description":"Evidence has a title", "kinds":["evidence"],
+        "require":{"op":"exists","field":"title"}});
+    let mut valid = base.clone();
+    valid["invariants"] = json!([rule.clone()]);
+    Schema::parse(&valid.to_string()).unwrap();
+    let mut cases = vec![];
+    let mut duplicate = valid.clone();
+    duplicate["invariants"] = json!([rule.clone(), rule.clone()]);
+    cases.push(duplicate);
+    let mut collision = valid.clone();
+    collision["kinds"]["evidence"]["cardinality"] = json!([{
+        "name":"named-rule", "relation":"supports", "direction":"outgoing", "min":0
+    }]);
+    cases.push(collision);
+    let mut old_format = valid.clone();
+    // Convert the format-2 work spellings as well, isolating the invariant error.
+    old_format =
+        serde_json::from_str(&old_format.to_string().replace("\"work\"", "\"beads\"")).unwrap();
+    old_format["format"] = json!(1);
+    cases.push(old_format);
+    let mut kind = valid.clone();
+    kind["invariants"][0]["kinds"] = json!(["unknown"]);
+    cases.push(kind);
+    let mut no_selection = valid.clone();
+    no_selection["invariants"][0]["kinds"] = json!([]);
+    cases.push(no_selection);
+    for expr in [
+        json!({"op":"relation", "relation":"unknown"}),
+        json!({"op":"compare", "field":"kind", "cmp":"eq", "value":"unknown"}),
+        json!({"op":"compare", "field":"owner", "cmp":"eq", "value":"$actor"}),
+        json!({"op":"compare", "field":"created", "cmp":"eq", "value":"$now"}),
+        json!({"op":"date_plus", "field":"created", "days":1,"cmp":"lt", "value":"$now"}),
+        json!({"op":"path_glob", "field":"fields.paths"}),
+        json!({"op":"applicability"}),
+        json!({"op":"relation", "relation":"supports", "where":{"op":"not","arg":{"op":"applicability"}}}),
+    ] {
+        for key in ["when", "require"] {
+            let mut invalid = valid.clone();
+            invalid["invariants"][0][key] = json!({"op":"all", "args":[expr.clone()]});
+            cases.push(invalid);
+        }
+    }
+    for invalid in cases {
+        let error = format!("{:#}", Schema::parse(&invalid.to_string()).unwrap_err());
+        assert!(error.contains("named-rule"), "{error}: {invalid}");
+    }
+    // Predicate-only selection and every deterministic operator round-trip.
+    valid["invariants"][0]["kinds"] = json!([]);
+    valid["invariants"][0]["when"] =
+        json!({"op":"compare","field":"kind","cmp":"eq","value":"evidence"});
+    valid["invariants"][0]["require"] = json!({"op":"any","args":[
+        {"op":"not","arg":{"op":"exists","field":"fields.date"}},
+        {"op":"date_plus","field":"fields.date","days":{"field":"review_every"},"cmp":"le","value":"2030-01-01"}
+    ]});
+    let schema = Schema::parse(&valid.to_string()).unwrap();
+    assert_eq!(
+        schema,
+        Schema::parse(&serde_yaml::to_string(&schema).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn invariant_metadata_roundtrip_preserves_revision() {
+    use scrolls::{
+        storage::Store,
+        store::{Change, ChangeSet, KnowledgeStore},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tools/dolt");
+    let store = Store::open(&dir.path().join("store"), &binary, true).unwrap();
+    let mut value = serde_json::to_value(Schema::default()).unwrap();
+    value["invariants"] = json!([{"name":"has-title", "description":"Title is present", "kinds":["evidence"],
+        "when":{"op":"all","args":[]},"require":{"op":"exists","field":"title"}}]);
+    let schema = Schema::parse(&value.to_string()).unwrap();
+    store
+        .commit(
+            &ChangeSet::from(Change::put("metadata", "ontology", &schema).unwrap()),
+            "configure invariants",
+            "alice",
+        )
+        .unwrap();
+    drop(store);
+    let reopened = Store::open(&dir.path().join("store"), &binary, false).unwrap();
+    let loaded: Schema = reopened.one("metadata", "ontology").unwrap().unwrap();
+    assert_eq!(loaded, schema);
+    assert_eq!(loaded.revision(), schema.revision());
+}
+
+#[test]
+fn documented_invariant_accepts_a_published_public_page_with_a_staff_chapter() {
+    let docs = include_str!("../docs/commands.md");
+    let example = docs
+        .split("```yaml\ninvariants:")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let schema = Schema::parse(&format!(
+        "{}\ninvariants:{}",
+        include_str!("../examples/handbook.yaml"),
+        example
+    ))
+    .unwrap();
+    let mut graph = Graph {
+        schema,
+        ..Graph::default()
+    };
+    let mut public = graph
+        .schema
+        .new_record("page", "Public", "", "alice")
+        .unwrap();
+    public.status = "published".into();
+    public.fields["audience"] = json!("public");
+    let mut staff = graph
+        .schema
+        .new_record("page", "Staff", "", "alice")
+        .unwrap();
+    staff.status = "published".into();
+    graph.records.insert(public.id.clone(), public.clone());
+    graph.records.insert(staff.id.clone(), staff.clone());
+    let work = scrolls::beads::Local::default();
+    assert_eq!(
+        policy::lint(&graph, &work),
+        [format!("{}:published-chapter", public.id)].into()
+    );
+    graph.add_edge(&public.id, "chapter", &staff.id, "", "alice");
+    assert!(policy::lint(&graph, &work).is_empty());
+}
