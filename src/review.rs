@@ -70,9 +70,10 @@ pub(crate) fn validate_review_candidate(
     debt: &BTreeSet<String>,
     requirements: &[crate::mutation::Requirement],
     routing: &Value,
-    who: &str,
-    role: Role,
+    authority: (&str, Role),
+    work: &dyn crate::work_ref::Adapter,
 ) -> Result<()> {
+    let (who, role) = authority;
     for (id, source) in &merged.import_sources {
         if !main_graph.import_sources.contains_key(id)
             && (source.schema_hash != main_graph.schema.revision()
@@ -81,7 +82,7 @@ pub(crate) fn validate_review_candidate(
             bail!("stale_plan: import schema changed; reject proposal and create a new plan");
         }
     }
-    policy::validate_change(main_graph, merged, debt)?;
+    policy::validate_change(main_graph, merged, debt, work)?;
     merged.schema.validate()?;
     for pin in &merged.schema.pins {
         merged.resolve(pin)?;

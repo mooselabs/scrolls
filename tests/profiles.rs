@@ -131,20 +131,26 @@ fn raw_git_identity_references_and_ownership() {
         "human",
     )
     .unwrap();
-    let c = build(&g, &s).unwrap();
+    let c = build(&g, &s, &scrolls::beads::Local::default()).unwrap();
     assert_eq!(c.source.coverage["documents"], 2);
     assert_eq!(c.files.len(), 3);
     assert_eq!(
         c.source.candidate_digest,
-        build(&g, &s).unwrap().source.candidate_digest
+        build(&g, &s, &scrolls::beads::Local::default())
+            .unwrap()
+            .source
+            .candidate_digest
     );
     let id = record_id("test", "chapter/one");
     assert!(c.graph.records[&id].body.contains("sc-missing"));
-    assert!(scrolls::policy::lint(&c.graph).is_empty());
+    assert!(scrolls::policy::lint(&c.graph, &scrolls::beads::Local::default()).is_empty());
     std::fs::write(t.path().join("chapters/one.md"), "broken uncommitted").unwrap();
     assert_eq!(
         c.source.candidate_digest,
-        build(&g, &s).unwrap().source.candidate_digest
+        build(&g, &s, &scrolls::beads::Local::default())
+            .unwrap()
+            .source
+            .candidate_digest
     );
     git(t.path(), &["checkout", "--", "chapters/one.md"]);
     git(t.path(), &["mv", "chapters/one.md", "chapters/renamed.md"]);
@@ -160,7 +166,13 @@ fn raw_git_identity_references_and_ownership() {
         "human",
     )
     .unwrap();
-    assert!(build(&g, &renamed).unwrap().graph.records.contains_key(&id));
+    assert!(
+        build(&g, &renamed, &scrolls::beads::Local::default())
+            .unwrap()
+            .graph
+            .records
+            .contains_key(&id)
+    );
     let mut modified = c.graph.clone();
     modified.records.get_mut(&id).unwrap().body.push('x');
     assert!(ownership(&c.graph, &modified).is_err());
@@ -180,7 +192,11 @@ fn raw_git_identity_references_and_ownership() {
         "human",
     )
     .unwrap();
-    assert!(build(&g, &s).unwrap_err_text().contains("ambiguous_rule"));
+    assert!(
+        build(&g, &s, &scrolls::beads::Local::default())
+            .unwrap_err_text()
+            .contains("ambiguous_rule")
+    );
 }
 trait ErrText {
     fn unwrap_err_text(self) -> String;
@@ -214,7 +230,7 @@ fn reference_occurrences_collapse_and_imported_edges_remain_owned() {
         "human",
     )
     .unwrap();
-    let c = build(&g, &s).unwrap();
+    let c = build(&g, &s, &scrolls::beads::Local::default()).unwrap();
     assert_eq!(c.source.coverage["header_references"], 3);
     assert_eq!(c.source.coverage["edges"], 1);
     assert_eq!(c.source.coverage["unmapped_references"], 1);
@@ -242,7 +258,7 @@ fn reference_occurrences_collapse_and_imported_edges_remain_owned() {
     )
     .unwrap();
     assert!(
-        build(&g, &s)
+        build(&g, &s, &scrolls::beads::Local::default())
             .unwrap_err_text()
             .contains("unresolved_reference")
     );
@@ -273,7 +289,7 @@ fn custom_research_projection_and_unsupported_files() {
         "human",
     )
     .unwrap();
-    let c = build(&g, &s).unwrap();
+    let c = build(&g, &s, &scrolls::beads::Local::default()).unwrap();
     for r in c.graph.records.values() {
         assert_eq!(r.fields["count"], 0);
         assert_eq!(r.fields["replicated"], false);
@@ -298,7 +314,7 @@ fn custom_research_projection_and_unsupported_files() {
         )
         .unwrap();
         assert!(
-            build(&Graph::default(), &s)
+            build(&Graph::default(), &s, &scrolls::beads::Local::default())
                 .unwrap_err_text()
                 .contains("unsupported_file_type")
         );
@@ -320,7 +336,7 @@ fn relocation_empty_sets_and_aliases_precede_beads_shorthand() {
         "human",
     )
     .unwrap();
-    let c = build(&g, &s).unwrap();
+    let c = build(&g, &s, &scrolls::beads::Local::default()).unwrap();
     let clone = tempfile::tempdir().unwrap();
     assert!(
         Command::new("git")
@@ -343,7 +359,10 @@ fn relocation_empty_sets_and_aliases_precede_beads_shorthand() {
     )
     .unwrap();
     assert_eq!(
-        build(&g, &relocated).unwrap().source.candidate_digest,
+        build(&g, &relocated, &scrolls::beads::Local::default())
+            .unwrap()
+            .source
+            .candidate_digest,
         c.source.candidate_digest
     );
     let empty = profile::HANDBOOK
@@ -361,7 +380,7 @@ fn relocation_empty_sets_and_aliases_precede_beads_shorthand() {
     )
     .unwrap();
     assert!(
-        build(&g, &s)
+        build(&g, &s, &scrolls::beads::Local::default())
             .unwrap_err_text()
             .contains("empty_document_set")
     );

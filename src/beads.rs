@@ -2,7 +2,7 @@
 use crate::{
     model::*,
     store::{self, KnowledgeStore},
-    work_ref::*,
+    work_ref::{Adapter, document_uri},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,6 +15,57 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BeadRef {
+    pub project_id: String,
+    pub issue_id: String,
+}
+impl BeadRef {
+    pub fn parse(s: &str) -> Result<Self> {
+        let Some((project, issue)) = s.strip_prefix("beads://").and_then(|s| s.split_once('/'))
+        else {
+            bail!("expected beads://PROJECT-UUID/FULL-ISSUE-ID");
+        };
+        let project_id = uuid::Uuid::parse_str(project)?.to_string();
+        if issue.is_empty()
+            || issue.len() > 128
+            || !issue
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+            || !issue
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            bail!("invalid Beads issue ID");
+        }
+        Ok(Self {
+            project_id,
+            issue_id: issue.into(),
+        })
+    }
+    pub fn uri(&self) -> String {
+        format!("beads://{}/{}", self.project_id, self.issue_id)
+    }
+}
+impl Adapter for Local {
+    fn canonicalize(&self, reference: &str) -> Option<Result<String>> {
+        reference
+            .starts_with("beads://")
+            .then(|| BeadRef::parse(reference).map(|r| r.uri()))
+    }
+    fn resolve_local(&self, input: &str) -> Option<Result<String>> {
+        let (name, _) = input.split_once(':')?;
+        if input.contains("://") || matches!(name, "glob" | "http" | "https") {
+            return None;
+        }
+        Some(self.resolve(input).map(|r| r.uri()))
+    }
+    fn summary(&self, reference: &str) -> Value {
+        Local::summary(self, reference)
+    }
+}
 
 /// Explicit inputs from a transport; command serialization is publication identity.
 pub struct Request<'a> {
@@ -257,7 +308,7 @@ pub fn refs(g: &Graph, reference: &str) -> Vec<Value> {
     for e in g
         .edges
         .values()
-        .filter(|e| e.to == reference && relation(&e.rel))
+        .filter(|e| e.to == reference && crate::work_ref::relation(&g.schema, &e.rel))
     {
         grouped.entry(&e.from).or_default().push(&e.rel);
     }
@@ -267,20 +318,13 @@ pub fn refs(g: &Graph, reference: &str) -> Vec<Value> {
         Some(json!({"id":r.id,"title":r.title,"kind":r.kind,"status":r.status,"revision":r.revision,"relations":relations}))
     }).collect()
 }
-pub fn related(g: &Graph, id: &str, local: &Local) -> Vec<Value> {
-    g.edges
-        .values()
-        .filter(|e| e.from == id && e.to.starts_with("beads://"))
-        .map(|e| json!({"relation":e.rel,"reference":e.to,"bead":local.summary(&e.to)}))
-        .collect()
-}
 fn targets(g: &Graph, local: &Local, target: &Target) -> Result<BTreeSet<BeadRef>> {
     if let Some(r) = &target.reference {
         return Ok(BTreeSet::from([local.resolve(r)?]));
     }
     g.edges
         .values()
-        .filter(|e| e.to.starts_with("beads://"))
+        .filter(|e| crate::work_ref::relation(&g.schema, &e.rel) && e.to.starts_with("beads://"))
         .map(|e| BeadRef::parse(&e.to))
         .collect()
 }

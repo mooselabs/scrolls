@@ -206,7 +206,16 @@ can require both endpoint revisions. See [relationship rules](docs/commands.md).
 
 ## Beads integration
 
-The adapter is qualified against **Beads 1.3.0**. It keeps work references in
+Work references pass through the library's `work_ref::Adapter`. Standalone
+Scrolls supplies the Beads adapter (`beads::Local`) in the CLI, HTTP server and
+shared mode. An embedder supplies its own adapter to mutations, policy checks,
+query packets and `read::View`. It must claim and canonicalize references
+(including any portable aliases), resolve caller-local short forms at link time,
+recognise Markdown work links, and return offline summaries. Adapter methods
+never start a process or call the network. Relations carry work when their
+ontology `external` includes `work` (format 2) or `beads` (format 1).
+
+The Beads adapter is qualified against **Beads 1.3.0**. It keeps work references in
 Scrolls and requires explicit commands to contact Beads. Existing older stores
 need `scrolls migrate` after pending proposals are accepted or rejected; new
 stores use format 4.

@@ -8,7 +8,7 @@ fn baseline_edge_valid(g: &Graph, e: &Edge) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing source {}", e.from))?;
     let b = g.records.get(&e.to);
     if e.to.starts_with("beads://") {
-        let target = scrolls::work_ref::BeadRef::parse(&e.to)?;
+        let target = scrolls::beads::BeadRef::parse(&e.to)?;
         if target.uri() != e.to {
             bail!("non-canonical Beads reference");
         }
@@ -108,7 +108,12 @@ fn bundled_relation_policy_matches_the_verified_baseline() {
                     };
                     assert_eq!(
                         baseline_edge_valid(&graph, &edge).is_ok(),
-                        scrolls::policy::edge_valid(&graph, &edge).is_ok(),
+                        scrolls::policy::edge_valid(
+                            &graph,
+                            &edge,
+                            &scrolls::beads::Local::default()
+                        )
+                        .is_ok(),
                         "{from} --{rel}--> {to}, why={why}"
                     );
                 }

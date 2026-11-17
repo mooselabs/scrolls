@@ -115,7 +115,7 @@ impl Snapshot {
         View {
             graph: &self.graph,
             routing: &self.routing,
-            local: &self.local,
+            work: &self.local,
             store_id: Some(&self.store_id),
             actor: &self.actor,
         }

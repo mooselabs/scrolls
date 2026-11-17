@@ -392,7 +392,7 @@ mod linux {
                 .map(|i| i.lint_debt)
                 .unwrap_or_default();
             ensure!(
-                policy::lint(&graph).is_subset(&debt),
+                policy::lint(&graph, &crate::beads::Local::default()).is_subset(&debt),
                 "backup_graph_invalid: inspect source lint"
             );
             crate::markdown_import::health(s, &graph, Some(&head))

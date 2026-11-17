@@ -286,7 +286,12 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
         schema: schema.clone(),
         ..Default::default()
     };
-    crate::policy::validate_change(&graph, &graph, &Default::default())?;
+    crate::policy::validate_change(
+        &graph,
+        &graph,
+        &Default::default(),
+        &crate::beads::Local::default(),
+    )?;
     let mut sql = String::new();
     for (table, size) in TABLES {
         sql.push_str(&format!(

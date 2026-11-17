@@ -414,7 +414,7 @@ pub(crate) fn import_selected(
         files: files.len(),
         markdown,
         untyped,
-        lint_debt: policy::lint(&graph),
+        lint_debt: policy::lint(&graph, &crate::beads::Local::default()),
     };
     Ok(Imported {
         graph,

@@ -659,7 +659,15 @@ fn dry_candidate(
             Some(&serde_json::from_str::<crate::markdown_import::Plan>(plan)?),
         )?;
     }
-    crate::review::validate_review_candidate(main, &g, &debt, &requirements, &routing, who, role)
+    crate::review::validate_review_candidate(
+        main,
+        &g,
+        &debt,
+        &requirements,
+        &routing,
+        (who, role),
+        &crate::beads::Local::default(),
+    )
 }
 fn commit_changes(
     s: &Store,
@@ -800,7 +808,12 @@ fn publish_write(s: &Store, mut i: Intent) -> Result<Value> {
         );
         let candidate = s.graph()?;
         crate::source_import::health(&candidate, &s.import_files()?)?;
-        crate::policy::validate_change(&graph, &candidate, &BTreeSet::new())?;
+        crate::policy::validate_change(
+            &graph,
+            &candidate,
+            &BTreeSet::new(),
+            &crate::beads::Local::default(),
+        )?;
         candidate.schema.validate()?;
         for pin in &candidate.schema.pins {
             candidate.resolve(pin)?;

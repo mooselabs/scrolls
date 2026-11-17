@@ -1148,8 +1148,12 @@ pub(crate) fn validate_merged_review(
         &debt,
         &requirements,
         &routing,
-        who,
-        role,
+        (who, role),
+        &if s.is_shared() {
+            crate::beads::Local::default()
+        } else {
+            crate::beads::Local::load(&s.root)?
+        },
     )
 }
 

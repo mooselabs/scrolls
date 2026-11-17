@@ -315,7 +315,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 .into_iter()
                 .map(|e| (e.key(), e))
                 .collect();
-            let mut debt = policy::lint(&original);
+            let mut debt = policy::lint(&original, &crate::beads::Local::default());
             debt.extend(policy::lint_routing(
                 &store
                     .one::<Value>("metadata", "routing")?
@@ -650,10 +650,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
             .unwrap_or_default();
         if matches!(cli.command, Cmd::New(_)) {
             for id in &affected {
-                policy::extract_links(&mut graph, id, who);
+                policy::extract_links(&mut graph, id, who, &local);
             }
         }
-        policy::validate_change(&before, &graph, &debt)?;
+        policy::validate_change(&before, &graph, &debt, &local)?;
         for pin in &graph.schema.pins {
             graph.resolve(pin)?;
         }
@@ -751,7 +751,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
     let reads = crate::read::View {
         graph: &graph,
         routing: &routing,
-        local: &local,
+        work: &local,
         store_id: store_id.as_deref(),
         actor: who,
     };
@@ -780,7 +780,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 configured.resolve_pins(&graph)?;
                 let mut after = graph.clone();
                 after.schema = configured;
-                policy::validate_change(&graph, &after, &BTreeSet::new())?;
+                policy::validate_change(&graph, &after, &BTreeSet::new(), &local)?;
                 json!({"valid":true,"schema_revision":after.schema.revision()})
             }
             SchemaCommand::Apply { .. } => unreachable!(),
@@ -862,7 +862,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             json!(crate::read::history(&store, &revision, id.as_deref())?)
         }
         Cmd::Lint => {
-            let mut lint = policy::lint(&graph);
+            let mut lint = policy::lint(&graph, &local);
             lint.extend(policy::lint_routing(&routing));
             let original_debt = info
                 .as_ref()
@@ -1179,6 +1179,7 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     role: cli.role,
                     store_directory: cli.connection.is_none().then_some(cli.store.as_path()),
                 },
+                &crate::beads::Local::default(),
             )
         }
         ImportCommand::Apply { plan } => {
@@ -1190,9 +1191,9 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
             if let ApplyPreparation::Response(result) = prepared {
                 return Ok(result);
             }
-            let prepared = prepared.build(&request.plan)?;
+            let prepared = prepared.build(&request.plan, &crate::beads::Local::default())?;
             let s = import_store(cli, shared.as_ref(), false)?;
-            source_import::apply(&*s, &request, prepared)
+            source_import::apply(&*s, &request, prepared, &crate::beads::Local::default())
         }
         _ => bail!("unsupported import command"),
     }

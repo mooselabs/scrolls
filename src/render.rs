@@ -459,7 +459,7 @@ fn render_work_navigation(
         if let Some(bytes) = output.get_mut(&path) {
             bytes.extend_from_slice(b"\n\n## Related work\n\n");
             for edge in edges {
-                let reference = crate::work_ref::BeadRef::parse(&edge.to)?;
+                let reference = crate::beads::BeadRef::parse(&edge.to)?;
                 let target = format!(
                     "scrolls/beads/{}/{}.md",
                     reference.project_id, reference.issue_id
@@ -476,7 +476,7 @@ fn render_work_navigation(
         }
     }
     for uri in work {
-        let reference = crate::work_ref::BeadRef::parse(&uri)?;
+        let reference = crate::beads::BeadRef::parse(&uri)?;
         let path = format!(
             "scrolls/beads/{}/{}.md",
             reference.project_id, reference.issue_id

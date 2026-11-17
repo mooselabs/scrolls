@@ -2,7 +2,7 @@ use crate::model::*;
 use crate::schema::neighbor;
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
-pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
+pub fn edge_valid(g: &Graph, e: &Edge, work: &dyn crate::work_ref::Adapter) -> Result<()> {
     let rule = g
         .schema
         .relations
@@ -41,11 +41,8 @@ pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
             e.rel
         );
     } else {
-        let ty = if e.to.starts_with("beads://") {
-            ensure!(
-                crate::work_ref::BeadRef::parse(&e.to)?.uri() == e.to,
-                "non-canonical Beads reference"
-            );
+        let ty = if let Some(canonical) = work.canonicalize(&e.to) {
+            ensure!(canonical? == e.to, "non-canonical work reference");
             g.schema.work_target()
         } else if let Some(glob) = e.to.strip_prefix("glob:") {
             crate::triggers::glob(&e.from, &e.rel, glob)?;
@@ -64,7 +61,7 @@ pub fn edge_valid(g: &Graph, e: &Edge) -> Result<()> {
     }
     Ok(())
 }
-pub fn lint(g: &Graph) -> BTreeSet<String> {
+pub fn lint(g: &Graph, work: &dyn crate::work_ref::Adapter) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     for r in g.records.values() {
@@ -103,7 +100,7 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
         }
     }
     for (key, e) in &g.edges {
-        if let Err(err) = edge_valid(g, e) {
+        if let Err(err) = edge_valid(g, e, work) {
             out.insert(format!("edge:{key}:{err}"));
         }
     }
@@ -143,7 +140,12 @@ pub fn lint(g: &Graph) -> BTreeSet<String> {
     }
     out
 }
-pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) -> Result<()> {
+pub fn validate_change(
+    before: &Graph,
+    after: &Graph,
+    _debt: &BTreeSet<String>,
+    work: &dyn crate::work_ref::Adapter,
+) -> Result<()> {
     crate::source_import::ownership(before, after)?;
     // Frozen rows and assertion owners remain immutable, including at review.
     for (id, old) in &before.records {
@@ -242,8 +244,8 @@ pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) 
             }
         }
     }
-    let baseline = lint(before);
-    let errors = lint(after);
+    let baseline = lint(before, work);
+    let errors = lint(after, work);
     let new: Vec<_> = errors.difference(&baseline).collect();
     if !new.is_empty() {
         bail!(
@@ -256,18 +258,13 @@ pub fn validate_change(before: &Graph, after: &Graph, _debt: &BTreeSet<String>) 
     }
     Ok(())
 }
-pub fn extract_links(g: &mut Graph, id: &str, actor: &str) {
+pub fn extract_links(g: &mut Graph, id: &str, actor: &str, work: &dyn crate::work_ref::Adapter) {
     if g.import_members.contains_key(id) {
         return;
     }
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     let body = g.records[id].body.clone();
-    let beads = regex::Regex::new(r"\]\((beads://[^)\s]+)\)").unwrap();
-    for cap in beads.captures_iter(&body) {
-        // Keep malformed links as edges so structural validation reports them.
-        let target = crate::work_ref::BeadRef::parse(&cap[1])
-            .map(|r| r.uri())
-            .unwrap_or_else(|_| cap[1].into());
+    for target in work.body_references(&body) {
         if g.schema.body_links.contains_key(g.schema.work_target())
             && !g.edges.values().any(|e| e.from == id && e.to == target)
         {

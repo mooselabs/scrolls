@@ -100,7 +100,7 @@ pub fn apply(
     before: &Graph,
     ops: &[Mutation],
     actor: &str,
-    local: &crate::beads::Local,
+    work: &dyn crate::work_ref::Adapter,
 ) -> Result<(Graph, BTreeSet<String>, Value)> {
     let mut g = before.clone();
     let mut affected = BTreeSet::new();
@@ -206,17 +206,15 @@ pub fn apply(
                     .with_context(|| format!("unknown relation {rel}"))?;
                 let to = if to.starts_with('$') {
                     resolve(&g, &handles, to)?
-                } else if !to.starts_with("beads://")
-                    && g.records.values().any(|r| r.aliases.contains(to))
-                {
+                } else if let Some(canonical) = work.canonicalize(to) {
+                    canonical?
+                } else if g.records.values().any(|r| r.aliases.contains(to)) {
                     g.resolve(to)?
-                } else if to.starts_with("beads://")
-                    || (rule.external.iter().any(|e| e == g.schema.work_target())
-                        && to.contains(':')
-                        && !to.starts_with("glob:")
-                        && !to.starts_with("http"))
+                } else if let Some(canonical) = crate::work_ref::relation(&g.schema, rel)
+                    .then(|| work.resolve_local(to))
+                    .flatten()
                 {
-                    local.resolve(to)?.uri()
+                    canonical?
                 } else {
                     match g.resolve(to) {
                         Ok(id) => id,
@@ -292,7 +290,7 @@ pub fn apply(
         }
     }
     for id in &authored {
-        crate::policy::extract_links(&mut g, id, actor);
+        crate::policy::extract_links(&mut g, id, actor, work);
     }
     for id in &affected {
         if let Some(old) = before.records.get(id) {
@@ -305,7 +303,7 @@ pub fn apply(
             r.actor = actor.into();
         }
     }
-    crate::policy::validate_change(before, &g, &BTreeSet::new())?;
+    crate::policy::validate_change(before, &g, &BTreeSet::new(), work)?;
     Ok((g, affected, json!({"created":created,"handles":handles})))
 }
 /// Guard every intermediate transition as well as the final state. Relinking or

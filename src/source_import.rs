@@ -285,7 +285,11 @@ fn files(source: &Source, p: &Profile) -> Result<Vec<File>> {
     ensure!(status.success(), "source_read: cat-file failed");
     Ok(out)
 }
-pub fn build(before: &Graph, source: &Source) -> Result<Candidate> {
+pub fn build(
+    before: &Graph,
+    source: &Source,
+    work: &dyn crate::work_ref::Adapter,
+) -> Result<Candidate> {
     ensure!(
         source.schema_hash == before.schema.revision() && source.contract == CONTRACT,
         "stale_plan: schema or interpreter changed; replan"
@@ -549,7 +553,7 @@ pub fn build(before: &Graph, source: &Source) -> Result<Candidate> {
         .import_sources
         .insert(source.source_id.clone(), source.clone());
     validate(&graph)?;
-    policy::validate_change(before, &graph, &BTreeSet::new())?;
+    policy::validate_change(before, &graph, &BTreeSet::new(), work)?;
     let protected = graph
         .import_members
         .values()
@@ -752,7 +756,11 @@ pub fn plan_base(s: &dyn KnowledgeStore) -> Result<PlanBase> {
     })
 }
 
-pub fn plan(base: PlanBase, request: PlanRequest<'_>) -> Result<Value> {
+pub fn plan(
+    base: PlanBase,
+    request: PlanRequest<'_>,
+    work: &dyn crate::work_ref::Adapter,
+) -> Result<Value> {
     let PlanBase {
         store_id,
         main_revision,
@@ -785,7 +793,7 @@ pub fn plan(base: PlanBase, request: PlanRequest<'_>) -> Result<Value> {
         );
         remove_source(&mut base, source_id);
     }
-    let candidate = build(&base, &source)?;
+    let candidate = build(&base, &source, work)?;
     let changes = planned_changes(&candidate);
     let mut plan = Plan {
         format: 1,
@@ -946,11 +954,11 @@ pub enum PreparedApply {
     },
 }
 impl ApplyPreparation {
-    pub fn build(self, plan: &Plan) -> Result<PreparedApply> {
+    pub fn build(self, plan: &Plan, work: &dyn crate::work_ref::Adapter) -> Result<PreparedApply> {
         match self {
             Self::Retry(result) => Ok(PreparedApply::Retry(result)),
             Self::Build(before) => {
-                let candidate = build(&before, &plan.source)?;
+                let candidate = build(&before, &plan.source, work)?;
                 ensure!(
                     candidate.source.candidate_digest == plan.source.candidate_digest
                         && candidate.source.coverage == plan.source.coverage
@@ -970,6 +978,7 @@ pub fn apply(
     s: &dyn KnowledgeStore,
     request: &ApplyRequest,
     prepared: PreparedApply,
+    work: &dyn crate::work_ref::Adapter,
 ) -> Result<Value> {
     let plan = &request.plan;
     let context = &request.context;
@@ -1006,7 +1015,7 @@ pub fn apply(
     } else {
         "main".into()
     };
-    policy::validate_change(&before, &candidate.graph, &BTreeSet::new())?;
+    policy::validate_change(&before, &candidate.graph, &BTreeSet::new(), work)?;
     if !protected {
         candidate
             .graph
@@ -1060,7 +1069,7 @@ pub fn apply(
     if s.shared() {
         s.commit_checked(&changes, &message, actor, false, &mut || {
             let actual = store::graph(s, None)?;
-            policy::validate_change(&before, &actual, &BTreeSet::new())?;
+            policy::validate_change(&before, &actual, &BTreeSet::new(), work)?;
             crate::source_import::health(&actual, &store::import_files(s, None)?)?;
             actual
                 .schema

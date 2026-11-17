@@ -5,6 +5,25 @@ independent of an information architecture. `schemas/knowledge.yaml` supplies
 the bundled knowledge ontology; `examples/handbook.yaml` and
 `examples/research.yaml` demonstrate different kinds, fields, and relations.
 
+Work identities are a separate host-supplied seam, `work_ref::Adapter`. Its four
+behaviours are reference ownership and canonicalization (with malformed owned
+input refused), caller-local resolution at link time, Markdown work-link
+recognition, and offline summaries. `canonicalize` and `resolve_local` return
+`None` for syntax they do not own and `Some(Err(_))` for malformed owned input.
+The default `body_references` recognises inline Markdown link targets using
+`canonicalize`, retaining malformed targets for validation. Local short forms
+never enter the graph; stored portable aliases fail canonical validation.
+
+Standalone Scrolls supplies `beads::Local`, backed by `beads.json` bindings and
+cache; its canonical form remains `beads://PROJECT-UUID/FULL-ISSUE-ID`. The CLI,
+HTTP server and shared Dolt paths supply this adapter. Embedders pass their own
+`&dyn work_ref::Adapter` to policy checks, `mutation::apply`, import building and
+application, `query::bead_packet`, and `read::View::work`. Every adapter method
+is offline: reads start no subprocess and make no network call. The read
+summary envelope retains its `bead` field for compatibility; its payload comes
+from the supplied adapter. Work relations are selected from the ontology's
+`external` target, never from a fixed list of relation names.
+
 The active ontology is a typed configuration in Dolt metadata. YAML (or JSON,
 a YAML subset) is its authoring and exchange representation. Configuration
 format 2 defines kinds, fields, lifecycle transitions, actor write policy,
