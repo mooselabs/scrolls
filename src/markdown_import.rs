@@ -313,7 +313,7 @@ pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
             json!({"dry_run":true,"result":result,"sql_bytes":sql_bytes,"shared_query_bytes":s.request_limit()}),
         );
     }
-    s.commit_markdown_checked(&changes, "bootstrap editable Markdown", actor, &mut || {
+    s.bootstrap(&changes, "bootstrap editable Markdown", actor, &mut || {
         let actual = store::graph(s, None)?;
         health(s, &actual, None)?;
         ensure!(

@@ -1,6 +1,6 @@
 use crate::model::*;
 use crate::schema::neighbor;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 pub fn edge_valid(g: &Graph, e: &Edge, work: &dyn crate::work_ref::Adapter) -> Result<()> {
     let rule = g
@@ -62,11 +62,28 @@ pub fn edge_valid(g: &Graph, e: &Edge, work: &dyn crate::work_ref::Adapter) -> R
     Ok(())
 }
 pub fn lint(g: &Graph, work: &dyn crate::work_ref::Adapter) -> BTreeSet<String> {
+    lint_graph(g, work, false)
+}
+fn lint_graph(
+    g: &Graph,
+    work: &dyn crate::work_ref::Adapter,
+    all_fields: bool,
+) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let re = regex::Regex::new(r"\]\((sc-[a-zA-Z0-9-]+)(?:#[^)]*)?\)").unwrap();
     for r in g.records.values() {
-        if let Err(e) = g.schema.validate_record(r) {
-            out.insert(format!("{e:#}"));
+        let errors = if all_fields {
+            g.schema.record_errors(r)
+        } else {
+            g.schema.validate_record(r).err().into_iter().collect()
+        };
+        for error in errors {
+            let text = format!("{error:#}");
+            out.insert(if all_fields {
+                record_violation(&r.id, text)
+            } else {
+                text
+            });
         }
         if let Some(k) = g.schema.kinds.get(&r.kind) {
             for c in &k.cardinality {
@@ -140,59 +157,173 @@ pub fn lint(g: &Graph, work: &dyn crate::work_ref::Adapter) -> BTreeSet<String> 
     }
     out
 }
+fn record_violation(id: &str, text: String) -> String {
+    if text.starts_with(&format!("{id}:")) {
+        text
+    } else {
+        format!("{id}:record:{text}")
+    }
+}
+
+/// Stable refusal payload shared by all engine write paths and CLI diagnostics.
+#[derive(Debug)]
+pub struct WriteRefusal {
+    pub violations: BTreeSet<String>,
+}
+impl std::fmt::Display for WriteRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "structural validation failed: {}",
+            self.violations
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
+impl std::error::Error for WriteRefusal {}
+
+// The identity is the lint identity, while the definition excludes unrelated
+// authority, presentation and lifecycle settings on the same kind.
+fn same_rule(before: &Graph, after: &Graph, violation: &str) -> bool {
+    if let Some(edge) = violation.strip_prefix("edge:") {
+        return before
+            .edges
+            .iter()
+            .find(|(key, _)| edge.starts_with(&format!("{key}:")))
+            .is_some_and(|(_, e)| {
+                before.schema.relations.get(&e.rel) == after.schema.relations.get(&e.rel)
+            });
+    }
+    let Some((id, rule)) = violation.split_once(':') else {
+        return false;
+    };
+    let (Some(old), Some(new)) = (before.records.get(id), after.records.get(id)) else {
+        return false;
+    };
+    if old.kind != new.kind {
+        return false;
+    }
+    if rule.starts_with("body-link:") {
+        return true;
+    }
+    if rule.starts_with("record:") && !after.schema.kinds.contains_key(&new.kind) {
+        return !before.schema.kinds.contains_key(&old.kind);
+    }
+    if let Some(rel) = rule.strip_suffix("-cycle") {
+        return before.schema.relations.get(rel) == after.schema.relations.get(rel);
+    }
+    let (Some(a), Some(b)) = (
+        before.schema.kinds.get(&old.kind),
+        after.schema.kinds.get(&new.kind),
+    ) else {
+        return false;
+    };
+    if let Some(c) = b.cardinality.iter().find(|c| c.name == rule) {
+        return a.cardinality.contains(c);
+    }
+    if rule == "invalid-status" {
+        return a.states == b.states;
+    }
+    if rule == "required-fields" {
+        return true;
+    }
+    if let Some(field) = rule
+        .strip_prefix("field:")
+        .or_else(|| rule.strip_prefix("required-field:"))
+    {
+        let field = field.split(':').next().unwrap();
+        return a.fields.get(field) == b.fields.get(field);
+    }
+    if rule.starts_with("unknown-field:") {
+        return a.additional_fields == b.additional_fields && a.fields.keys().eq(b.fields.keys());
+    }
+    before
+        .schema
+        .envelope_fields
+        .get(rule.split(':').next().unwrap())
+        == after
+            .schema
+            .envelope_fields
+            .get(rule.split(':').next().unwrap())
+}
+
+/// Preserve the legacy persisted lint-debt identities while tolerating the
+/// complete imported field baseline. Migration and the public lint output retain
+/// their original first-field-error behavior; write refusals report every field.
+pub(crate) fn validate_bootstrap(
+    before: &Graph,
+    after: &Graph,
+    recorded_debt: &BTreeSet<String>,
+    work: &dyn crate::work_ref::Adapter,
+) -> Result<()> {
+    ensure!(
+        lint(after, work) == *recorded_debt,
+        "bootstrap lint debt differs from imported graph"
+    );
+    validate_change(before, after, &lint_graph(after, work, true), work)
+}
+
+/// Backend-neutral full-graph write check. Only a bootstrap store write supplies
+/// `debt`; ordinary writes tolerate violations of unchanged rules on the same rows.
 pub fn validate_change(
     before: &Graph,
     after: &Graph,
-    _debt: &BTreeSet<String>,
+    debt: &BTreeSet<String>,
     work: &dyn crate::work_ref::Adapter,
 ) -> Result<()> {
     crate::source_import::ownership(before, after)?;
-    // Frozen rows and assertion owners remain immutable, including at review.
+    let mut violations = BTreeSet::new();
+    if let Err(error) = after.schema.validate() {
+        violations.insert(format!("ontology:schema:{error:#}"));
+    }
+    for pin in &after.schema.pins {
+        if after.resolve(pin).is_err() {
+            violations.insert(format!("ontology:pin:{pin}"));
+        }
+    }
     for (id, old) in &before.records {
-        if old.frozen {
-            ensure!(
-                after.records.get(id) == Some(old),
-                "{id} is immutable imported compatibility history"
-            );
+        if old.frozen && after.records.get(id) != Some(old) {
+            violations.insert(format!("{id}:immutable imported compatibility history"));
         }
     }
     for (key, edge) in before.edges.iter().chain(after.edges.iter()) {
         if before.edges.get(key) == after.edges.get(key) {
             continue;
         }
-        let source = before.records.get(&edge.from);
-        ensure!(
-            !source.is_some_and(|r| r.frozen),
-            "{} is immutable imported compatibility history",
-            edge.from
-        );
         let both = before
             .schema
             .relations
             .get(&edge.rel)
             .or_else(|| after.schema.relations.get(&edge.rel))
             .is_some_and(|r| r.affects == crate::schema::Affects::Both);
-        ensure!(
-            !both || !before.records.get(&edge.to).is_some_and(|r| r.frozen),
-            "{} is immutable imported compatibility history",
-            edge.to
-        );
+        for id in std::iter::once(&edge.from).chain(both.then_some(&edge.to)) {
+            if before.records.get(id).is_some_and(|r| r.frozen) {
+                violations.insert(format!("{id}:immutable imported compatibility history"));
+            }
+        }
     }
-    // Historical debt can remain unchanged, but edits cannot create fresh field violations.
+    // Preserve the stricter existing check on authored field edits.
     for (id, r) in &after.records {
         if before.records.get(id) != Some(r) {
             let old = before.records.get(id);
             if let Some(kind) = after.schema.kinds.get(&r.kind) {
                 for (field, rule) in &kind.fields {
-                    if rule.glob {
-                        if let Some(value) = r.fields.get(field) {
-                            rule.validate(value)
-                                .with_context(|| format!("{id}:field:{field}"))?;
+                    if let Some(error) = r
+                        .fields
+                        .get(field)
+                        .filter(|_| rule.glob)
+                        .and_then(|value| rule.validate(value).err())
+                    {
+                        let identity = format!("{id}:field:{field}: {error:#}");
+                        if !debt.contains(&identity) {
+                            violations.insert(identity);
                         }
                     }
                 }
             }
-
             if old.is_none_or(|old| {
                 old.fields != r.fields
                     || old.kind != r.kind
@@ -202,11 +333,14 @@ pub fn validate_change(
                     || old.review_every != r.review_every
                     || old.last_reviewed != r.last_reviewed
             }) {
-                after.schema.validate_record(r)?;
+                for error in after.schema.record_errors(r) {
+                    let identity = record_violation(id, format!("{error:#}"));
+                    if !debt.contains(&identity) {
+                        violations.insert(identity);
+                    }
+                }
             }
         }
-    }
-    for r in after.records.values() {
         if let Some(kind) = after.schema.kinds.get(&r.kind) {
             for c in &kind.cardinality {
                 if (c.skip_frozen && r.frozen) || c.status.as_ref().is_some_and(|s| s != &r.status)
@@ -226,35 +360,28 @@ pub fn validate_change(
                         .count()
                 };
                 let n = count(after);
-                if n < c.min || c.max.is_some_and(|m| n > m) {
-                    let same_rule = before
-                        .schema
-                        .kinds
-                        .get(&r.kind)
-                        .is_some_and(|k| k.cardinality.contains(c));
-                    ensure!(
-                        same_rule && count(before) == n,
-                        "{}:{}: relationship count {n} violates min {} max {:?}",
-                        r.id,
-                        c.name,
-                        c.min,
-                        c.max
-                    );
+                let identity = format!("{}:{}", r.id, c.name);
+                if (n < c.min || c.max.is_some_and(|m| n > m))
+                    && !debt.contains(&identity)
+                    && !(before.records.contains_key(&r.id)
+                        && same_rule(before, after, &identity)
+                        && count(before) == n)
+                {
+                    violations.insert(identity);
                 }
             }
         }
     }
-    let baseline = lint(before, work);
-    let errors = lint(after, work);
-    let new: Vec<_> = errors.difference(&baseline).collect();
-    if !new.is_empty() {
-        bail!(
-            "structural validation failed: {}",
-            new.iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+    let baseline = lint_graph(before, work, true);
+    for violation in lint_graph(after, work, true) {
+        if !debt.contains(&violation)
+            && !(baseline.contains(&violation) && same_rule(before, after, &violation))
+        {
+            violations.insert(violation);
+        }
+    }
+    if !violations.is_empty() {
+        return Err(WriteRefusal { violations }.into());
     }
     Ok(())
 }

@@ -283,7 +283,7 @@ impl SharedSession {
                 }
                 // DOLT_COMMIT may already have made a versioned commit. Rolling
                 // back SQL is never proof that the operation did not publish.
-                bail!("commit_failed: reconcile operation receipt before retry; {error:#}")
+                Err(error.context("commit_failed: reconcile operation receipt before retry"))
             }
         }
     }

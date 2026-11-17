@@ -27,6 +27,11 @@ pub fn literal(value: &str) -> String {
 pub fn revision_literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
+enum WriteMode {
+    Checked { owned: bool },
+    Bootstrap,
+}
+
 pub struct Store {
     pub root: PathBuf,
     pub db: PathBuf,
@@ -685,6 +690,104 @@ impl Store {
             .context("shared operation required")?
             .commit_markdown_checked(changes, message, actor, validate)
     }
+    fn check_graph(&self, before: &Graph, after: &Graph) -> Result<()> {
+        let work = if self.is_shared() {
+            crate::beads::Local::default()
+        } else {
+            crate::beads::Local::load(&self.root)?
+        };
+        crate::policy::validate_change(before, after, &Default::default(), &work)
+    }
+    fn write_changes(
+        &self,
+        changes: &ChangeSet,
+        message: &str,
+        actor: &str,
+        mode: WriteMode,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<String> {
+        let bootstrap = matches!(mode, WriteMode::Bootstrap);
+        let owned = matches!(mode, WriteMode::Checked { owned: true });
+        let before = if changes.changes_graph() || bootstrap {
+            Some(self.graph()?)
+        } else {
+            None
+        };
+        let info = changes
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Put { table, id, payload } | Change::Insert { table, id, payload }
+                    if table == "metadata" && id == "import" =>
+                {
+                    Some(serde_json::from_str::<ImportInfo>(payload))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let debt = if bootstrap {
+            let graph = before.as_ref().context("bootstrap graph")?;
+            anyhow::ensure!(
+                graph.records.is_empty()
+                    && graph.edges.is_empty()
+                    && graph.import_sources.is_empty()
+                    && self.one::<ImportInfo>("metadata", "import")?.is_none(),
+                "initial import requires an empty store"
+            );
+            info.last()
+                .context("bootstrap requires import metadata")?
+                .lint_debt
+                .clone()
+        } else {
+            let existing = self
+                .one::<ImportInfo>("metadata", "import")?
+                .map(|i| i.lint_debt)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                info.iter().all(|i| i.lint_debt == existing),
+                "only bootstrap may record lint debt"
+            );
+            Default::default()
+        };
+        let check = |candidate: &Graph| -> Result<()> {
+            if bootstrap {
+                let work = if self.is_shared() {
+                    crate::beads::Local::default()
+                } else {
+                    crate::beads::Local::load(&self.root)?
+                };
+                crate::policy::validate_bootstrap(
+                    before.as_ref().context("bootstrap graph")?,
+                    candidate,
+                    &debt,
+                    &work,
+                )?;
+            } else if let Some(before) = &before {
+                self.check_graph(before, candidate)?;
+            }
+            Ok(())
+        };
+        if self.is_shared() {
+            let checked = || {
+                if before.is_some() {
+                    check(&self.graph()?)?;
+                }
+                validate()
+            };
+            if bootstrap {
+                self.commit_shared_markdown_checked(&changes.to_sql(), message, actor, checked)
+            } else {
+                self.commit_shared_checked(&changes.to_sql(), message, actor, owned, checked)
+            }
+        } else {
+            if let Some(before) = &before {
+                check(&changes.candidate(before)?)?;
+            }
+            validate()?;
+            self.transaction(&changes.to_sql(), message, actor)?;
+            self.revision()
+        }
+    }
     pub fn head(&self, branch: &str) -> Result<String> {
         Ok(self.sql(&format!(
             "SELECT DOLT_HASHOF({}) AS revision",
@@ -912,7 +1015,14 @@ impl KnowledgeStore for Store {
         changes.to_sql().len()
     }
     fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
-        self.transaction(&changes.to_sql(), message, actor)
+        self.write_changes(
+            changes,
+            message,
+            actor,
+            WriteMode::Checked { owned: false },
+            &mut || Ok(()),
+        )
+        .map(|_| ())
     }
     fn commit_checked(
         &self,
@@ -922,18 +1032,28 @@ impl KnowledgeStore for Store {
         owned: bool,
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<String> {
-        self.commit_shared_checked(&changes.to_sql(), message, actor, owned, validate)
+        self.write_changes(
+            changes,
+            message,
+            actor,
+            WriteMode::Checked { owned },
+            validate,
+        )
     }
-    fn commit_markdown_checked(
+    fn bootstrap(
         &self,
         changes: &ChangeSet,
         message: &str,
         actor: &str,
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<String> {
-        self.commit_shared_markdown_checked(&changes.to_sql(), message, actor, validate)
+        self.write_changes(changes, message, actor, WriteMode::Bootstrap, validate)
     }
     fn propose(&self, context: &OperationContext, write: ProposalWrite<'_>) -> Result<Value> {
+        if write.changes.changes_graph() {
+            let before = crate::store::graph(self, write.start)?;
+            self.check_graph(&before, &write.changes.candidate(&before)?)?;
+        }
         if self.is_shared() {
             return shared_review::publish_proposal(
                 self,
@@ -1000,13 +1120,14 @@ impl KnowledgeStore for Store {
     fn accept(
         &self,
         context: &OperationContext,
-        main: &Graph,
+        _main: &Graph,
         proposal: &Proposal,
         revisions: (&str, &str),
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Value> {
         if self.is_shared() {
-            return shared_review::accept(self, context, main, proposal, revisions);
+            let current_main = self.graph_at("main")?;
+            return shared_review::accept(self, context, &current_main, proposal, revisions);
         }
         let s = self;
         let mut proposal = proposal.clone();
@@ -1031,6 +1152,7 @@ impl KnowledgeStore for Store {
             if !conflicts.is_empty() {
                 bail!("merge conflicts on {name}; main remains at {base}")
             }
+            s.check_graph(&s.graph_at("main")?, &s.graph()?)?;
             validate()?;
             if context.dry_run {
                 return Ok(
@@ -1075,11 +1197,12 @@ impl KnowledgeStore for Store {
     fn resume(
         &self,
         context: &OperationContext,
-        main: &Graph,
+        _main: &Graph,
         op: &str,
         hash: &str,
     ) -> Result<Option<Value>> {
-        shared_review::resume(self, context, main, op, hash)
+        let current_main = self.graph_at("main")?;
+        shared_review::resume(self, context, &current_main, op, hash)
     }
     fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>> {
         Store::receipt(self, op, hash)
@@ -1131,10 +1254,6 @@ pub(crate) fn validate_merged_review(
     let merged = s.graph()?;
     crate::markdown_import::health(s, &merged, None)?;
     crate::source_import::health(&merged, &s.import_files()?)?;
-    let debt = s
-        .one::<ImportInfo>("metadata", "import")?
-        .map(|i| i.lint_debt)
-        .unwrap_or_default();
     let mut requirements = vec![];
     for row in s.merged_review_guards()? {
         requirements.extend(serde_json::from_str::<Vec<crate::mutation::Requirement>>(
@@ -1145,7 +1264,6 @@ pub(crate) fn validate_merged_review(
     crate::review::validate_review_candidate(
         main_graph,
         &merged,
-        &debt,
         &requirements,
         &routing,
         (who, role),

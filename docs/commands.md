@@ -153,3 +153,35 @@ views and manifest provenance. Review displays file paths, hashes and modes.
 Captured properties and imported edges cannot be changed by authoring, batches,
 schema changes or review. New local relationships still follow endpoint revision,
 ownership and proposal rules. See [the complete contract](import-profiles.md).
+
+## Graph write refusals
+
+`KnowledgeStore` enforces the engine's full-graph check inside each atomic
+write. This covers direct mutations (`new`, `edit`, `link`, `unlink`, `status`,
+`batch`, `schema apply`), proposal writes and publication, local/shared acceptance,
+and qualified `import source` writes. The before graph belongs to the destination
+branch; acceptance checks against current main. Commands may also check plans and
+dry runs before attempting a store write.
+
+A new violation is refused without advancing branch heads. An existing violation
+is tolerated only for the same rule and record; changing a rule cannot hide behind
+old debt. The check includes frozen-history immutability, record fields,
+cardinality, relation endpoints, body links, cycles, ontology validity and pins.
+Authority, review tokens, guards and importer health remain additional checks.
+
+With `--json`, a graph refusal returns a nonzero exit and this diagnostic shape:
+
+```json
+{"schema_version":2,"ok":false,"error":{"message":"structural validation failed: sc-example:missing-support","diagnostic":{"code":"graph_write_refused","severity":"error","violations":["sc-example:missing-support"]}}}
+```
+
+`violations` lists the lint identities (`RECORD:RULE`,
+`RECORD:body-link:TARGET`, `RECORD:RELATION-cycle`, `edge:KEY:REASON`). Ontology
+errors use `ontology:schema:REASON` and unresolved pins use `ontology:pin:PIN`.
+Callers can use `code` and `violations` without parsing `message`.
+
+The initial legacy import and editable Markdown bootstrap also use checked store
+writes. Only these empty-store bootstrap writes may record the imported graph's
+lint violations as `lint_debt` in that same write. Receipt-only replays, rejects
+and identical retries need no graph check. Existing-store `migrate` maintenance
+keeps its separate format and `validation_debt` behavior.

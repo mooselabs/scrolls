@@ -667,3 +667,79 @@ fn work_relations_are_selected_by_the_ontology() {
         );
     }
 }
+
+#[test]
+fn graph_write_checks_schema_pins_and_changed_rules_with_row_identities() {
+    let work = scrolls::beads::Local::default();
+    let mut before = Graph::default();
+    let record = Record::new("knowledge", "historical debt", "body", "alice").unwrap();
+    before.records.insert(record.id.clone(), record.clone());
+    // The same rule on the same record can remain in debt during an unrelated write.
+    policy::validate_change(&before, &before, &Default::default(), &work).unwrap();
+    let mut after = before.clone();
+    after.schema.kinds.get_mut("knowledge").unwrap().cardinality[0].min += 1;
+    after.schema.pins.push("sc-missing-pin".into());
+    after.schema.kinds.get_mut("evidence").unwrap().initial = "missing-state".into();
+    let error = policy::validate_change(&before, &after, &Default::default(), &work).unwrap_err();
+    let refusal = error.downcast_ref::<policy::WriteRefusal>().unwrap();
+    assert!(
+        refusal
+            .violations
+            .contains(&format!("{}:missing-support", record.id))
+    );
+    assert!(refusal.violations.contains("ontology:pin:sc-missing-pin"));
+    assert!(
+        refusal
+            .violations
+            .iter()
+            .any(|v| v.starts_with("ontology:schema:"))
+    );
+    let mut after = before.clone();
+    let second = Record::new("knowledge", "new violation", "body", "alice").unwrap();
+    after.records.insert(second.id.clone(), second.clone());
+    let error = policy::validate_change(&before, &after, &Default::default(), &work).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<policy::WriteRefusal>()
+            .unwrap()
+            .violations,
+        [format!("{}:missing-support", second.id)].into()
+    );
+}
+
+#[test]
+fn a_historical_field_failure_does_not_hide_a_new_field_rule() {
+    let work = scrolls::beads::Local::default();
+    let mut before = Graph::default();
+    let record = Record::new("evidence", "historical", "body", "alice").unwrap();
+    before.records.insert(record.id.clone(), record.clone());
+    let required =
+        serde_yaml::from_str::<scrolls::schema::Field>("type: string\nrequired: true").unwrap();
+    before
+        .schema
+        .kinds
+        .get_mut("evidence")
+        .unwrap()
+        .fields
+        .insert("aaa".into(), required.clone());
+    let mut after = before.clone();
+    after
+        .schema
+        .kinds
+        .get_mut("evidence")
+        .unwrap()
+        .fields
+        .insert("bbb".into(), required);
+    assert_eq!(
+        policy::lint(&after, &work),
+        [format!("{}:required-field:aaa", record.id)].into()
+    );
+    let error = policy::validate_change(&before, &after, &Default::default(), &work).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<policy::WriteRefusal>()
+            .unwrap()
+            .violations,
+        [format!("{}:required-field:bbb", record.id)].into()
+    );
+}

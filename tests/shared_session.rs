@@ -4918,3 +4918,109 @@ fn shared_review_accept_reason_is_preserved_in_receipt() {
     assert_eq!(receipt["result"]["proposal"]["reason"], reason);
     assert_eq!(receipt["command"]["Review"]["reason"], reason);
 }
+
+#[test]
+fn shared_knowledge_store_write_refusal_rolls_back_and_keeps_diagnostic() {
+    use scrolls::{
+        model::Record,
+        storage::Store,
+        store::{Change, ChangeSet, KnowledgeStore},
+    };
+    let server = Server::empty();
+    server.init(None);
+    let root = server.dir.path().join("a");
+    let s = Store::open_shared(&root.join("connection.json"), &root).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    let base = store.head("main").unwrap();
+    let record = Record::new("knowledge", "unsupported", "body", "alice").unwrap();
+    let mut changes = ChangeSet::from(Change::put("records", &record.id, &record).unwrap());
+    changes
+        .push(Change::put("operations", "refused-write", &json!({"should":"rollback"})).unwrap());
+    let error = store
+        .commit(&changes, "invalid shared write", "alice")
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("{}:missing-support", record.id)),
+        "{error:#}"
+    );
+    let diagnostic = scrolls::source_import::diagnostic(&error);
+    assert_eq!(diagnostic["code"], "graph_write_refused");
+    assert_eq!(
+        diagnostic["violations"],
+        json!([format!("{}:missing-support", record.id)])
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+    assert!(s.graph().unwrap().records.is_empty());
+    assert!(
+        s.one::<serde_json::Value>("operations", "refused-write")
+            .unwrap()
+            .is_none()
+    );
+    s.clean().unwrap();
+}
+
+#[test]
+fn shared_accept_uses_store_main_instead_of_caller_baseline() {
+    use scrolls::{
+        model::{Proposal, Record, Role},
+        storage::{Store, put},
+        store::{KnowledgeStore, OperationContext, ReviewRequest},
+    };
+    let server = Server::empty();
+    server.init(None);
+    let root = server.dir.path().join("a");
+    let s = Store::open_shared(&root.join("connection.json"), &root).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    let base = store.head("main").unwrap();
+    let proposal = Proposal {
+        branch: "proposal/external".into(),
+        base: base.clone(),
+        actor: "alice".into(),
+        status: "pending".into(),
+        reason: None,
+    };
+    s.sql("CALL DOLT_BRANCH('proposal/external', 'main')")
+        .unwrap();
+    store.select_branch(&proposal.branch).unwrap();
+    let record = Record::new("knowledge", "external invalid proposal", "body", "alice").unwrap();
+    s.transaction(
+        &(put("records", &record.id, &record).unwrap()
+            + &put("metadata", &proposal.branch, &proposal).unwrap()),
+        "external proposal",
+        "alice",
+    )
+    .unwrap();
+    let proposed = store.head(&proposal.branch).unwrap();
+    let false_baseline = s.graph().unwrap();
+    store.select_branch("main").unwrap();
+    let context = OperationContext {
+        op_id: "accept-external".into(),
+        args_hash: "external-hash".into(),
+        explicit_op_id: true,
+        actor: Some("alice".into()),
+        role: Role::Human,
+        dry_run: false,
+        command: json!({"review":{"action":"accept"}}),
+        review: Some(ReviewRequest {
+            action: "accept".into(),
+            token: Some("caller approves".into()),
+            reason: None,
+        }),
+        recovery: None,
+    };
+    let error = store
+        .accept(
+            &context,
+            &false_baseline,
+            &proposal,
+            (&base, &proposed),
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("{}:missing-support", record.id)),
+        "{error:#}"
+    );
+    assert_eq!(store.head("main").unwrap(), base);
+    assert_eq!(store.head(&proposal.branch).unwrap(), proposed);
+}

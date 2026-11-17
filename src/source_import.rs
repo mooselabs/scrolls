@@ -1069,7 +1069,6 @@ pub fn apply(
     if s.shared() {
         s.commit_checked(&changes, &message, actor, false, &mut || {
             let actual = store::graph(s, None)?;
-            policy::validate_change(&before, &actual, &BTreeSet::new(), work)?;
             crate::source_import::health(&actual, &store::import_files(s, None)?)?;
             actual
                 .schema
@@ -1118,6 +1117,9 @@ fn remove_source(g: &mut Graph, source: &str) {
 
 /// Stable machine-readable diagnostics alongside the human error chain.
 pub fn diagnostic(error: &anyhow::Error) -> Value {
+    if let Some(refusal) = error.downcast_ref::<crate::policy::WriteRefusal>() {
+        return json!({"code":"graph_write_refused","severity":"error","violations":refusal.violations});
+    }
     let reason = format!("{error:#}");
     let codes = [
         "input_limit",

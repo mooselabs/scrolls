@@ -520,10 +520,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
             &serde_json::to_value(&cli.command)?,
             &result,
         )?);
-        store.commit(
+        store.bootstrap(
             &changes,
             &format!("import {} by {}", imported.info.commit, actor(cli)?),
             actor(cli)?,
+            &mut || Ok(()),
         )?;
         return wrap(&store, result, branch);
     }
@@ -644,19 +645,12 @@ pub fn run(cli: &Cli) -> Result<Value> {
         false
     };
     if cli.command.mutation() {
-        let debt = info
-            .as_ref()
-            .map(|i| i.lint_debt.clone())
-            .unwrap_or_default();
         if matches!(cli.command, Cmd::New(_)) {
             for id in &affected {
                 policy::extract_links(&mut graph, id, who, &local);
             }
         }
-        policy::validate_change(&before, &graph, &debt, &local)?;
-        for pin in &graph.schema.pins {
-            graph.resolve(pin)?;
-        }
+        policy::validate_change(&before, &graph, &BTreeSet::new(), &local)?;
         let guarded =
             crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())
                 .is_err();

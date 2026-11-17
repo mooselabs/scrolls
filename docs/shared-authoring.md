@@ -242,3 +242,25 @@ uses 300 seconds: the PEP transaction can exceed 30 seconds on a busy host.
 A timeout is not success; preserve the original operation ID and reconcile its
 receipt before retrying. The setting does not change locks, byte limits,
 transaction atomicity, stale-revision checks or review tokens.
+
+## Store-enforced graph checks
+
+Every `KnowledgeStore` graph write runs the same backend-neutral full-graph
+check inside its atomic write. Direct CLI mutations to main or a proposal,
+proposal publication, acceptance against current main, qualified `import source`
+writes and their recovery/resume paths cannot skip it. Shared checks read the
+transaction's uncommitted candidate under the publication lock before durable
+Dolt commit. Authority and import health checks remain additional obligations.
+
+The check covers frozen history, record fields, cardinality, relation endpoints,
+body links, cycles, ontology validity and pin resolution. Existing violations
+are tolerated only for the same rule and record; a changed rule is rechecked.
+A refusal leaves branch heads unchanged and returns `graph_write_refused` with
+its `violations` list; see [the JSON shape](commands.md#graph-write-refusals).
+
+Both bootstrap imports pass through the checked store write. Only an initial
+legacy import or editable Markdown bootstrap into an empty store may record the
+imported graph's lint as `lint_debt` in the same atomic write. Ordinary writes
+cannot add debt. Receipt-only replays, rejects and identical retries may skip
+graph validation. Raw SQL transport and existing-store migration maintenance
+retain their separate contracts.

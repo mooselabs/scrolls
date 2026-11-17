@@ -613,12 +613,6 @@ fn dry_candidate(
         .into_values()
         .collect::<Vec<_>>();
     crate::source_import::health(&g, &files)?;
-    let debt = metadata
-        .get("import")
-        .map(|p| serde_json::from_str::<ImportInfo>(p))
-        .transpose()?
-        .map(|v| v.lint_debt)
-        .unwrap_or_default();
     let mut requirements = vec![];
     for (id, payload) in &metadata {
         if id.starts_with("guard:") && !ours.rows["metadata"].contains_key(id) {
@@ -662,7 +656,6 @@ fn dry_candidate(
     crate::review::validate_review_candidate(
         main,
         &g,
-        &debt,
         &requirements,
         &routing,
         (who, role),
@@ -814,10 +807,6 @@ fn publish_write(s: &Store, mut i: Intent) -> Result<Value> {
             &BTreeSet::new(),
             &crate::beads::Local::default(),
         )?;
-        candidate.schema.validate()?;
-        for pin in &candidate.schema.pins {
-            candidate.resolve(pin)?;
-        }
         Ok(())
     })?;
     i.stage = Stage::Complete { revision };
