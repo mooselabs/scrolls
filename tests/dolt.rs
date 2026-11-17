@@ -3261,3 +3261,245 @@ fn named_invariants_refuse_new_violations_and_changed_rules_atomically() {
         }
     }
 }
+
+impl Fixture {
+    fn sequenced(kind: &str, direct: bool) -> Self {
+        let f = Self {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        let mut schema = json!({"format":2,"kinds":{}});
+        schema["kinds"][kind] = json!({
+            "initial":"proposed", "states":["proposed","accepted"],
+            "transitions":{"proposed":["accepted"]},
+            "write":{"human":if direct { "direct" } else { "proposal" },"agent":"proposal"},
+            "alias_sequence":{"prefix":"ADR-","width":4}
+        });
+        let file = f.batch_file(schema);
+        f.ok(&["init", "--schema", file.to_str().unwrap()]);
+        f
+    }
+    fn accept(&self, branch: &str) -> Value {
+        let token = self.review_token(branch);
+        self.ok(&["review", "accept", branch, "--review-token", &token])
+    }
+}
+
+#[test]
+fn concurrent_proposals_receive_distinct_aliases_at_acceptance() {
+    let f = Fixture::sequenced("decision", false);
+    let p = f.ok(&["new", "decision", "--title", "First", "--body", ""]);
+    let q = f.ok(&["new", "decision", "--title", "Second", "--body", ""]);
+    let pid = p["id"].as_str().unwrap();
+    let qid = q["id"].as_str().unwrap();
+    let pb = p["branch"].as_str().unwrap();
+    let qb = q["branch"].as_str().unwrap();
+    for (id, branch) in [(pid, pb), (qid, qb)] {
+        assert_eq!(
+            f.ok(&["--proposal", branch, "show", id])["record"]["aliases"],
+            json!([])
+        );
+    }
+    assert!(p.get("allocated_aliases").is_none());
+    let pr = f.ok(&["review", pb]);
+    let qr = f.ok(&["review", qb]);
+    assert_eq!(pr["allocated_aliases"][pid], "ADR-0001");
+    let human_review = scrolls::presentation::human(&json!({"data":pr}));
+    assert!(human_review.contains(&format!("{pid}: ADR-0001")));
+    assert_eq!(
+        f.ok(&["--proposal", pb, "review", pb])["allocated_aliases"],
+        pr["allocated_aliases"]
+    );
+    assert_eq!(qr["allocated_aliases"][qid], "ADR-0001");
+    let args = [
+        "--op-id",
+        "accept-first",
+        "review",
+        "accept",
+        pb,
+        "--review-token",
+        pr["review_token"].as_str().unwrap(),
+    ];
+    let result = f.ok(&args);
+    assert_eq!(result["allocated_aliases"][pid], "ADR-0001");
+    assert_eq!(result, f.ok(&args));
+    f.fail(
+        &[
+            "review",
+            "accept",
+            qb,
+            "--review-token",
+            qr["review_token"].as_str().unwrap(),
+        ],
+        "main revision changed",
+    );
+    assert_eq!(f.ok(&["review", qb])["allocated_aliases"][qid], "ADR-0002");
+    assert_eq!(f.accept(qb)["allocated_aliases"][qid], "ADR-0002");
+    let rejected = f.ok(&["new", "decision", "--title", "Rejected", "--body", ""]);
+    let branch = rejected["branch"].as_str().unwrap();
+    assert!(
+        f.ok(&["review", "reject", branch, "--reason", "unneeded"])
+            .get("allocated_aliases")
+            .is_none()
+    );
+    assert_eq!(
+        f.ok(&[
+            "--proposal",
+            branch,
+            "show",
+            rejected["id"].as_str().unwrap()
+        ])["record"]["aliases"],
+        json!([])
+    );
+    let fourth = f.ok(&["new", "decision", "--title", "Fourth", "--body", ""]);
+    assert_eq!(
+        f.accept(fourth["branch"].as_str().unwrap())["allocated_aliases"]
+            [fourth["id"].as_str().unwrap()],
+        "ADR-0003"
+    );
+    for (alias, id) in [("ADR-0001", pid), ("ADR-0002", qid)] {
+        assert_eq!(f.ok(&["show", alias])["record"]["id"], id);
+    }
+    // Lifecycle changes neither consume another number nor report allocations.
+    let update = f.ok(&["status", pid, "accepted", "--expect", "1"]);
+    assert!(
+        f.accept(update["branch"].as_str().unwrap())
+            .get("allocated_aliases")
+            .is_none()
+    );
+    assert_eq!(
+        f.ok(&["show", pid])["record"]["aliases"],
+        json!(["ADR-0001"])
+    );
+}
+
+#[test]
+fn direct_write_allocates_alias_at_landing() {
+    let f = Fixture::sequenced("page", true);
+    let args = [
+        "--op-id",
+        "direct-first",
+        "new",
+        "page",
+        "--title",
+        "First",
+        "--body",
+        "",
+    ];
+    let first = f.ok(&args);
+    let id = first["id"].as_str().unwrap();
+    assert_eq!(first["allocated_aliases"][id], "ADR-0001");
+    assert_eq!(f.ok(&args), first);
+    let second = f.ok(&["new", "page", "--title", "Second", "--body", ""]);
+    assert_eq!(
+        second["allocated_aliases"][second["id"].as_str().unwrap()],
+        "ADR-0002"
+    );
+    let proposal = f.ok(&[
+        "--role", "agent", "new", "page", "--title", "Proposal", "--body", "",
+    ]);
+    let branch = proposal["branch"].as_str().unwrap();
+    let appended = f.ok(&[
+        "--proposal",
+        branch,
+        "new",
+        "page",
+        "--title",
+        "Appended",
+        "--body",
+        "",
+    ]);
+    let appended_id = appended["id"].as_str().unwrap();
+    assert!(appended.get("allocated_aliases").is_none());
+    assert_eq!(
+        f.ok(&["--proposal", branch, "show", appended_id])["record"]["aliases"],
+        json!([])
+    );
+    let review = f.ok(&["review", branch]);
+    let accepted = f.accept(branch);
+    assert_eq!(review["allocated_aliases"], accepted["allocated_aliases"]);
+    let mut ids = [proposal["id"].as_str().unwrap(), appended_id];
+    ids.sort();
+    assert_eq!(accepted["allocated_aliases"][ids[0]], "ADR-0003");
+    assert_eq!(accepted["allocated_aliases"][ids[1]], "ADR-0004");
+}
+
+#[test]
+fn alias_sequence_starts_after_imported_numbers() {
+    let f = Fixture::new();
+    let repo = f.dir.path().join("import-repo");
+    std::fs::create_dir_all(repo.join("docs/raw")).unwrap();
+    std::fs::create_dir_all(repo.join("docs/decisions")).unwrap();
+    std::fs::write(repo.join("docs/raw/source.md"), "---\ntitle: Source\ndoc_type: raw\nstatus: captured\nowner: alice\nsource_documents: [https://example.com]\n---\nFacts\n").unwrap();
+    for number in [7, 280] {
+        std::fs::write(repo.join(format!("docs/decisions/{number:04}-decision.md")), format!("---\ntitle: Decision {number}\ndoc_type: adr\nstatus: accepted\nowner: alice\nsource_documents: [../raw/source.md]\n---\nDecision\n")).unwrap();
+    }
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "docs"],
+        vec![
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    f.ok(&[
+        "import",
+        "markdown",
+        repo.join("docs").to_str().unwrap(),
+        "--rev",
+        "HEAD",
+    ]);
+    let imported = f.ok(&["show", "ADR-0280"])["record"].clone();
+    let active = f.ok(&["schema", "show"]);
+    let mut schema = active["schema"].clone();
+    schema["kinds"]["decision"]["alias_sequence"] = json!({"prefix":"ADR-","width":4});
+    let path = f.batch_file(schema);
+    let proposal = f.ok(&[
+        "schema",
+        "apply",
+        path.to_str().unwrap(),
+        "--expect",
+        active["schema_revision"].as_str().unwrap(),
+    ]);
+    assert!(
+        f.accept(proposal["branch"].as_str().unwrap())
+            .get("allocated_aliases")
+            .is_none()
+    );
+    let evidence = f.ok(&[
+        "new",
+        "evidence",
+        "--title",
+        "Native support",
+        "--body",
+        "Facts",
+    ]);
+    let p = f.batch(json!([
+        {"op":"new","kind":"decision","title":"Native","body":"Decision","handle":"d"},
+        {"op":"link","from":evidence["id"],"rel":"supports","to":"$d","expect":1}
+    ]));
+    let id = p["handles"]["d"].as_str().unwrap();
+    assert_eq!(
+        f.accept(p["branch"].as_str().unwrap())["allocated_aliases"][id],
+        "ADR-0281"
+    );
+    assert_eq!(f.ok(&["show", "ADR-0281"])["record"]["id"], id);
+    assert_eq!(f.ok(&["show", "ADR-0280"])["record"], imported);
+}

@@ -5,6 +5,7 @@ use crate::{
     model::{Graph, ImportInfo, Proposal, Role, digest},
     mutation::Requirement,
     review::OperationContext,
+    store::{AliasAllocations, ChangeSet, KnowledgeStore},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -563,7 +564,7 @@ fn dry_candidate(
     ours: &Snapshot,
     merged: &Snapshot,
     context: &OperationContext,
-) -> Result<()> {
+) -> Result<(AliasAllocations, ChangeSet)> {
     let who = context.actor.as_deref().context("actor")?;
     let role = context.role;
     let a = s.graph_at(base)?;
@@ -653,6 +654,8 @@ fn dry_candidate(
             Some(&serde_json::from_str::<crate::markdown_import::Plan>(plan)?),
         )?;
     }
+    let merged_graph = g.clone();
+    let allocated = s.allocate_aliases(main, &mut g)?;
     crate::review::validate_review_candidate(
         main,
         &g,
@@ -660,7 +663,8 @@ fn dry_candidate(
         &routing,
         (who, role),
         &crate::beads::Local::default(),
-    )
+    )?;
+    Ok((allocated, ChangeSet::graph(&merged_graph, &g)?))
 }
 fn commit_changes(
     s: &Store,
@@ -1153,7 +1157,8 @@ pub(crate) fn accept(
     let theirs = Snapshot::read(s, Some(proposal_revision))?;
     let merged = merge(&a, &ours, &theirs)?;
     let actor = context.actor.as_deref().context("actor")?;
-    dry_candidate(s, main, base, proposal_revision, &ours, &merged, context)?;
+    let (allocated, alias_changes) =
+        dry_candidate(s, main, base, proposal_revision, &ours, &merged, context)?;
     if context.dry_run {
         return Ok(
             json!({"dry_run":true,"validated":true,"proposal":p.branch,"base":base,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(context)?}),
@@ -1164,8 +1169,12 @@ pub(crate) fn accept(
     if let Some(review) = &context.review {
         proposal.reason = review.reason.clone();
     }
-    let result = json!({"branch":"main","proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(context)?});
-    let sql = super::put("metadata", &p.branch, &proposal)?
+    let result = crate::store::alias_result(
+        json!({"branch":"main","proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token(context)?}),
+        &allocated,
+    );
+    let sql = alias_changes.to_sql()
+        + &super::put("metadata", &p.branch, &proposal)?
         + &crate::review::receipt(op, hash, actor, &context.command, &result)?;
     let delta = changes(&sql, op)?;
     ensure!(

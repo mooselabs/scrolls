@@ -5024,3 +5024,101 @@ fn shared_accept_uses_store_main_instead_of_caller_baseline() {
     assert_eq!(store.head("main").unwrap(), base);
     assert_eq!(store.head(&proposal.branch).unwrap(), proposed);
 }
+
+#[test]
+fn shared_acceptance_allocates_alias_and_recovery_replays_it() {
+    for boundary in ["accept-commit", "CALL DOLT_MERGE('--ff-only'"] {
+        let mut s = Server::empty();
+        let mut schema: serde_json::Value =
+            serde_yaml::from_str(include_str!("../examples/handbook.yaml")).unwrap();
+        schema["kinds"]["page"]["alias_sequence"] = json!({"prefix":"ADR-","width":4});
+        let file = s.dir.path().join("sequence.json");
+        fs::write(&file, serde_json::to_vec(&schema).unwrap()).unwrap();
+        s.init(Some(file.to_str().unwrap()));
+        let p = s.proposed_page("first", "First");
+        let q = s.proposed_page("second", "Second");
+        let branch = p["branch"].as_str().unwrap();
+        let id = p["id"].as_str().unwrap();
+        assert!(p.get("allocated_aliases").is_none());
+        assert_eq!(
+            s.call("reader", &["--proposal", branch, "show", id], true)["data"]["record"]["aliases"],
+            json!([])
+        );
+        let preview = s.call("reviewer", &["review", branch], true);
+        assert_eq!(preview["data"]["allocated_aliases"][id], "ADR-0001");
+        let token = preview["data"]["review_token"].as_str().unwrap();
+        let needle = if boundary == "accept-commit" {
+            literal(&format!("accept {branch} by alice"))
+        } else {
+            boundary.into()
+        };
+        s.interrupted(
+            &[
+                "--op-id",
+                "accept-first",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                token,
+            ],
+            needle,
+        );
+        let intent = s.intent("accept-first");
+        assert_eq!(intent["result"]["allocated_aliases"][id], "ADR-0001");
+        assert!(
+            intent["plan"]["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["table"] == "records" && c["id"] == id)
+        );
+        let recovered = s.call(
+            "second-machine",
+            &["recover", "accept-first", "--resume"],
+            true,
+        );
+        assert_eq!(recovered["data"]["allocated_aliases"][id], "ADR-0001");
+        assert_eq!(
+            recovered["data"],
+            s.call(
+                "third-machine",
+                &["recover", "accept-first", "--resume"],
+                true
+            )["data"]
+        );
+        assert_eq!(
+            s.call("reader", &["show", "ADR-0001"], true)["data"]["record"]["id"],
+            id
+        );
+        let branch = q["branch"].as_str().unwrap();
+        let id = q["id"].as_str().unwrap();
+        let preview = s.call("reviewer", &["review", branch], true);
+        assert_eq!(preview["data"]["allocated_aliases"][id], "ADR-0002");
+        let token = preview["data"]["review_token"].as_str().unwrap();
+        let accepted = s.call(
+            "reviewer",
+            &[
+                "--op-id",
+                "accept-second",
+                "review",
+                "accept",
+                branch,
+                "--review-token",
+                token,
+            ],
+            true,
+        );
+        assert_eq!(accepted["data"]["allocated_aliases"][id], "ADR-0002");
+        let direct = s.call(
+            "author",
+            &[
+                "--op-id", "direct", "new", "page", "--title", "Direct", "--body", "text",
+            ],
+            true,
+        );
+        let id = direct["data"]["id"].as_str().unwrap();
+        assert_eq!(direct["data"]["allocated_aliases"][id], "ADR-0003");
+        s.call("reader", &["doctor"], true);
+    }
+}

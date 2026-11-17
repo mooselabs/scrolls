@@ -1152,7 +1152,15 @@ impl KnowledgeStore for Store {
             if !conflicts.is_empty() {
                 bail!("merge conflicts on {name}; main remains at {base}")
             }
-            s.check_graph(&s.graph_at("main")?, &s.graph()?)?;
+            let main = s.graph_at("main")?;
+            let mut candidate = s.graph()?;
+            let merged = candidate.clone();
+            let allocated = s.allocate_aliases(&main, &mut candidate)?;
+            let alias_changes = ChangeSet::graph(&merged, &candidate)?;
+            if !alias_changes.changes.is_empty() {
+                s.sql(&alias_changes.to_sql())?;
+            }
+            s.check_graph(&main, &candidate)?;
             validate()?;
             if context.dry_run {
                 return Ok(
@@ -1161,7 +1169,10 @@ impl KnowledgeStore for Store {
             }
             proposal.status = "accepted".into();
             proposal.reason = reason.map(str::to_string);
-            let result = json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token});
+            let result = crate::store::alias_result(
+                json!({"proposal":proposal,"op_id":op,"validated_base":base,"proposal_revision":proposal_revision,"review_token":token}),
+                &allocated,
+            );
             let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
             changes.extend(crate::review::receipt_changes(
                 op,

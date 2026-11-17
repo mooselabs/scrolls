@@ -683,6 +683,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 reason: None,
             });
         }
+        if target == "main" {
+            let allocated = store.allocate_aliases(&before, &mut graph)?;
+            result = crate::store::alias_result(result, &allocated);
+            policy::validate_change(&before, &graph, &BTreeSet::new(), &local)?;
+        }
         result["branch"] = json!(target);
         result["op_id"] = json!(op);
         result["records"] = json!(
@@ -968,7 +973,24 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         .find(|p| p.branch == name)
         .context("proposal metadata missing")?;
     if !deciding {
-        let data = crate::read::proposal_detail(s, &name)?;
+        let mut data = crate::read::proposal_detail(s, &name)?;
+        if proposal.status == "pending" {
+            let reviewed_main =
+                s.graph_at(data["main_revision"].as_str().context("main revision")?)?;
+            let old = s.graph_at(data["merge_base"].as_str().context("merge base")?)?;
+            let proposed = s.graph_at(
+                data["proposal_revision"]
+                    .as_str()
+                    .context("proposal revision")?,
+            )?;
+            let mut candidate = ChangeSet::graph(&old, &proposed)?.candidate(&reviewed_main)?;
+            candidate.import_members.extend(proposed.import_members);
+            if proposed.schema != old.schema {
+                candidate.schema = proposed.schema;
+            }
+            let allocated = s.allocate_aliases(&reviewed_main, &mut candidate)?;
+            data = crate::store::alias_result(data, &allocated);
+        }
         let mut response = wrap(s, data.clone(), &name)?;
         response["revision"] = data["proposal_revision"].clone();
         return Ok(response);

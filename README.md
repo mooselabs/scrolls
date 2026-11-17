@@ -100,6 +100,8 @@ and the [store migration guide](docs/migration-0.2.md).
   confidence, review cadence, and attributed relationships.
 - **Local history:** Dolt commits retain changes to records and edges. Stable
   `sc-…` IDs survive edits and exports; imported IDs remain lookup aliases.
+  Format-2 kinds can declare an alias sequence allocated atomically on landing
+  on main, such as `ADR-0001` (see [schema format](docs/commands.md#schema-format)).
 - **Reviewable changes:** protected records use proposal branches with readable
   body, metadata, and graph diffs before human acceptance.
 - **Agent context:** deterministic search and graph traversal, versioned JSON
@@ -337,7 +339,9 @@ backlog, epic, milestone, question, and untyped archive records remain immutable
 
 Both native and Liskov exports include every native kind, `scrolls/graph.json`,
 and `SCROLLS-MANIFEST.json`. Native decisions use stable `sc-…` identities and
-separate views; imported ADR numbers remain metadata and aliases. Local
+separate views. A declared sequence gives native decisions ADR lookup aliases on
+landing; imported ADR numbers remain metadata and aliases. Native allocated
+numbers do not populate imported-number metadata. Local
 questions and answers are independent of the legacy inbox.
 
 **Import and export do not transfer documentation authority.** The original Git

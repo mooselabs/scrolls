@@ -143,6 +143,12 @@ pub fn human(envelope: &Value) -> String {
             out.push_str("\nGraph changes:\n");
             out.push_str(diff);
         }
+        if let Some(aliases) = data["allocated_aliases"].as_object() {
+            out.push_str("\nAliases allocated on acceptance:\n");
+            for (id, alias) in aliases {
+                out.push_str(&format!("{id}: {}\n", alias.as_str().unwrap_or("")));
+            }
+        }
         out.push_str(&format!(
             "\nMain revision: {}\nProposal revision: {}\nReview token: {}\n\nAfter reviewing, accept these revisions with:\nscrolls --role human review accept {} --review-token {}\nAny change to main or this proposal requires another review.\n",
             data["main_revision"].as_str().unwrap_or(""),
