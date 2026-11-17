@@ -359,6 +359,35 @@ fn named_invariants_validate_their_selection_and_predicates() {
 }
 
 #[test]
+fn invariant_names_cannot_mask_builtin_lint_rules() {
+    for name in [
+        "invalid-status",
+        "required-fields",
+        "confidence",
+        "review_every",
+        "last_reviewed",
+        "supports-cycle",
+        "future-relation-cycle",
+    ] {
+        for configured_envelope in [false, true] {
+            let mut value = serde_json::to_value(Schema::default()).unwrap();
+            value["envelope_fields"] = if configured_envelope {
+                json!({"confidence":{"type":"string"}, "review_every":{"type":"integer"},
+                    "last_reviewed":{"type":"string"}})
+            } else {
+                json!({})
+            };
+            value["invariants"] = json!([{"name":name, "description":"No outgoing support",
+                "kinds":["evidence"],
+                "require":{"op":"relation","relation":"supports","direction":"outgoing","max":0}}]);
+            let error = format!("{:#}", Schema::parse(&value.to_string()).unwrap_err());
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("built-in lint rule"), "{error}");
+        }
+    }
+}
+
+#[test]
 fn invariant_metadata_roundtrip_preserves_revision() {
     use scrolls::{
         storage::Store,

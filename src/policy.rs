@@ -213,10 +213,8 @@ fn same_rule(before: &Graph, after: &Graph, violation: &str) -> bool {
     }
     let old_invariant = before.schema.invariants.iter().find(|i| i.name == rule);
     let new_invariant = after.schema.invariants.iter().find(|i| i.name == rule);
-    if (old_invariant.is_some() || new_invariant.is_some())
-        && (old_invariant.is_none() || old_invariant != new_invariant)
-    {
-        return false;
+    if old_invariant.is_some() || new_invariant.is_some() {
+        return old_invariant.is_some() && old_invariant == new_invariant;
     }
     if rule.starts_with("body-link:") {
         return true;

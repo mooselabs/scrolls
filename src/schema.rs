@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+const OPTIONAL_ENVELOPE_FIELDS: [&str; 3] = ["confidence", "review_every", "last_reviewed"];
 fn yes() -> bool {
     true
 }
@@ -374,6 +375,12 @@ impl Schema {
                 );
                 ensure!(names.insert(&invariant.name), "duplicate invariant name");
                 ensure!(
+                    !["invalid-status", "required-fields"].contains(&invariant.name.as_str())
+                        && !OPTIONAL_ENVELOPE_FIELDS.contains(&invariant.name.as_str())
+                        && !invariant.name.ends_with("-cycle"),
+                    "invariant name collides with built-in lint rule"
+                );
+                ensure!(
                     !self
                         .kinds
                         .values()
@@ -397,7 +404,7 @@ impl Schema {
         for (f, def) in &self.envelope_fields {
             def.definition().with_context(|| format!("envelope.{f}"))?;
             ensure!(
-                ["confidence", "review_every", "last_reviewed"].contains(&f.as_str()),
+                OPTIONAL_ENVELOPE_FIELDS.contains(&f.as_str()),
                 "unsupported optional envelope field {f}"
             );
             if let Some(v) = &def.default {

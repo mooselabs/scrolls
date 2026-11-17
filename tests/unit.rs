@@ -745,6 +745,44 @@ fn a_historical_field_failure_does_not_hide_a_new_field_rule() {
 }
 
 #[test]
+fn builtin_debt_cannot_hide_a_new_invariant_violation() {
+    use serde_json::json;
+    let work = scrolls::beads::Local::default();
+    let mut before = Graph::default();
+    let mut record = before
+        .schema
+        .new_record("evidence", "Legacy", "", "alice")
+        .unwrap();
+    record.id = "sc-legacy".into();
+    record.status = "bogus".into();
+    before.records.insert(record.id.clone(), record);
+    let target = before
+        .schema
+        .new_record("knowledge", "Target", "", "alice")
+        .unwrap();
+    let target_id = target.id.clone();
+    before.records.insert(target_id.clone(), target);
+    // Exercise the write check on a caller-supplied schema, bypassing parse.
+    before.schema.invariants.push(
+        serde_json::from_value(json!({
+            "name":"invalid-status", "description":"No outgoing support", "kinds":["evidence"],
+            "require":{"op":"relation","relation":"supports","direction":"outgoing","max":0}
+        }))
+        .unwrap(),
+    );
+    let mut after = before.clone();
+    after.add_edge("sc-legacy", "supports", &target_id, "", "alice");
+    assert!(policy::lint(&before, &work).contains("sc-legacy:invalid-status"));
+    assert!(policy::lint(&after, &work).contains("sc-legacy:invalid-status"));
+    let error = format!(
+        "{:#}",
+        policy::validate_change(&before, &after, &Default::default(), &work).unwrap_err()
+    );
+    assert!(error.contains("invariant invalid-status"), "{error}");
+    assert!(error.contains("built-in lint rule"), "{error}");
+}
+
+#[test]
 fn invariant_tolerance_uses_definition_and_fails_closed_on_evaluation_errors() {
     use serde_json::json;
     let work = scrolls::beads::Local::default();

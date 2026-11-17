@@ -107,7 +107,9 @@ Each entry has `name`, `description`, `require` (a query predicate), and a
 selection: `kinds` (nonempty kind list), `when` (query predicate), or both.
 With both, the record must match both. `skip_frozen: true` excludes frozen
 records; the default is false. Names use letters, numbers, underscores or
-hyphens, must be unique, and must not match any cardinality name.
+hyphens, must be unique, and must not match any cardinality name. Built-in lint
+identities are reserved: `invalid-status`, `required-fields`, `confidence`,
+`review_every`, `last_reviewed`, and every name ending in `-cycle`.
 
 For example, add this section to the handbook ontology to require every
 published public page to have an outgoing chapter pointing at another published page:
