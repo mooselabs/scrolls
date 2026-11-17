@@ -645,16 +645,12 @@ pub fn run(cli: &Cli) -> Result<Value> {
         false
     };
     if cli.command.mutation() {
-        let debt = info
-            .as_ref()
-            .map(|i| i.lint_debt.clone())
-            .unwrap_or_default();
         if matches!(cli.command, Cmd::New(_)) {
             for id in &affected {
                 policy::extract_links(&mut graph, id, who, &local);
             }
         }
-        policy::validate_change(&before, &graph, &debt, &local)?;
+        policy::validate_change(&before, &graph, &BTreeSet::new(), &local)?;
         let guarded =
             crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())
                 .is_err();

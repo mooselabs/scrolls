@@ -2965,10 +2965,146 @@ fn bootstrap_retains_legacy_lint_debt_while_checking_all_fields() {
         debt
     );
     let base = store.head("main").unwrap();
+    let mut edited = record.clone();
+    edited.title = "edited legacy field debt".into();
+    let error = store
+        .commit(
+            &ChangeSet::from(Change::put("records", &record.id, &edited).unwrap()),
+            "edit with recorded debt",
+            "alice",
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("required-field:aaa"));
+    drop(s);
+    for dry_run in [true, false] {
+        let mut args = vec![];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        args.extend([
+            "edit",
+            &record.id,
+            "--expect",
+            "1",
+            "--title",
+            &edited.title,
+        ]);
+        let (ok, value) = f.call(&args);
+        assert!(!ok, "{args:?}: {value}");
+        assert_eq!(
+            value["error"]["diagnostic"]["code"], "graph_write_refused",
+            "{value}"
+        );
+        assert!(value.to_string().contains("required-field:aaa"));
+    }
+    // Schema commands bypass mutation::apply, so their preview must independently
+    // reject changing a rule even when its violation matches old import debt.
+    let schema_revision = schema.revision();
+    schema.kinds.get_mut("evidence").unwrap().fields.insert(
+        "aaa".into(),
+        serde_yaml::from_str::<scrolls::schema::Field>("type: integer\nrequired: true").unwrap(),
+    );
+    let path = f.dir.path().join("changed-schema.yaml");
+    std::fs::write(&path, serde_yaml::to_string(&schema).unwrap()).unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec![];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        args.extend([
+            "schema",
+            "apply",
+            path.to_str().unwrap(),
+            "--expect",
+            &schema_revision,
+        ]);
+        let (ok, value) = f.call(&args);
+        assert!(!ok, "{args:?}: {value}");
+        assert_eq!(
+            value["error"]["diagnostic"]["code"], "graph_write_refused",
+            "{value}"
+        );
+        assert!(value.to_string().contains("required-field:aaa"));
+    }
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let store: &dyn KnowledgeStore = &s;
+    assert_eq!(store.head("main").unwrap(), base);
     assert!(
         store
             .bootstrap(&changes, "second bootstrap", "alice", &mut || Ok(()))
             .is_err()
     );
     assert_eq!(store.head("main").unwrap(), base);
+}
+
+#[test]
+fn cli_does_not_reuse_recorded_lint_debt_after_support_is_repaired() {
+    use scrolls::{
+        model::{ImportInfo, Record},
+        store::{Change, ChangeSet, KnowledgeStore},
+    };
+    let f = Fixture::new();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let record = Record::new("knowledge", "legacy support debt", "body", "alice").unwrap();
+    let info = ImportInfo {
+        repository: "fixture".into(),
+        commit: "fixture".into(),
+        prefix: "docs".into(),
+        files: 0,
+        markdown: 0,
+        untyped: 0,
+        lint_debt: [format!("{}:missing-support", record.id)].into(),
+    };
+    let mut changes = ChangeSet::from(Change::put("records", &record.id, &record).unwrap());
+    changes.push(Change::put("metadata", "import", &info).unwrap());
+    s.bootstrap(&changes, "initial import", "alice", &mut || Ok(()))
+        .unwrap();
+    drop(s);
+    let evidence = f.ok(&["new", "evidence", "--title", "Support", "--body", "facts"]);
+    let evidence = evidence["id"].as_str().unwrap();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let before = s.graph().unwrap();
+    let mut repaired = before.clone();
+    repaired.add_edge(evidence, "supports", &record.id, "", "alice");
+    s.commit(
+        &ChangeSet::graph(&before, &repaired).unwrap(),
+        "repair support debt",
+        "alice",
+    )
+    .unwrap();
+    drop(s);
+    let revision = f.ok(&["show", evidence])["record"]["revision"].to_string();
+    let target_revision = f.ok(&["show", &record.id])["record"]["revision"].to_string();
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    let base = s.head("main").unwrap();
+    drop(s);
+    for dry_run in [true, false] {
+        let mut args = vec![];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        args.extend([
+            "unlink",
+            evidence,
+            "supports",
+            &record.id,
+            "--expect",
+            &revision,
+            "--expect-to",
+            &target_revision,
+        ]);
+        let (ok, value) = f.call(&args);
+        assert!(!ok, "{args:?}: {value}");
+        assert_eq!(
+            value["error"]["diagnostic"]["code"], "graph_write_refused",
+            "{value}"
+        );
+        assert!(
+            value
+                .to_string()
+                .contains(&format!("{}:missing-support", record.id))
+        );
+    }
+    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
+    assert_eq!(s.head("main").unwrap(), base);
 }
