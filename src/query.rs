@@ -155,11 +155,11 @@ pub fn bead_context(g: &Graph, reference: &str, budget: usize) -> Result<Value> 
 pub fn bead_packet(
     g: &Graph,
     reference: &str,
-    local: &crate::beads::Local,
+    work: &dyn crate::work_ref::Adapter,
     budget: usize,
 ) -> Result<Value> {
     bounded(
-        vec![json!({"reference":reference,"bead":local.summary(reference)})],
+        vec![json!({"reference":reference,"bead":work.summary(reference)})],
         references(g, reference),
         budget,
     )

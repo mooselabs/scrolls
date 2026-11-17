@@ -77,7 +77,11 @@ fn predicates_traversal_and_applicability_are_deterministic() {
         2
     );
     g.add_edge("sc-three", "chapter", "sc-one", "", "alice");
-    assert!(policy::lint(&g).iter().any(|e| e.contains("cycle")));
+    assert!(
+        policy::lint(&g, &scrolls::beads::Local::default())
+            .iter()
+            .any(|e| e.contains("cycle"))
+    );
     assert_eq!(
         query::traverse(&g, "sc-one", None, 100, Direction::Both, false).unwrap()["items"]
             .as_array()
@@ -135,7 +139,8 @@ fn relinking_cannot_change_guard_authority_and_batches_use_initial_revisions() {
         {"op":"status","id":"sc-answer","state":"accepted","expect":1},
         {"op":"status","id":"sc-q2","state":"answered","expect":1}
     ]).to_string()).unwrap();
-    let (after, _, _) = mutation::apply(&g, &ops, "bob", &Default::default()).unwrap();
+    let (after, _, _) =
+        mutation::apply(&g, &ops, "bob", &scrolls::beads::Local::default()).unwrap();
     assert_eq!(after.records["sc-answer"].revision, 2);
     assert!(mutation::guards(&g.schema, &g, &after, &ops, "bob", "human").is_err());
     assert!(
@@ -196,7 +201,7 @@ fn already_accepted_answers_cannot_be_swapped_around_owner_guards() {
     after.edges.clear();
     after.add_edge("sc-a1", "answers", "sc-q2", "", "bob");
     after.add_edge("sc-a2", "answers", "sc-q1", "", "bob");
-    assert!(policy::lint(&after).is_empty());
+    assert!(policy::lint(&after, &scrolls::beads::Local::default()).is_empty());
     assert!(
         before
             .schema

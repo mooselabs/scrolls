@@ -2344,7 +2344,8 @@ fn prepared_import_rolls_back_all_collections_and_receipt() {
     s.checkout("main").unwrap();
     let before = s.graph().unwrap();
     let head = s.head("main").unwrap();
-    let c = scrolls::source_import::build(&before, &plan.source).unwrap();
+    let c = scrolls::source_import::build(&before, &plan.source, &scrolls::beads::Local::default())
+        .unwrap();
     let sql = scrolls::storage::graph_changes(&before, &c.graph).unwrap()
         + &scrolls::source_import::persist(&c).unwrap()
         + &put(
@@ -2547,7 +2548,9 @@ fn imported_file_key_collision_never_overwrites_another_tuple() {
         let s = Store::open(&root, &dolt(), false).unwrap();
         s.checkout("main").unwrap();
         let g = s.graph().unwrap();
-        let c = scrolls::source_import::build(&g, &parsed.source).unwrap();
+        let c =
+            scrolls::source_import::build(&g, &parsed.source, &scrolls::beads::Local::default())
+                .unwrap();
         key = c.files[0].key();
         s.transaction(
             &put("import_files", &key, &foreign).unwrap(),

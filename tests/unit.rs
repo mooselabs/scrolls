@@ -23,9 +23,12 @@ fn policy_and_budget() {
     k.status = "current".into();
     g.records.insert(e.id.clone(), e.clone());
     g.records.insert(k.id.clone(), k.clone());
-    assert!(policy::lint(&g).contains(&format!("{}:missing-support", k.id)));
+    assert!(
+        policy::lint(&g, &scrolls::beads::Local::default())
+            .contains(&format!("{}:missing-support", k.id))
+    );
     g.add_edge(&e.id, "supports", &k.id, "", "alice");
-    assert!(policy::lint(&g).is_empty());
+    assert!(policy::lint(&g, &scrolls::beads::Local::default()).is_empty());
     assert!(
         query::context(&g, &k.id, 10)
             .unwrap_err()
@@ -107,8 +110,20 @@ fn trigger_parser_routing_and_lint_share_validation() {
             ..Default::default()
         };
         assert!(query::doctrine(&g, &json!({}), &[]).is_err());
-        assert!(policy::lint(&g).iter().any(|e| e.contains(&r.id)));
-        assert!(policy::validate_change(&Graph::default(), &g, &Default::default()).is_err());
+        assert!(
+            policy::lint(&g, &scrolls::beads::Local::default())
+                .iter()
+                .any(|e| e.contains(&r.id))
+        );
+        assert!(
+            policy::validate_change(
+                &Graph::default(),
+                &g,
+                &Default::default(),
+                &scrolls::beads::Local::default()
+            )
+            .is_err()
+        );
     }
     for fields in [
         json!({"glob":[]}),
@@ -122,7 +137,7 @@ fn trigger_parser_routing_and_lint_share_validation() {
         };
         let result = query::doctrine(&g, &json!({}), &["src/a.rs".into()]).unwrap();
         assert_eq!(result["matched"], json!([]));
-        assert!(policy::lint(&g).is_empty());
+        assert!(policy::lint(&g, &scrolls::beads::Local::default()).is_empty());
         let bad = json!({"triggers":[{"id":r.id,"globs":["["]}]});
         assert!(query::doctrine(&g, &bad, &[]).is_err());
         assert!(!policy::lint_routing(&bad).is_empty());
@@ -384,7 +399,7 @@ fn native_supersession_cannot_publish_incompatible_legacy_status() {
 
 #[test]
 fn qualified_bead_references_policy_and_body_links() {
-    use scrolls::work_ref::BeadRef;
+    use scrolls::beads::BeadRef;
     let a = "beads://00000000-0000-4000-8000-000000000001/bd-a.1";
     let b = "beads://00000000-0000-4000-8000-000000000002/bd-a.1";
     assert_ne!(BeadRef::parse(a).unwrap(), BeadRef::parse(b).unwrap());
@@ -398,14 +413,14 @@ fn qualified_bead_references_policy_and_body_links() {
     let mut g = Graph::default();
     let q = Record::new("question", "Gate", &format!("[work]({a})"), "alice").unwrap();
     g.records.insert(q.id.clone(), q.clone());
-    policy::extract_links(&mut g, &q.id, "alice");
+    policy::extract_links(&mut g, &q.id, "alice", &scrolls::beads::Local::default());
     assert_eq!(g.edges.len(), 1);
-    assert!(policy::lint(&g).is_empty());
+    assert!(policy::lint(&g, &scrolls::beads::Local::default()).is_empty());
     g.add_edge(&q.id, "blocks", a, "", "alice");
-    policy::extract_links(&mut g, &q.id, "alice");
+    policy::extract_links(&mut g, &q.id, "alice", &scrolls::beads::Local::default());
     assert_eq!(g.edges.len(), 2);
     g.add_edge(&q.id, "implemented_by", b, "", "alice");
-    assert!(!policy::lint(&g).is_empty());
+    assert!(!policy::lint(&g, &scrolls::beads::Local::default()).is_empty());
 }
 
 #[test]
@@ -469,12 +484,12 @@ fn format_one_beads_is_the_work_target() {
             .unwrap();
         let id = note.id.clone();
         g.records.insert(id.clone(), note);
-        policy::extract_links(&mut g, &id, "alice");
+        policy::extract_links(&mut g, &id, "alice", &scrolls::beads::Local::default());
         assert_eq!(g.edges.len(), 1);
         let edge = g.edges.values().next().unwrap();
         assert_eq!(edge.rel, "related_work");
         assert_eq!(edge.to, target);
-        policy::edge_valid(&g, edge).unwrap();
+        policy::edge_valid(&g, edge, &scrolls::beads::Local::default()).unwrap();
         g.edges.clear();
         let ops = mutation::parse(
             &serde_json::json!([
@@ -487,6 +502,168 @@ fn format_one_beads_is_the_work_target() {
         assert_eq!(after.edges.len(), 1);
         assert_eq!(after.edges.values().next().unwrap().to, target);
         assert_eq!(after.schema.revision(), g.schema.revision());
-        assert!(policy::lint(&after).is_empty());
+        assert!(policy::lint(&after, &scrolls::beads::Local::default()).is_empty());
+    }
+}
+
+#[test]
+fn work_target_uses_the_supplied_adapter() {
+    use scrolls::{mutation, read, work_ref::Adapter};
+    use serde_json::{Value, json};
+
+    struct Example;
+    impl Adapter for Example {
+        fn canonicalize(&self, reference: &str) -> Option<anyhow::Result<String>> {
+            let id = reference
+                .strip_prefix("example://")
+                .or_else(|| reference.strip_prefix("old-example://"))?;
+            Some((|| {
+                anyhow::ensure!(
+                    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "invalid example reference"
+                );
+                Ok(format!("example://{id}"))
+            })())
+        }
+        fn resolve_local(&self, input: &str) -> Option<anyhow::Result<String>> {
+            self.canonicalize(&format!("example://{}", input.strip_prefix("job:")?))
+        }
+        fn summary(&self, reference: &str) -> Value {
+            json!({"reference":reference,"title":"Example work","status":"open"})
+        }
+    }
+    let work = Example;
+    let mut g = Graph::default();
+    assert_eq!(g.schema.format, 2);
+    let r = Record::new("note", "Work", "", "alice").unwrap();
+    let id = r.id.clone();
+    g.records.insert(id.clone(), r);
+    let link = |target: &str| mutation::Mutation::Link {
+        from: id.clone(),
+        rel: "related_work".into(),
+        to: target.into(),
+        why: String::new(),
+        expect: Some(1),
+        expect_to: None,
+    };
+    for input in ["example://a", "old-example://a", "job:a"] {
+        let (after, _, _) = mutation::apply(&g, &[link(input)], "alice", &work).unwrap();
+        let edge = after.edges.values().next().unwrap();
+        assert_eq!(edge.to, "example://a");
+        policy::edge_valid(&after, edge, &work).unwrap();
+        assert!(policy::lint(&after, &work).is_empty());
+    }
+    assert!(mutation::apply(&g, &[link("example://")], "alice", &work).is_err());
+    assert!(
+        mutation::apply(
+            &g,
+            &[link("beads://00000000-0000-4000-8000-000000000001/bd-a")],
+            "alice",
+            &work
+        )
+        .is_err()
+    );
+
+    // Stored aliases are refused even though link-time input accepts them.
+    let mut stored = g.clone();
+    stored.add_edge(&id, "related_work", "old-example://a", "", "alice");
+    assert!(policy::edge_valid(&stored, stored.edges.values().next().unwrap(), &work).is_err());
+    assert!(policy::validate_change(&g, &stored, &Default::default(), &work).is_err());
+
+    let edit = |body: &str| mutation::Mutation::Edit {
+        id: id.clone(),
+        expect: Some(1),
+        title: None,
+        body: Some(body.into()),
+        owner: None,
+        fields: Default::default(),
+        confidence: None,
+        review_every: None,
+        last_reviewed: None,
+    };
+    let (after, _, _) =
+        mutation::apply(&g, &[edit("[work](example://a)")], "alice", &work).unwrap();
+    assert_eq!(after.edges.values().next().unwrap().rel, "related_work");
+    assert_eq!(after.edges.values().next().unwrap().to, "example://a");
+    assert!(mutation::apply(&g, &[edit("[work](example://)")], "alice", &work).is_err());
+    let (aliased, _, _) =
+        mutation::apply(&g, &[edit("[work](old-example://a)")], "alice", &work).unwrap();
+    assert_eq!(aliased.edges.values().next().unwrap().to, "example://a");
+    let routing = json!({});
+    let view = read::View {
+        graph: &after,
+        routing: &routing,
+        work: &work,
+        store_id: None,
+        actor: "alice",
+    };
+    let document = view
+        .execute(read::Operation::Document {
+            id: &id,
+            provenance: false,
+        })
+        .unwrap();
+    assert_eq!(
+        document["related_work"][0]["bead"],
+        work.summary("example://a")
+    );
+    let packet = query::bead_packet(&after, "example://a", &work, 16000).unwrap();
+    assert_eq!(packet["items"][0]["bead"], work.summary("example://a"));
+    assert_eq!(packet["items"][1]["id"], id);
+
+    // Cardinality lint is independent of the work scheme.
+    let mut knowledge = Record::new("knowledge", "Finding", "", "alice").unwrap();
+    knowledge.status = "current".into();
+    let knowledge_id = knowledge.id.clone();
+    stored.records.insert(knowledge_id.clone(), knowledge);
+    stored.add_edge(&knowledge_id, "implemented_by", "example://a", "", "alice");
+    assert!(policy::lint(&stored, &work).contains(&format!("{knowledge_id}:missing-support")));
+}
+
+#[test]
+fn work_relations_are_selected_by_the_ontology() {
+    use scrolls::{beads, schema::Schema, work_ref};
+    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
+    for schema in [
+        Schema::default(),
+        Schema::parse(include_str!("fixtures/knowledge-format-1.yaml")).unwrap(),
+    ] {
+        let mut g = Graph {
+            schema,
+            ..Default::default()
+        };
+        let rule = g.schema.relations.remove("related_work").unwrap();
+        g.schema.relations.insert("tracks_work".into(), rule);
+        // A familiar relation name with a different external type carries no work.
+        g.schema
+            .relations
+            .get_mut("implemented_by")
+            .unwrap()
+            .external = vec!["url".into()];
+        for relation in g.schema.body_links.values_mut() {
+            if relation == "related_work" {
+                *relation = "tracks_work".into();
+            }
+        }
+        g.schema.validate().unwrap();
+        assert!(work_ref::relation(&g.schema, "tracks_work"));
+        assert!(!work_ref::relation(&g.schema, "implemented_by"));
+        let r = Record::new(
+            "note",
+            "Custom work relation",
+            &format!("[work]({target})"),
+            "alice",
+        )
+        .unwrap();
+        let id = r.id.clone();
+        g.records.insert(id.clone(), r);
+        policy::extract_links(&mut g, &id, "alice", &beads::Local::default());
+        assert!(policy::lint(&g, &beads::Local::default()).is_empty());
+        let refs = beads::refs(&g, target);
+        assert_eq!(refs[0]["relations"], serde_json::json!(["tracks_work"]));
+        assert_eq!(
+            work_ref::related(&g, &id, &beads::Local::default())[0]["relation"],
+            "tracks_work"
+        );
     }
 }

@@ -1,10 +1,10 @@
 //! Typed knowledge reads shared by CLI and HTTP. No audit, recovery or mutation.
 use crate::{
-    beads::Local,
     model::*,
     query::{self, Filters},
     schema::Direction,
     store::{self, KnowledgeStore},
+    work_ref::Adapter,
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -47,7 +47,7 @@ pub enum Operation<'a> {
 pub struct View<'a> {
     pub graph: &'a Graph,
     pub routing: &'a Value,
-    pub local: &'a Local,
+    pub work: &'a dyn Adapter,
     pub store_id: Option<&'a str>,
     pub actor: &'a str,
 }
@@ -96,7 +96,7 @@ impl View<'_> {
             Operation::Document { id, provenance } => {
                 let id = self.resolve(id)?;
                 Ok(
-                    json!({"uri":self.store_id.map(|s|crate::work_ref::document_uri(s,&id)),"record":g.records[&id],"references":query::references(g,&id),"edges":g.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::beads::related(g,&id,self.local),"provenance":if provenance {crate::source_import::provenance(g,&id)} else {Value::Null}}),
+                    json!({"uri":self.store_id.map(|s|crate::work_ref::document_uri(s,&id)),"record":g.records[&id],"references":query::references(g,&id),"edges":g.edges.values().filter(|e|e.from==id||e.to==id).collect::<Vec<_>>(),"related_work":crate::work_ref::related(g,&id,self.work),"provenance":if provenance {crate::source_import::provenance(g,&id)} else {Value::Null}}),
                 )
             }
             Operation::Context { id, budget } => query::context(g, &self.resolve(id)?, budget),
