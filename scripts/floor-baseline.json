@@ -1,0 +1,14 @@
+{
+  "markers": [
+    {
+      "path": "src/source_import.rs",
+      "kind": "rust-attribute",
+      "text": "#[allow(clippy::too_many_arguments)] // Explicit source invocation and attribution, no ambient state.",
+      "count": 1
+    }
+  ],
+  "held": {
+    "tests/shared_session.rs": 5026,
+    "tests/dolt.rs": 3263
+  }
+}
