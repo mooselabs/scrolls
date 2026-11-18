@@ -23,21 +23,75 @@ SUPPRESSIONS = {
 JS_SUPPRESSION = r"\beslint-disable[\w-]*\b|@ts-(?:ignore|expect-error)\b|^nolint\b"
 RUST_RAW = re.compile(r'(?:br|r)(#+)?"')
 RUST_CHAR = re.compile(r"'(?:\\[^\n]+?|[^'\\\n])'")
+SHELL_WORD_START = set(";|&()")
+HEREDOC_OPERATOR = re.compile(
+    r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\([A-Za-z0-9_]+)|([A-Za-z0-9_][A-Za-z0-9_-]*))"
+)
+TOML_HEADER = re.compile(r"^\s*\[([^\[\]\n]+)\]\s*$")
+TOML_KEY = re.compile(
+    r"""^\s*((?:[\w-]+|"[^"]+"|'[^']+')(?:\s*\.\s*(?:[\w-]+|"[^"]+"|'[^']+'))*)\s*="""
+)
 
 
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, check=True).stdout
 
 
+def shell_word_start(text, index):
+    """True when a shell token can start, so $# and ${#name} stay code."""
+    return index == 0 or text[index - 1].isspace() or text[index - 1] in SHELL_WORD_START
+
+
+def mask_span(code, text, start, end):
+    code[start:end] = ["\n" if char == "\n" else " " for char in text[start:end]]
+
+
+def read_heredoc_operator(text, index):
+    """Return the end offset, delimiter and tab-stripping flag, or None."""
+    if text.startswith("<<<", index):
+        return None
+    match = HEREDOC_OPERATOR.match(text, index)
+    if match is None:
+        return None
+    word = next(group for group in match.groups()[1:] if group is not None)
+    return match.end(), word, match.group(1) == "-"
+
+
+def read_heredoc_body(text, index, word, strip_tabs):
+    """Return the offset after a heredoc body, including its terminator line."""
+    while index < len(text):
+        end = text.find("\n", index)
+        line_end = len(text) if end == -1 else end
+        line = text[index:line_end]
+        compared = line.lstrip("\t") if strip_tabs else line
+        next_index = len(text) if end == -1 else end + 1
+        if compared == word:
+            return next_index
+        index = next_index
+    return index
+
+
 def lexical(text, language):
     """Return code, comments and literals with offsets; masking preserves newlines."""
     code = list(text)
     comments, literals = [], []
+    heredocs = []
+    arith = []
     i = 0
     while i < len(text):
+        if language == ".sh" and heredocs and i < len(text) and i > 0 and text[i - 1] == "\n":
+            while heredocs and i < len(text):
+                word, strip_tabs = heredocs.pop(0)
+                end = read_heredoc_body(text, i, word, strip_tabs)
+                literals.append((i, text[i:end]))
+                mask_span(code, text, i, end)
+                i = end
+            continue
         start = i
         comment = None
-        if language in {".py", ".sh", ".toml"} and text[i] == "#":
+        if language in {".py", ".toml"} and text[i] == "#":
+            comment = "#"
+        elif language == ".sh" and not arith and text[i] == "#" and shell_word_start(text, i):
             comment = "#"
         elif language not in {".py", ".sh", ".toml"}:
             if text.startswith("//", i):
@@ -65,6 +119,31 @@ def lexical(text, language):
                 opener = 3
             body = text[start + opener:i - 2] if comment == "/*" else text[start + opener:i]
             comments.append((start, body))
+        elif language == ".sh" and not arith and text.startswith("<<", i):
+            operator = read_heredoc_operator(text, i)
+            if operator is None:
+                i += 1
+                continue
+            end, word, strip_tabs = operator
+            heredocs.append((word, strip_tabs))
+            i = end
+            continue
+        elif language == ".sh" and text.startswith("$((", i):
+            arith.append(0)
+            i += 3
+            continue
+        elif language == ".sh" and not arith and text.startswith("((", i) and shell_word_start(text, i):
+            arith.append(0)
+            i += 2
+            continue
+        elif language == ".sh" and arith and text.startswith("))", i) and arith[-1] == 0:
+            arith.pop()
+            i += 2
+            continue
+        elif language == ".sh" and arith and text[i] in "()":
+            arith[-1] += 1 if text[i] == "(" else -1
+            i += 1
+            continue
         else:
             raw = RUST_RAW.match(text, i) if language == ".rs" else None
             quote = text[i]
@@ -97,8 +176,36 @@ def lexical(text, language):
                 else:
                     i += 1
                 continue
-        code[start:i] = ["\n" if c == "\n" else " " for c in text[start:i]]
+        mask_span(code, text, start, i)
     return "".join(code), comments, literals
+
+
+def split_toml_key(key):
+    return [part.strip().strip("\"'") for part in re.split(r"\s*\.\s*", key)]
+
+
+def toml_value(data, parts):
+    value = data
+    for part in parts:
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def value_allows(value):
+    """True when a Cargo lint value is "allow" or a table whose level is."""
+    if value == "allow":
+        return True
+    if not isinstance(value, dict):
+        return False
+    if "level" in value:
+        return value["level"] == "allow"
+    return any(value_allows(item) for item in value.values())
+
+
+def lint_table(parts):
+    return parts[:1] == ["lints"] or parts[:2] == ["workspace", "lints"]
 
 
 def markers(path, text):
@@ -158,22 +265,18 @@ def markers(path, text):
         table = []
         offset = 0
         for raw, masked in zip(text.splitlines(keepends=True), code.splitlines(keepends=True)):
-            if masked.lstrip().startswith("["):
-                header = tomllib.loads(raw)
-                table = []
-                while isinstance(header, dict) and len(header) == 1:
-                    key, header = next(iter(header.items()))
-                    table.append(key)
-            key = re.match(r'\s*([\w-]+|"[^"]+"|\x27[^\x27]+\x27)\s*=', raw)
-            is_lints = table[:1] == ["lints"] or table[:2] == ["workspace", "lints"]
-            if key is not None and "=" in masked and is_lints:
-                value = data
-                for part in table + [key[1].strip("\"'")]:
-                    value = value[part]
-                if value == "allow" or (isinstance(value, dict) and value.get("level") == "allow"):
-                    found = marker(offset, "manifest-lint")
-                    if found is not None:
-                        yield found
+            header = TOML_HEADER.match(masked)
+            if header is not None:
+                table = split_toml_key(header.group(1))
+            else:
+                key = TOML_KEY.match(raw)
+                equals = None if key is None else key.end() - 1
+                if equals is not None and equals < len(masked) and masked[equals] == "=":
+                    parts = table + split_toml_key(key.group(1))
+                    if lint_table(parts) and value_allows(toml_value(data, parts)):
+                        found = marker(offset, "manifest-lint")
+                        if found is not None:
+                            yield found
             offset += len(raw)
 
 

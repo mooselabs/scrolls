@@ -111,6 +111,33 @@ let e = '\\''; let f = "\\\" // TODO";
         self.write("test.sh", 'scratch=$(mktemp -d "XXX")\necho "# TODO later"\n')
         self.check()
 
+    def test_shell_hash_is_a_comment_only_at_a_word(self):
+        self.write("b.sh", "[ $# -eq 1 ] || exit 2 # TODO accept more args\n"
+                   "echo ${#arr[@]} # TODO x\necho foo#TODO\n")
+        output = self.check(1, "b.sh:1: new anonymous deferral")
+        self.assertIn("b.sh:2: new anonymous deferral", output)
+        self.assertNotIn("b.sh:3:", output)
+
+    def test_shell_heredoc_does_not_mask_later_markers(self):
+        self.write("a.sh", "cat <<EOF\nDon't do this\nEOF\n# shellcheck disable=SC2086\n"
+                   "rm $x\n# TODO later\necho done\n")
+        output = self.check(1, "a.sh:4: new anonymous comment-suppression")
+        self.assertIn("a.sh:6: new anonymous deferral", output)
+        self.assertNotIn("a.sh:2:", output)
+
+    def test_shell_dash_heredoc_strips_tabs(self):
+        self.write("a.sh", "cat <<-EOF\n\tDon't\n\tEOF\n# TODO later\n")
+        self.check(1, "a.sh:4: new anonymous deferral")
+
+    def test_quoted_shell_heredoc_hides_markers(self):
+        self.write("a.sh", "cat <<'EOF'\n# TODO later\n# shellcheck disable=SC2086\nEOF\n"
+                   "echo ${#arr[@]}\n")
+        self.check()
+
+    def test_shell_arithmetic_shift_is_not_a_heredoc(self):
+        self.write("a.sh", "echo $((1<<2))\n# TODO later\n")
+        self.check(1, "a.sh:2: new anonymous deferral")
+
     def test_manifest_allow_fails(self):
         self.write("Cargo.toml", '[lints.clippy]\nneedless_return = "allow"\n')
         self.check(1, "Cargo.toml:2: new anonymous manifest-lint")
@@ -118,6 +145,22 @@ let e = '\\''; let f = "\\\" // TODO";
     def test_manifest_inline_allow_fails(self):
         self.write("Cargo.toml", '[workspace.lints.rust]\nunused = { level = "allow", priority = -1 }\n')
         self.check(1, "Cargo.toml:2:")
+
+    def test_manifest_inline_tool_table_allow_fails(self):
+        self.write("sub/Cargo.toml", '[lints]\nclippy = { needless_return = "allow" }\n')
+        self.check(1, "sub/Cargo.toml:2: new anonymous manifest-lint")
+
+    def test_manifest_dotted_key_allow_fails(self):
+        self.write("sub/Cargo.toml", "[lints]\nclippy.needless_return = \"allow\"\n")
+        self.check(1, "sub/Cargo.toml:2: new anonymous manifest-lint")
+
+    def test_manifest_inline_warn_passes(self):
+        self.write("Cargo.toml", '[lints]\nclippy = { needless_return = "warn" }\n')
+        self.check()
+
+    def test_manifest_nested_array_is_not_a_header(self):
+        self.write("Cargo.toml", '[package]\nfeatures = [\n  ["a", "b"],\n]\n')
+        self.check()
 
     def test_manifest_id_passes(self):
         self.write("Cargo.toml", '[lints.clippy]\n# Q-20261108-aot6\nneedless_return = "allow"\n')
