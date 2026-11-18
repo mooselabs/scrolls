@@ -62,6 +62,12 @@ impl Invariant {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Kind {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_sequence"
+    )]
+    pub alias_sequence: Option<AliasSequence>,
     #[serde(default)]
     pub description: String,
     pub initial: String,
@@ -77,6 +83,25 @@ pub struct Kind {
     pub guards: Vec<Guard>,
     #[serde(default)]
     pub cardinality: Vec<Cardinality>,
+}
+/// A kind's store-allocated alias, assigned on its first landing on main.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AliasSequence {
+    pub prefix: String,
+    pub width: usize,
+}
+fn present_sequence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<AliasSequence>, D::Error> {
+    AliasSequence::deserialize(deserializer).map(Some)
+}
+impl AliasSequence {
+    pub(crate) fn number<'a>(&self, alias: &'a str) -> Option<&'a str> {
+        alias
+            .strip_prefix(&self.prefix)
+            .filter(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -291,7 +316,26 @@ impl Schema {
                 "body link relations must affect only their source"
             );
         }
+        let mut prefixes = BTreeSet::new();
         for (name, k) in &self.kinds {
+            if let Some(sequence) = &k.alias_sequence {
+                ensure!(
+                    self.format == 2,
+                    "unknown field alias_sequence in ontology format 1"
+                );
+                ensure!(
+                    !sequence.prefix.is_empty(),
+                    "{name}: empty alias sequence prefix"
+                );
+                ensure!(
+                    sequence.width > 0,
+                    "{name}: alias sequence width must be positive"
+                );
+                ensure!(
+                    prefixes.insert(&sequence.prefix),
+                    "duplicate alias sequence prefix"
+                );
+            }
             ensure!(
                 !name.is_empty()
                     && name

@@ -85,6 +85,29 @@ An explicit `format` is required: use `format: 2` for new ontologies.
 `write: {human: direct|proposal, agent: direct|proposal}`, `fields`,
 `additional_fields`, optional `guards` and `cardinality`.
 
+In format 2 a kind may also declare `alias_sequence: {prefix: ADR-, width: 4}`.
+The prefix must be nonempty and unique across kinds; the minimum digit width must
+be positive. Format 1 refuses this key. The bundled ontology declares no sequence.
+New native records receive an alias only when they first land on main: in a direct
+write or when their proposal is accepted. Creating or appending a proposal,
+rejecting it, or changing a record's lifecycle does not consume a number. Records
+already on main when a sequence is declared remain unnumbered. Imports retain
+their source aliases and never allocate.
+
+Allocation starts at one above the highest exact `PREFIX` plus ASCII digits alias
+held by any record, including imported records. Qualified aliases such as
+`source:ADR-0999` and suffixes such as `ADR-12a` do not count. Numbers are padded to
+the minimum width and can grow past it. Multiple new records receive consecutive
+numbers in record-id order. Existing duplicate imported aliases stay ambiguous.
+Once held, sequence aliases cannot be removed or changed, and a sequence prefix
+with held numbers cannot be withdrawn from the ontology.
+
+Direct-write and accept results, and their stored receipts, include
+`allocated_aliases: {"sc-…": "ADR-0001"}` only when an alias was allocated.
+CLI `review BRANCH` includes the same field as a preview against its bound main
+revision. If main advances, obtain a fresh review token and preview. Ordinary
+`show ADR-0001` and HTTP `/v0/records/ADR-0001` resolve the alias.
+
 Fields define `type`, `required`, `default`, `values` (enum), `items` (list),
 `minimum` (number), `nonempty` (string), and `glob` (string/list of globs).
 Relations define `from`/`to` kind lists (`'*'` means any), `external`
