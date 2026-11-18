@@ -1,5 +1,6 @@
 //! Local storage and the shared SQL session foundation.
 pub mod backup;
+pub mod http;
 mod inspection;
 pub mod session;
 pub mod shared;

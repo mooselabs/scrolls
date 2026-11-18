@@ -151,3 +151,46 @@ pub fn history(store: &dyn KnowledgeStore, revision: &str, id: Option<&str>) -> 
         store.log(revision)
     }
 }
+
+/// Backend failures safe to expose through the stable read transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendFailure {
+    Unavailable,
+    Busy,
+    Conflict,
+}
+
+/// A host's read-snapshot factory. No concrete backend types cross this seam.
+/// `open` pins the selected view, including its graph, configuration and work
+/// cache. Reads through the handle must remain consistent until snapshot drop.
+/// Backend-specific errors from later handle reads are classified here too.
+pub trait SnapshotSource: Send + Sync + 'static {
+    fn open(&self) -> std::result::Result<Snapshot, BackendFailure>;
+    fn classify(&self, error: anyhow::Error) -> BackendFailure;
+}
+
+/// Owns one operation's immutable read view and any required lock/session.
+pub struct Snapshot {
+    pub store: Box<dyn KnowledgeStore>,
+    pub graph: Graph,
+    pub work: Box<dyn Adapter>,
+    pub routing: Value,
+    pub store_id: String,
+    pub selection: String,
+    pub revision: String,
+    pub actor: String,
+}
+impl Snapshot {
+    pub fn view(&self) -> View<'_> {
+        View {
+            graph: &self.graph,
+            routing: &self.routing,
+            work: self.work.as_ref(),
+            store_id: Some(&self.store_id),
+            actor: &self.actor,
+        }
+    }
+    pub fn envelope(&self, data: Value) -> Value {
+        json!({"schema_version":3,"ok":true,"store_id":self.store_id,"view":self.selection,"store_revision":self.revision,"schema_revision":self.graph.schema.revision(),"data":data})
+    }
+}

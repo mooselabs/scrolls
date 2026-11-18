@@ -39,10 +39,14 @@ complete the discovery and inspection surface. Proposal IDs accept either the
 suffix or `proposal/NAME`. Percent-encode IDs/aliases in paths. There is no
 mutation, acceptance, file-export, Beads refresh/publication or SQL endpoint.
 
-Responses retain the CLI envelope (`schema_version: 2`, `ok`, `revision`,
-`branch`, `data`) and add `store_id` and `schema_revision`. Document results
-retain record revisions. `--proposal` selects ordinary reads; main is the
-default. Proposal inspection includes the current main and proposal revisions,
+HTTP uses envelope version 3: `schema_version: 3`, `ok`, `store_id`, `view`,
+`store_revision`, `schema_revision` and `data`. `view` is `main` or
+`proposal/NAME`; discovery repeats the same `view`. `store_revision` is an
+opaque, non-empty string with no prescribed length or hash format. Errors also
+use `schema_version: 3`. The CLI keeps its version 2 envelope with `branch` and
+`revision`, including the `serve --json` listening startup record (which has
+no selection fields). Document results retain their integer record revisions.
+`--proposal` selects ordinary reads; main is the default. Proposal inspection includes the current main and proposal revisions,
 merge base, changed/deleted documents, relationship/configuration diffs and
 import summary. The returned review token is only usable through existing CLI
 review; HTTP cannot accept a proposal.
@@ -100,10 +104,38 @@ existing graph keys and every relationship, including external Beads targets.
 Records include bodies, fields, paths, aliases and revisions; `original` is
 omitted. Import-original payloads, import metadata and source-file bytes are
 not included. Empty stores return two empty objects. There is no pagination or
-filtering. The graph uses the server-selected branch and schema.
+filtering. The graph uses the server-selected view and schema.
 
-Fabriscope can attach with `--scrolls-url http://127.0.0.1:PORT` or start a private
-server with `--scrolls STORE`. It requires discovery capability `graph`, with no
-render fallback. Conditional requests still read and validate the backend, so
-Fabriscope revalidates at a 30-second interval. No storage migration, installed
-service change or documentation/work authority cutover is required.
+Fabriscope's envelope-version-2 client refuses discovery against this build
+until its version-3 update (ADR-0280 D27, BKLG-20261111-21om). That update maps
+`branch` to `view` and `revision` to `store_revision`, and accepts HTTP
+`schema_version: 3`; the CLI listening record remains at version 2.
+Clients can attach with `--scrolls-url http://127.0.0.1:PORT` or start a private
+server with `--scrolls STORE`. Graph discovery and conditional reads remain
+the same; no store migration or documentation/work authority cutover is required.
+
+## Backend conformance
+
+Hosts implement `scrolls::read::SnapshotSource` and mount the public
+`scrolls::http::router(source, loopback_address)`. Each source opens one immutable
+`read::Snapshot` per request, owning a `KnowledgeStore` handle and its graph,
+store id, selected view, revision, actor, routing and offline work adapter.
+Keep any lock/session alive in that handle until the snapshot drops. Classify
+backend errors as `read::BackendFailure::{Unavailable, Busy, Conflict}`; the
+router owns stable HTTP status codes, sanitized messages and error envelopes.
+The standalone adapter is `storage::http::DoltSource`.
+
+`scrolls::conformance::seed(&store)` commits the fixed fixture through
+`KnowledgeStore::commit` into a fresh initialized backend. Expose a
+`proposal/conformance` view at the seeded revision as well as `main`; the
+fixture includes its stored proposal metadata. Alternatively provision the same
+`conformance::fixture()` through the backend's own fixture loader. Sources use
+actor `reader`, the seeded routing and an empty offline work cache.
+Run `conformance::check(source).await` inside a Tokio runtime. It exercises
+every `/v0` route and `/readyz` through the public router and checks the exact
+OpenAPI-required envelope, revision opacity, discovery selection, OpenAPI bytes,
+security, ETags and errors. Compare its returned `Report` across backends to
+check row-read parity; store-derived document URIs are normalized. History and
+proposal payload internals retain their backend representation.
+`cargo test --locked --test conformance` compares local Dolt, shared Dolt and
+an in-memory `KnowledgeStore` that starts no processes.
