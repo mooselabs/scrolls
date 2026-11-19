@@ -139,7 +139,7 @@ pub fn human(envelope: &Value) -> String {
             ("configuration_changes", "Configuration changes"),
             ("graph_changes", "Graph changes"),
         ] {
-            if let Some(changes) = data[field].as_array().filter(|changes| !changes.is_empty()) {
+            if let Some(changes) = data[field].as_array() {
                 out.push_str(&format!("\n{title}:\n"));
                 for change in changes {
                     out.push_str(&format!(
