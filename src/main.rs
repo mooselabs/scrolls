@@ -19,7 +19,7 @@ fn main() {
         }
     };
     match if let scrolls::cli::Cmd::Serve { bind } = cli.command {
-        scrolls::http::serve(&cli, bind).map(|()| serde_json::Value::Null)
+        scrolls::storage::http::serve(&cli, bind).map(|()| serde_json::Value::Null)
     } else {
         scrolls::app::run(&cli)
     } {

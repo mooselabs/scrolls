@@ -1094,6 +1094,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tower",
  "unsafe-libyaml",
  "uuid",
 ]

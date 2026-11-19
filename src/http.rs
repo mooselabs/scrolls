@@ -1,14 +1,10 @@
-//! Loopback-only read transport. Blocking Dolt work never runs on the executor.
+//! Loopback-only read transport. Blocking reads never run on the executor.
 use crate::{
-    beads::Local,
-    cli::Cli,
-    model::{Graph, digest},
+    model::digest,
     query::Filters,
-    read::{Operation, View},
+    read::{BackendFailure, Operation, Snapshot, SnapshotSource},
     schema::Direction,
-    storage::Store,
 };
-use anyhow::Context;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -21,109 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
-
-#[derive(Clone)]
-pub struct Config {
-    pub store: PathBuf,
-    pub dolt: PathBuf,
-    pub connection: Option<PathBuf>,
-    pub branch: String,
-    pub actor: String,
-}
-impl Config {
-    pub fn from_cli(cli: &Cli) -> Self {
-        Self {
-            store: cli.store.clone(),
-            dolt: cli.dolt.clone(),
-            connection: cli.connection.clone(),
-            branch: cli.proposal.clone().unwrap_or_else(|| "main".into()),
-            actor: cli.actor.clone().unwrap_or_else(|| "reader".into()),
-        }
-    }
-}
-
-/// Owns the operation's lock/session. Every application row is read at an
-/// immutable commit; dropping this value releases admission to CLI writers.
-pub struct Snapshot {
-    pub store: Store,
-    pub graph: Graph,
-    pub local: Local,
-    pub routing: Value,
-    pub store_id: String,
-    pub branch: String,
-    pub revision: String,
-    pub actor: String,
-}
-impl Snapshot {
-    pub fn open(config: &Config) -> anyhow::Result<Self> {
-        let store = if let Some(path) = &config.connection {
-            Store::open_shared(path, &config.store)?
-        } else {
-            Store::open_readonly_wait(&config.store, &config.dolt, Some(Duration::from_secs(5)))?
-        };
-        if store.is_shared() {
-            crate::storage::shared_review::check_readable(&store)?;
-        }
-        anyhow::ensure!(
-            config.branch == "main" || config.branch.starts_with("proposal/"),
-            "unknown selected proposal"
-        );
-        anyhow::ensure!(
-            store.branches()?.contains(&config.branch),
-            "unknown selected proposal"
-        );
-        let revision = store.head(&config.branch)?;
-        let format = store.one_at::<u32>("metadata", "schema", &revision)?;
-        anyhow::ensure!(
-            format == Some(if store.is_shared() { 5 } else { 4 }),
-            "unsupported store format; explicit migration required"
-        );
-        if store.is_shared() {
-            store.check_versioned_inventory(&revision)?;
-        }
-        let store_id: String = store
-            .one_at("metadata", "store_id", &revision)?
-            .context("missing store identity")?;
-        uuid::Uuid::parse_str(&store_id)?;
-        let graph = store.graph_at(&revision)?;
-        graph.schema.validate()?;
-        let local = if store.is_shared() {
-            Local::default()
-        } else {
-            Local::load(&store.root)?
-        };
-        let routing = store
-            .one_at("metadata", "routing", &revision)?
-            .unwrap_or(json!({}));
-        Ok(Self {
-            store,
-            graph,
-            local,
-            routing,
-            store_id,
-            branch: config.branch.clone(),
-            revision,
-            actor: config.actor.clone(),
-        })
-    }
-    pub fn view(&self) -> View<'_> {
-        View {
-            graph: &self.graph,
-            routing: &self.routing,
-            work: &self.local,
-            store_id: Some(&self.store_id),
-            actor: &self.actor,
-        }
-    }
-    pub fn envelope(&self, data: Value) -> Value {
-        json!({"schema_version":2,"ok":true,"store_id":self.store_id,"branch":self.branch,"revision":self.revision,"schema_revision":self.graph.schema.revision(),"data":data})
-    }
-}
 
 pub const OPENAPI: &str = include_str!("../docs/openapi.json");
 pub const BODY_LIMIT: usize = 65_536;
@@ -144,7 +41,7 @@ const OPERATIONS: &[&str] = &[
 ];
 #[derive(Clone)]
 struct Server {
-    config: Config,
+    source: Arc<dyn SnapshotSource>,
     address: SocketAddr,
     admission: Arc<Semaphore>,
 }
@@ -178,89 +75,42 @@ impl Error {
             "Store is busy; retry later",
         )
     }
-    fn backend(error: anyhow::Error) -> Self {
-        // Existing storage diagnostics are internal only; never echo SQL,
-        // credentials, filesystem paths, document text or raw driver errors.
-        // Keep typed transport identity even when account names in a driver
-        // message happen to resemble a store-state diagnostic.
-        if error
-            .chain()
-            .any(|cause| cause.is::<mysql::Error>() || cause.is::<std::io::Error>())
-        {
-            return Self::new(
+    fn backend(error: BackendFailure) -> Self {
+        match error {
+            BackendFailure::Busy => Self::busy(),
+            BackendFailure::Unavailable => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "backend_unavailable",
                 "Store backend unavailable",
-            );
-        }
-        let text = format!("{error:#}");
-        if text.contains("read_lock_timeout") || text.contains("publication_lock_timeout") {
-            return Self::busy();
-        }
-        if [
-            "dirty",
-            "recovery_required",
-            "unsupported",
-            "store format",
-            "selected proposal",
-            "identity",
-            "ontology",
-            "schema",
-        ]
-        .iter()
-        .any(|s| text.contains(s))
-        {
-            Self::new(
+            ),
+            BackendFailure::Conflict => Self::new(
                 StatusCode::CONFLICT,
                 "store_state_conflict",
                 "Store needs explicit maintenance or branch selection",
-            )
-        } else {
-            Self::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "backend_unavailable",
-                "Store backend unavailable",
-            )
+            ),
         }
     }
 }
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.status,axum::Json(json!({"schema_version":2,"ok":false,"error":{"code":self.code,"message":self.message}}))).into_response()
+        (self.status,axum::Json(json!({"schema_version":3,"ok":false,"error":{"code":self.code,"message":self.message}}))).into_response()
     }
 }
 
-pub fn serve(cli: &Cli, bind: SocketAddr) -> anyhow::Result<()> {
+/// Build the shared read router for a numeric loopback listener. The source
+/// opens on a blocking worker once per admitted request; it must pin all reads
+/// for that request and retain any required lock/session until snapshot drop.
+pub fn router(source: Arc<dyn SnapshotSource>, address: SocketAddr) -> anyhow::Result<Router> {
     anyhow::ensure!(
-        bind.ip().is_loopback(),
+        address.ip().is_loopback(),
         "serve requires a numeric loopback address"
     );
-    let config = Config::from_cli(cli);
-    // Validate before binding; the snapshot/session is released immediately.
-    drop(Snapshot::open(&config)?);
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-        // Register signals before publishing the startup record.
-        #[cfg(unix)]
-        let shutdown = {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut int = signal(SignalKind::interrupt())?;
-            let mut term = signal(SignalKind::terminate())?;
-            let mut hup = signal(SignalKind::hangup())?;
-            async move { tokio::select! { _ = int.recv() => {}, _ = term.recv() => {}, _ = hup.recv() => {} } }
-        };
-        #[cfg(not(unix))]
-        let shutdown = async { let _ = tokio::signal::ctrl_c().await; };
-        let listener = tokio::net::TcpListener::bind(bind).await?;
-        let address = listener.local_addr()?;
-        let server = Server { config, address, admission: Arc::new(Semaphore::new(1)) };
-        let app = Router::new().fallback(handle).with_state(server);
-        if cli.json { println!("{}",json!({"schema_version":2,"ok":true,"event":"listening","address":address.to_string(),"api_version":"v0","read_only":true})); }
-        else { println!("Listening on http://{address}"); }
-        use std::io::Write;
-        std::io::stdout().flush()?;
-        axum::serve(listener,app).with_graceful_shutdown(shutdown).await?;
-        Ok(())
-    })
+    let server = Server {
+        source,
+        address,
+        admission: Arc::new(Semaphore::new(1)),
+    };
+    Ok(Router::new().fallback(handle).with_state(server))
 }
 
 fn security(headers: &HeaderMap, address: SocketAddr) -> Result<()> {
@@ -548,10 +398,17 @@ async fn respond(
         .map_err(|_| Error::busy())?;
     let value = tokio::task::spawn_blocking(move || {
         // The permit remains owned by the blocking task even if the client
-        // disconnects. The Store is dropped before bytes go to the network.
+        // disconnects. The snapshot is dropped before bytes go to the network.
         let _permit = permit;
-        let snapshot = Snapshot::open(&server.config).map_err(Error::backend)?;
-        execute(&snapshot, route, id.as_deref(), &params, query)
+        let snapshot = server.source.open().map_err(Error::backend)?;
+        execute(
+            &snapshot,
+            server.source.as_ref(),
+            route,
+            id.as_deref(),
+            &params,
+            query,
+        )
     })
     .await
     .map_err(|_| {
@@ -663,12 +520,14 @@ fn paginate(rows: Vec<Value>, params: &Params, snapshot: &str) -> Result<Value> 
 }
 fn execute(
     s: &Snapshot,
+    source: &dyn SnapshotSource,
     route: Route,
     id: Option<&str>,
     p: &Params,
     q: Option<Query>,
 ) -> Result<Value> {
     let view = s.view();
+    let backend = |error| Error::backend(source.classify(error));
     let id = id.unwrap_or("");
     // Missing records are distinguished from malformed predicates and backends.
     let resolved = if matches!(route, Route::Document | Route::Context | Route::Walk) {
@@ -700,7 +559,7 @@ fn execute(
         }
         Route::Discovery => {
             p.allowed(&[])?;
-            json!({"api_version":"v0","operations":OPERATIONS,"read_only":true,"store_id":s.store_id,"branch":s.branch})
+            json!({"api_version":"v0","operations":OPERATIONS,"read_only":true,"store_id":s.store_id,"view":s.selection})
         }
         Route::Graph => {
             p.allowed(&[])?;
@@ -733,7 +592,7 @@ fn execute(
                 p,
                 &digest(format!(
                     "records:{}:{}:{}:{}",
-                    s.store_id, s.branch, s.revision, s.actor
+                    s.store_id, s.selection, s.revision, s.actor
                 )),
             )?
         }
@@ -786,8 +645,8 @@ fn execute(
         Route::Proposals => {
             p.allowed(&[])?;
             let mut rows = vec![];
-            for proposal in s.store.proposals().map_err(Error::backend)? {
-                let revision = s.store.head(&proposal.branch).map_err(Error::backend)?;
+            for proposal in s.store.proposals().map_err(backend)? {
+                let revision = s.store.head(&proposal.branch).map_err(backend)?;
                 let mut v = json!(proposal);
                 v["revision"] = json!(revision);
                 rows.push(v);
@@ -804,7 +663,7 @@ fn execute(
             if !s
                 .store
                 .proposals()
-                .map_err(Error::backend)?
+                .map_err(backend)?
                 .iter()
                 .any(|p| p.branch == name)
             {
@@ -814,7 +673,7 @@ fn execute(
                     "Proposal not found",
                 ));
             }
-            crate::read::proposal_detail(&s.store, &name).map_err(Error::backend)?
+            crate::read::proposal_detail(s.store.as_ref(), &name).map_err(backend)?
         }
         Route::History => {
             p.allowed(&["id", "limit", "cursor"])?;
@@ -830,14 +689,14 @@ fn execute(
                     })
                 })
                 .transpose()?;
-            let rows = crate::read::history(&s.store, &s.revision, id.as_deref())
-                .map_err(Error::backend)?;
+            let rows = crate::read::history(s.store.as_ref(), &s.revision, id.as_deref())
+                .map_err(backend)?;
             paginate(
                 rows,
                 p,
                 &digest(format!(
                     "history:{}:{}:{}",
-                    s.store_id, s.branch, s.revision
+                    s.store_id, s.selection, s.revision
                 )),
             )?
         }
@@ -885,18 +744,5 @@ mod tests {
         let response = body_error(malformed);
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(!response.message.contains("private"));
-    }
-    #[test]
-    fn typed_backend_failures_do_not_depend_on_account_names() {
-        let error = mysql::Error::MySqlError(mysql::MySqlError {
-            state: "28000".into(),
-            code: 1045,
-            message: "Access denied for schema_identity_user".into(),
-        });
-        let response =
-            Error::backend(anyhow::Error::new(error).context("shared Dolt connection failed"));
-        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.code, "backend_unavailable");
-        assert!(!response.message.contains("schema_identity_user"));
     }
 }

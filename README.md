@@ -123,7 +123,10 @@ and `--proposal` selection. The server reports its actual address, refuses
 uninitialized/dirty/interrupted stores, and performs no recovery or consumption
 logging. `/healthz` reports process liveness; `/readyz` performs a real backend
 read. Remote use requires a tunnel. See the [HTTP API guide](docs/http-api.md)
-and [OpenAPI contract](docs/openapi.json).
+and [OpenAPI contract](docs/openapi.json). HTTP envelope version 3 uses `view`
+and `store_revision` (an opaque, non-empty string); CLI output stays at version
+2 with `branch` and `revision`. The public snapshot source and router support
+other backends, verified by the [conformance suite](docs/http-api.md#backend-conformance).
 
 ## Essential commands
 
@@ -409,6 +412,8 @@ unavailable. Local workflows retain their existing behavior.
 
 `GET /v0/graph` serves all documents and relationships in one revision-bound
 read, without captured originals or source-file bytes. Fabriscope uses this
-endpoint through a private `scrolls serve` or `--scrolls-url`. See the
+endpoint through a private `scrolls serve` or `--scrolls-url`; its older
+version-2 client needs the ADR-0280 D27 update to accept this version-3 server.
+See the
 [HTTP guide](docs/http-api.md) for conditional reads, discovery and loopback
 security. This additive endpoint needs no store migration.

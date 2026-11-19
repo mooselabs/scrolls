@@ -192,16 +192,17 @@ impl Fixture {
             .into()
     }
     fn state(&self) -> Value {
-        let config = scrolls::http::Config {
-            store: self.dir.path().join("store"),
-            dolt: dolt(),
-            connection: self.shared.then(|| self.dir.path().join("connection.json")),
-            branch: "main".into(),
-            actor: "alice".into(),
-        };
-        let snap = scrolls::http::Snapshot::open(&config).unwrap();
+        let store = if self.shared {
+            Store::open_shared(
+                &self.dir.path().join("connection.json"),
+                &self.dir.path().join("store"),
+            )
+        } else {
+            Store::open_readonly(&self.dir.path().join("store"), &dolt())
+        }
+        .unwrap();
         let mut rows = BTreeMap::new();
-        for branch in snap.store.branches().unwrap() {
+        for branch in store.branches().unwrap() {
             for table in [
                 "metadata",
                 "records",
@@ -213,7 +214,7 @@ impl Fixture {
             ] {
                 rows.insert(
                     format!("{branch}:{table}"),
-                    snap.store
+                    store
                         .sql(&format!(
                             "SELECT * FROM {table} AS OF {} ORDER BY id",
                             scrolls::storage::revision_literal(&branch)
@@ -222,7 +223,7 @@ impl Fixture {
                 );
             }
         }
-        let active = snap.store.sql("SELECT active_branch() AS branch").unwrap();
+        let active = store.sql("SELECT active_branch() AS branch").unwrap();
         let mut files = BTreeMap::new();
         for file in [
             "consumed.jsonl",
@@ -231,7 +232,7 @@ impl Fixture {
             "migration-journal.json",
             "dolt-home/.dolt/config_global.json",
         ] {
-            let path = config.store.join(file);
+            let path = store.root.join(file);
             files.insert(file, fs::read(path).ok().map(digest));
         }
         json!({"rows":rows,"files":files,"active":active})
@@ -468,7 +469,7 @@ fn exercise(shared: bool) {
         graph["data"],
         json!({"records":rendered["records"], "edges":rendered["edges"]})
     );
-    for key in ["store_id", "branch", "revision", "schema_revision"] {
+    for key in ["store_id", "view", "store_revision", "schema_revision"] {
         assert_eq!(graph[key], v[key]);
     }
     assert!(
@@ -479,7 +480,7 @@ fn exercise(shared: bool) {
             .all(|r| r.get("original").is_none())
     );
     let selected = proposal_http.get("/v0/graph");
-    assert_eq!(selected["branch"], branch);
+    assert_eq!(selected["view"], branch);
     assert_eq!(
         selected["data"]["records"][prop["id"].as_str().unwrap()]["title"],
         "Proposed"
@@ -488,7 +489,7 @@ fn exercise(shared: bool) {
     let unchanged = http.request("GET", "/v0/graph", &[("If-None-Match", &graph_etag)], &[]);
     assert_eq!(unchanged.status, 304);
     assert!(unchanged.bytes.is_empty());
-    assert_eq!(v["branch"], "main");
+    assert_eq!(v["view"], "main");
     assert_eq!(http.get("/v0/schema")["data"], schema);
     assert_eq!(
         http.get(&format!("/v0/records/{id}?provenance=true"))["data"],
@@ -539,7 +540,7 @@ fn exercise(shared: bool) {
     assert_eq!(http.get("/v0/openapi.json")["openapi"], "3.1.0");
     assert_eq!(http.get("/readyz")["data"]["ready"], true);
     assert_eq!(http.get("/healthz")["ok"], true);
-    assert_eq!(proposal_http.get("/v0/context")["branch"], branch);
+    assert_eq!(proposal_http.get("/v0/context")["view"], branch);
     assert_eq!(
         proposal_http.get(&format!("/v0/records/{}", prop["id"].as_str().unwrap()))["data"]["record"]
             ["title"],
@@ -908,7 +909,7 @@ fn coherent_concurrent_reads_release_the_lock_to_cli_writes() {
                 (record["title"] == "A title" && record["revision"] == 1)
                     || (record["title"] == "New" && record["revision"] == 2)
             );
-            assert_eq!(v["revision"].as_str().unwrap().len(), 32);
+            assert!(!v["store_revision"].as_str().unwrap().is_empty());
         }
         assert_eq!(
             h.get(&format!("/v0/records/{id}"))["data"]["record"]["revision"],
