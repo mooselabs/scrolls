@@ -31,7 +31,7 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 | `search TERMS [filters] [--limit N]` | Same filters; case-insensitive AND over title/body. Includes notes. |
 | `query --file FILE [--path PATH] [--at RFC3339]` | Structured selection with explicit bindings. |
 | `walk ID [--rel R] [--direction incoming\|outgoing\|both] [--depth N] [--full]` | References and traversed edges; default depth 2, maximum 100. |
-| `history [ID]` | Dolt history. |
+| `history [ID]` | Typed store log, or historical record snapshots for ID. |
 | `lint` | Structural errors and retained imported debt; nonzero on new errors. |
 | `consumed [--for-session ID]` | Audited deliveries and record revisions. |
 | `doctor` / `migrate` | Inspect / explicitly upgrade a store. |
@@ -253,3 +253,21 @@ writes. Only these empty-store bootstrap writes may record the imported graph's
 lint violations as `lint_debt` in that same write. Receipt-only replays, rejects
 and identical retries need no graph check. Existing-store `migrate` maintenance
 keeps its separate format and `validation_debt` behavior.
+
+### Typed history and proposal inspection
+
+`history` returns chronological log entries with `store_revision`, `actor`,
+`time` (UTC RFC3339) and `message`. `history ID` replaces `message` with the
+`record` snapshot at that store revision. Store revisions are opaque strings;
+the snapshot's integer record revision remains separate.
+
+`proposals` adds `store_revision` for each proposal view. `review PROPOSAL`
+returns `base_revision`, `main_revision`, `proposal_revision`, record changes,
+`graph_changes` and `configuration_changes`. The latter two are arrays of
+`{table, id, before, after}` with decoded JSON values and null for an absent side,
+in row-id order. Human review output renders both sides. Local and shared Dolt
+compare main with the proposal head; a change-set store lists the proposal's
+own changes. Its `base_revision` is the recorded proposal base; Dolt uses the
+common ancestor for record inspection. Review-token computation and stored
+proposal/receipt/journal formats are unchanged. See the [HTTP contract](http-api.md)
+for the shared payload schemas.

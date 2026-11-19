@@ -9,6 +9,6 @@
   ],
   "held": {
     "tests/shared_session.rs": 5124,
-    "tests/dolt.rs": 3505
+    "tests/dolt.rs": 3503
   }
 }

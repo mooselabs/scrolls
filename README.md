@@ -279,6 +279,12 @@ private configuration and serializes store access with a filesystem lock.
 Authoring changes and operation receipts commit in one explicit transaction.
 Records and edges are keyed JSON rows; those row payloads are the merge units.
 
+`scrolls history [ID]` exposes typed chronological entries with an opaque
+`store_revision`, actor and UTC time, plus a message or the historical record.
+Proposal inspection renders typed graph/configuration row changes with decoded
+`before` and `after` values. These read payloads are shared by local and shared
+stores and the [HTTP API](docs/http-api.md); they do not change stored data.
+
 The consumption audit and Beads bindings/cache are separate local state. An
 unexplained dirty database stops commands for inspection; Scrolls does not
 silently discard it. Start with `scrolls doctor` and the

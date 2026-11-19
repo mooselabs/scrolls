@@ -2,12 +2,80 @@
 pub use crate::review::{OperationContext, RecoveryRequest, ReviewRequest};
 use crate::{model::*, source_import};
 use anyhow::Result;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Newly allocated alias by record id, in deterministic record-id order.
 pub type AliasAllocations = BTreeMap<String, String>;
+
+/// A record snapshot at an immutable store revision, oldest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryEntry {
+    pub store_revision: String,
+    pub actor: String,
+    /// UTC RFC3339 timestamp.
+    pub time: String,
+    pub record: Record,
+}
+
+/// An attributed store publication, oldest first. Revisions are opaque.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogEntry {
+    pub store_revision: String,
+    pub actor: String,
+    /// UTC RFC3339 timestamp.
+    pub time: String,
+    pub message: String,
+}
+
+/// A decoded row change. A missing side denotes insertion or deletion.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowChange {
+    pub table: String,
+    pub id: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+}
+
+impl RowChange {
+    /// Compare keyed JSON rows deterministically, independent of serialization
+    /// whitespace, key ordering, or backend row ordering.
+    pub fn between(
+        table: &str,
+        before: Vec<(String, String)>,
+        after: Vec<(String, String)>,
+    ) -> Result<Vec<Self>> {
+        fn decode(rows: Vec<(String, String)>) -> Result<BTreeMap<String, Value>> {
+            let mut decoded = BTreeMap::new();
+            for (id, payload) in rows {
+                anyhow::ensure!(
+                    decoded
+                        .insert(id, serde_json::from_str(&payload)?)
+                        .is_none(),
+                    "duplicate row identity in proposal changes"
+                );
+            }
+            Ok(decoded)
+        }
+        let before = decode(before)?;
+        let after = decode(after)?;
+        let ids: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+        Ok(ids
+            .into_iter()
+            .filter(|id| before.get(*id) != after.get(*id))
+            .map(|id| Self {
+                table: table.into(),
+                id: id.clone(),
+                before: before.get(id).cloned(),
+                after: after.get(id).cloned(),
+            })
+            .collect())
+    }
+}
 
 pub(crate) fn alias_result(mut result: Value, allocated: &AliasAllocations) -> Value {
     if !allocated.is_empty() {
@@ -237,8 +305,8 @@ pub struct ProposalWrite<'a> {
     pub result: &'a Value,
 }
 
-/// The read and write surface of the knowledge engine. Revisions and payloads keep their
-/// backend representation until the later ADR-0280 format-neutrality cut.
+/// The read and write surface of the knowledge engine. Store revisions are opaque;
+/// history and inspection payloads have backend-neutral types.
 ///
 /// `at: None` always selects the session's current view, including uncommitted
 /// writes in its open transaction. `Some(at)` selects that ref or revision.
@@ -318,13 +386,28 @@ pub trait KnowledgeStore {
     fn head(&self, reference: &str) -> Result<String>;
     fn revision(&self) -> Result<String>;
     fn branches(&self) -> Result<Vec<String>>;
-    fn merge_base(&self, from: &str, to: &str) -> Result<String>;
+    /// Revision from which the proposal's record changes are inspected. Dolt
+    /// resolves the common ancestor; a change-set store returns its proposal base.
+    fn base_revision(&self, main: &str, proposal: &str) -> Result<String>;
     fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>>;
     fn one(&self, table: &str, id: &str, at: Option<&str>) -> Result<Option<String>>;
     fn proposals(&self) -> Result<Vec<Proposal>>;
-    fn history(&self, at: &str, id: &str) -> Result<Vec<Value>>;
-    fn log(&self, at: &str) -> Result<Vec<Value>>;
-    fn diff(&self, from: &str, to: &str, table: &str) -> Result<String>;
+    fn history(&self, at: &str, id: &str) -> Result<Vec<HistoryEntry>>;
+    fn log(&self, at: &str) -> Result<Vec<LogEntry>>;
+    /// Proposal changes in row-id order. Snapshot stores compare main to the
+    /// proposal head; change-set stores override this to list their own changes
+    /// (ADR-0280 decision 5). Both return decoded before/after images.
+    fn diff(&self, main: &str, proposal: &str, table: &str) -> Result<Vec<RowChange>> {
+        anyhow::ensure!(
+            matches!(table, "edges" | "metadata"),
+            "unsupported inspection table"
+        );
+        RowChange::between(
+            table,
+            self.rows(table, Some(main))?,
+            self.rows(table, Some(proposal))?,
+        )
+    }
     fn request_limit(&self) -> Option<usize>;
     fn shared(&self) -> bool;
 }
@@ -518,19 +601,19 @@ mod tests {
         fn branches(&self) -> Result<Vec<String>> {
             anyhow::bail!("unexpected branch read")
         }
-        fn merge_base(&self, _: &str, _: &str) -> Result<String> {
+        fn base_revision(&self, _: &str, _: &str) -> Result<String> {
             anyhow::bail!("unexpected merge-base read")
         }
         fn proposals(&self) -> Result<Vec<Proposal>> {
             anyhow::bail!("unexpected proposal read")
         }
-        fn history(&self, _: &str, _: &str) -> Result<Vec<Value>> {
+        fn history(&self, _: &str, _: &str) -> Result<Vec<HistoryEntry>> {
             anyhow::bail!("unexpected history read")
         }
-        fn log(&self, _: &str) -> Result<Vec<Value>> {
+        fn log(&self, _: &str) -> Result<Vec<LogEntry>> {
             anyhow::bail!("unexpected log read")
         }
-        fn diff(&self, _: &str, _: &str, _: &str) -> Result<String> {
+        fn diff(&self, _: &str, _: &str, _: &str) -> Result<Vec<RowChange>> {
             anyhow::bail!("unexpected diff read")
         }
         fn request_limit(&self) -> Option<usize> {
