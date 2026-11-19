@@ -1504,7 +1504,7 @@
                       "type": "string"
                     },
                     "data": {
-                      "$ref": "#/components/schemas/Page"
+                      "$ref": "#/components/schemas/HistoryPage"
                     },
                     "view": {
                       "type": "string"
@@ -2240,9 +2240,10 @@
               "rejected"
             ]
           },
-          "revision": {
+          "store_revision": {
             "type": "string",
-            "description": "Added by the HTTP proposal collection; proposal commit revision."
+            "minLength": 1,
+            "description": "Added by the proposal collection; immutable revision of this proposal view."
           }
         }
       },
@@ -2252,10 +2253,10 @@
           "proposal",
           "main_revision",
           "proposal_revision",
-          "merge_base",
+          "base_revision",
           "records",
-          "graph_diff",
-          "configuration_diff",
+          "graph_changes",
+          "configuration_changes",
           "imports",
           "review_token"
         ],
@@ -2267,9 +2268,6 @@
             "type": "string"
           },
           "proposal_revision": {
-            "type": "string"
-          },
-          "merge_base": {
             "type": "string"
           },
           "records": {
@@ -2308,20 +2306,34 @@
               }
             }
           },
-          "graph_diff": {
-            "type": "string"
-          },
-          "configuration_diff": {
-            "type": "string"
-          },
           "imports": {
             "type": "object"
           },
           "review_token": {
             "type": "string",
             "description": "Same revision-bound inspection token as CLI. No HTTP acceptance endpoint exists."
+          },
+          "base_revision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Proposal base revision used to inspect record changes; common ancestor on Dolt, recorded base on a change-set backend."
+          },
+          "graph_changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphChange"
+            },
+            "description": "In row-id order. Dolt compares main to proposal head; a change-set backend lists its own changes."
+          },
+          "configuration_changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigurationChange"
+            },
+            "description": "In row-id order. Dolt compares main to proposal head; a change-set backend lists its own changes."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Query": {
         "type": "object",
@@ -2530,6 +2542,187 @@
             }
           }
         }
+      },
+      "HistoryEntry": {
+        "type": "object",
+        "required": [
+          "store_revision",
+          "actor",
+          "time",
+          "record"
+        ],
+        "properties": {
+          "store_revision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque immutable store revision."
+          },
+          "actor": {
+            "type": "string"
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC RFC3339 publication time."
+          },
+          "record": {
+            "$ref": "#/components/schemas/Record"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Historical record snapshot, in chronological order (oldest first)."
+      },
+      "LogEntry": {
+        "type": "object",
+        "required": [
+          "store_revision",
+          "actor",
+          "time",
+          "message"
+        ],
+        "properties": {
+          "store_revision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque immutable store revision."
+          },
+          "actor": {
+            "type": "string"
+          },
+          "time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC RFC3339 publication time."
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Attributed store publication, in chronological order (oldest first)."
+      },
+      "HistoryPage": {
+        "type": "object",
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/HistoryEntry"
+                },
+                {
+                  "$ref": "#/components/schemas/LogEntry"
+                }
+              ]
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque request/snapshot/last-item binding. Repeat the same filters and limit. Restart on snapshot_changed."
+          }
+        },
+        "additionalProperties": false,
+        "description": "With id, all items are HistoryEntry; without id, all items are LogEntry."
+      },
+      "Edge": {
+        "type": "object",
+        "required": [
+          "from",
+          "rel",
+          "to",
+          "why",
+          "actor",
+          "created"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "rel": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "created": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GraphChange": {
+        "type": "object",
+        "required": [
+          "table",
+          "id",
+          "before",
+          "after"
+        ],
+        "properties": {
+          "table": {
+            "const": "edges"
+          },
+          "id": {
+            "type": "string"
+          },
+          "before": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Edge"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "after": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Edge"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Decoded relationship row. Null before means inserted; null after means deleted."
+      },
+      "ConfigurationChange": {
+        "type": "object",
+        "required": [
+          "table",
+          "id",
+          "before",
+          "after"
+        ],
+        "properties": {
+          "table": {
+            "const": "metadata"
+          },
+          "id": {
+            "type": "string"
+          },
+          "before": {},
+          "after": {}
+        },
+        "additionalProperties": false,
+        "description": "Decoded configuration row. Values may be any JSON value; null denotes an absent side. Snapshot backends compare main to proposal head; change-set backends list their proposal changes."
       }
     },
     "responses": {

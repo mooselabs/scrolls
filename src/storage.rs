@@ -7,7 +7,9 @@ pub mod shared;
 pub mod shared_review;
 use crate::{
     model::*,
-    store::{Change, ChangeSet, KnowledgeStore, OperationContext, ProposalWrite},
+    store::{
+        Change, ChangeSet, HistoryEntry, KnowledgeStore, LogEntry, OperationContext, ProposalWrite,
+    },
 };
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -649,17 +651,6 @@ impl Store {
         .map(str::to_owned)
         .context("missing merge base")
     }
-    pub fn diff_text(&self, from: &str, to: &str, table: &str) -> Result<String> {
-        if !self.is_shared() {
-            return self.run(&["diff", from, to, table]);
-        }
-        Ok(serde_json::to_string_pretty(&self.sql(&format!(
-            "SELECT * FROM DOLT_DIFF({}, {}, {})",
-            literal(from),
-            literal(to),
-            literal(table)
-        ))?)?)
-    }
     pub(crate) fn select_shared(&self, branch: &str) -> Result<()> {
         self.shared
             .as_ref()
@@ -872,14 +863,19 @@ impl Store {
         }
         Ok(out)
     }
-    pub fn history(&self, revision: &str, id: &str) -> Result<Vec<Value>> {
-        self.sql(&format!("SELECT commit_hash,committer,commit_date,payload FROM dolt_history_records AS OF {} WHERE id={} ORDER BY commit_date,commit_hash,payload",revision_literal(revision),literal(id)))
+    pub fn history(&self, revision: &str, id: &str) -> Result<Vec<HistoryEntry>> {
+        self.sql(&format!("SELECT commit_hash AS store_revision,committer AS actor,DATE_FORMAT(commit_date, '%Y-%m-%dT%H:%i:%s.%fZ') AS time,payload FROM dolt_history_records AS OF {} WHERE id={} ORDER BY commit_date,commit_hash,payload",revision_literal(revision),literal(id)))?
+            .into_iter().map(|mut row| {
+                row["record"] = serde_json::from_str(row["payload"].as_str().context("history record payload")?)?;
+                row.as_object_mut().context("history row")?.remove("payload");
+                Ok(serde_json::from_value(row)?)
+            }).collect()
     }
-    pub fn log(&self, revision: &str) -> Result<Vec<Value>> {
+    pub fn log(&self, revision: &str) -> Result<Vec<LogEntry>> {
         self.sql(&format!(
-            "SELECT * FROM DOLT_LOG({}) ORDER BY date,commit_hash",
+            "SELECT commit_hash AS store_revision,committer AS actor,DATE_FORMAT(date, '%Y-%m-%dT%H:%i:%s.%fZ') AS time,message FROM DOLT_LOG({}) ORDER BY date,commit_hash",
             literal(revision)
-        ))
+        ))?.into_iter().map(|row| Ok(serde_json::from_value(row)?)).collect()
     }
     /// Dolt-only review guard spanning the current working set and main.
     pub(crate) fn merged_review_guards(&self) -> Result<Vec<Value>> {
@@ -1228,7 +1224,7 @@ impl KnowledgeStore for Store {
     fn branches(&self) -> Result<Vec<String>> {
         Store::branches(self)
     }
-    fn merge_base(&self, from: &str, to: &str) -> Result<String> {
+    fn base_revision(&self, from: &str, to: &str) -> Result<String> {
         Store::merge_base(self, from, to)
     }
     fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
@@ -1240,14 +1236,11 @@ impl KnowledgeStore for Store {
     fn proposals(&self) -> Result<Vec<Proposal>> {
         Store::proposals(self)
     }
-    fn history(&self, at: &str, id: &str) -> Result<Vec<Value>> {
+    fn history(&self, at: &str, id: &str) -> Result<Vec<HistoryEntry>> {
         Store::history(self, at, id)
     }
-    fn log(&self, at: &str) -> Result<Vec<Value>> {
+    fn log(&self, at: &str) -> Result<Vec<LogEntry>> {
         Store::log(self, at)
-    }
-    fn diff(&self, from: &str, to: &str, table: &str) -> Result<String> {
-        Store::diff_text(self, from, to, table)
     }
     fn request_limit(&self) -> Option<usize> {
         Store::shared_query_limit(self)

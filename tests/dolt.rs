@@ -1078,12 +1078,10 @@ fn custom_ontologies_complete_cli_roundtrip_and_configuration_revalidation() {
             active["schema_revision"].as_str().unwrap(),
         ]);
         let view = f.ok(&["review", p["branch"].as_str().unwrap()]);
-        assert!(
-            view["configuration_diff"]
-                .as_str()
-                .unwrap()
-                .contains("ontology")
-        );
+        let changes = view["configuration_changes"].as_array().unwrap();
+        assert!(changes.contains(&json!({
+            "table":"metadata", "id":"ontology", "before":active["schema"], "after":config
+        })));
         f.ok(&[
             "review",
             "accept",

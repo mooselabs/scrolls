@@ -135,13 +135,26 @@ pub fn human(envelope: &Value) -> String {
                 serde_json::to_string_pretty(&data["imports"]).unwrap()
             ));
         }
-        if let Some(diff) = data["configuration_diff"].as_str() {
-            out.push_str("\nConfiguration changes:\n");
-            out.push_str(diff);
-        }
-        if let Some(diff) = data["graph_diff"].as_str() {
-            out.push_str("\nGraph changes:\n");
-            out.push_str(diff);
+        for (field, title) in [
+            ("configuration_changes", "Configuration changes"),
+            ("graph_changes", "Graph changes"),
+        ] {
+            if let Some(changes) = data[field].as_array() {
+                out.push_str(&format!("\n{title}:\n"));
+                for change in changes {
+                    out.push_str(&format!(
+                        "{} {}\n",
+                        change["table"].as_str().unwrap_or(""),
+                        change["id"].as_str().unwrap_or("")
+                    ));
+                    for side in ["before", "after"] {
+                        out.push_str(&format!(
+                            "{side}: {}\n",
+                            serde_json::to_string_pretty(&change[side]).unwrap()
+                        ));
+                    }
+                }
+            }
         }
         if let Some(aliases) = data["allocated_aliases"].as_object() {
             out.push_str("\nAliases allocated on acceptance:\n");

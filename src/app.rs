@@ -855,7 +855,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             consumed = graph.schema.pins.clone();
             packet
         }
-        Cmd::Proposals => json!(store.proposals()?),
+        Cmd::Proposals => json!(crate::read::proposals(&store)?),
         Cmd::History { id } => {
             let id = id.as_deref().map(|id| graph.resolve(id)).transpose()?;
             json!(crate::read::history(&store, &revision, id.as_deref())?)
@@ -977,7 +977,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         if proposal.status == "pending" {
             let reviewed_main =
                 s.graph_at(data["main_revision"].as_str().context("main revision")?)?;
-            let old = s.graph_at(data["merge_base"].as_str().context("merge base")?)?;
+            let old = s.graph_at(data["base_revision"].as_str().context("base revision")?)?;
             let proposed = s.graph_at(
                 data["proposal_revision"]
                     .as_str()

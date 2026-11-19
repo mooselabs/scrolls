@@ -11,7 +11,10 @@ use scrolls::{
         Store,
         http::{Config, DoltSource},
     },
-    store::{self, Change, ChangeSet, KnowledgeStore, OperationContext, ProposalWrite},
+    store::{
+        self, Change, ChangeSet, HistoryEntry, KnowledgeStore, LogEntry, OperationContext,
+        ProposalWrite, RowChange,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -25,12 +28,23 @@ use std::{
 };
 
 type Tables = BTreeMap<String, BTreeMap<String, String>>;
+#[derive(Clone, Default)]
+struct MemoryState {
+    main: Tables,
+    proposal: Tables,
+    selected: String,
+    log: Vec<LogEntry>,
+    history: Vec<HistoryEntry>,
+}
 #[derive(Default)]
-struct Memory(Mutex<Tables>);
+struct Memory(Mutex<MemoryState>);
 const MEMORY_REVISION: &str = "memory:fixture:1";
+const PROPOSAL_REVISION: &str = "memory:proposal:2";
 impl KnowledgeStore for Memory {
-    fn select_branch(&self, _: &str) -> Result<()> {
-        anyhow::bail!("unexpected branch selection")
+    fn select_branch(&self, view: &str) -> Result<()> {
+        anyhow::ensure!(["main", PROPOSAL].contains(&view), "unknown view");
+        self.0.lock().unwrap().selected = view.into();
+        Ok(())
     }
     fn receipt_response(&self, _: Value, _: &str) -> Result<Value> {
         anyhow::bail!("unexpected importer response")
@@ -47,9 +61,14 @@ impl KnowledgeStore for Memory {
     fn encoded_request_size(&self, _: &ChangeSet) -> usize {
         panic!("unexpected request encoding")
     }
-    fn commit(&self, changes: &ChangeSet, _: &str, _: &str) -> Result<()> {
-        let mut rows = self.0.lock().unwrap();
-        let mut candidate = rows.clone();
+    fn commit(&self, changes: &ChangeSet, message: &str, actor: &str) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        let proposal = state.selected == PROPOSAL;
+        let mut candidate = if proposal {
+            state.proposal.clone()
+        } else {
+            state.main.clone()
+        };
         for change in &changes.changes {
             match change {
                 Change::Put { table, id, payload } => {
@@ -68,7 +87,43 @@ impl KnowledgeStore for Memory {
                 }
             }
         }
-        *rows = candidate;
+        let entry = LogEntry {
+            store_revision: if proposal {
+                PROPOSAL_REVISION
+            } else {
+                MEMORY_REVISION
+            }
+            .into(),
+            actor: actor.into(),
+            time: if proposal {
+                "2026-01-02T00:00:00Z"
+            } else {
+                "2026-01-01T00:00:00Z"
+            }
+            .into(),
+            message: message.into(),
+        };
+        let history = candidate
+            .get("records")
+            .into_iter()
+            .flat_map(|t| t.values())
+            .map(|record| {
+                Ok(HistoryEntry {
+                    store_revision: entry.store_revision.clone(),
+                    actor: entry.actor.clone(),
+                    time: entry.time.clone(),
+                    record: serde_json::from_str(record)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if proposal {
+            state.proposal = candidate;
+        } else {
+            state.main = candidate.clone();
+            state.proposal = candidate;
+        }
+        state.log.push(entry);
+        state.history.extend(history);
         Ok(())
     }
     fn commit_checked(
@@ -117,17 +172,22 @@ impl KnowledgeStore for Memory {
     }
 
     fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
-        anyhow::ensure!(at.is_none_or(|r| r == MEMORY_REVISION), "unknown revision");
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
+        let state = self.0.lock().unwrap();
+        let tables = match at {
+            Some(PROPOSAL_REVISION) => &state.proposal,
+            Some(MEMORY_REVISION) => &state.main,
+            None if state.selected == PROPOSAL => &state.proposal,
+            None => &state.main,
+            _ => anyhow::bail!("unknown revision"),
+        };
+        Ok(tables
             .get(table)
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .collect())
     }
+
     fn one(&self, table: &str, id: &str, at: Option<&str>) -> Result<Option<String>> {
         Ok(self
             .rows(table, at)?
@@ -136,42 +196,58 @@ impl KnowledgeStore for Memory {
             .map(|(_, v)| v))
     }
     fn head(&self, reference: &str) -> Result<String> {
-        anyhow::ensure!(
-            ["main", PROPOSAL, MEMORY_REVISION].contains(&reference),
-            "unknown view"
-        );
-        Ok(MEMORY_REVISION.into())
+        match reference {
+            "main" | MEMORY_REVISION => Ok(MEMORY_REVISION.into()),
+            PROPOSAL | PROPOSAL_REVISION => Ok(PROPOSAL_REVISION.into()),
+            _ => anyhow::bail!("unknown view"),
+        }
     }
     fn revision(&self) -> Result<String> {
-        Ok(MEMORY_REVISION.into())
+        let selected = self.0.lock().unwrap().selected.clone();
+        self.head(if selected.is_empty() {
+            "main"
+        } else {
+            &selected
+        })
     }
     fn branches(&self) -> Result<Vec<String>> {
         Ok(vec!["main".into(), PROPOSAL.into()])
     }
-    fn merge_base(&self, from: &str, to: &str) -> Result<String> {
-        self.head(from)?;
-        self.head(to)
+    fn base_revision(&self, main: &str, proposal: &str) -> Result<String> {
+        self.head(proposal)?;
+        self.head(main)
     }
     fn proposals(&self) -> Result<Vec<Proposal>> {
         Ok(vec![serde_json::from_str(
             &self.one("metadata", PROPOSAL, None)?.unwrap(),
         )?])
     }
-    fn history(&self, at: &str, id: &str) -> Result<Vec<Value>> {
-        Ok(vec![
-            json!({"payload":self.one("records",id,Some(at))?,"revision":at}),
-        ])
+    fn history(&self, at: &str, id: &str) -> Result<Vec<HistoryEntry>> {
+        let at = self.head(at)?;
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .history
+            .iter()
+            .filter(|e| {
+                e.record.id == id
+                    && (at == PROPOSAL_REVISION || e.store_revision == MEMORY_REVISION)
+            })
+            .cloned()
+            .collect())
     }
-    fn log(&self, at: &str) -> Result<Vec<Value>> {
-        self.head(at)?;
-        Ok(vec![
-            json!({"revision":at,"message":"Read conformance fixture"}),
-        ])
-    }
-    fn diff(&self, from: &str, to: &str, _: &str) -> Result<String> {
-        self.head(from)?;
-        self.head(to)?;
-        Ok(String::new())
+    fn log(&self, at: &str) -> Result<Vec<LogEntry>> {
+        let at = self.head(at)?;
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .filter(|e| at == PROPOSAL_REVISION || e.store_revision == MEMORY_REVISION)
+            .cloned()
+            .collect())
     }
     fn request_limit(&self) -> Option<usize> {
         None
@@ -202,6 +278,15 @@ impl SnapshotSource for Memory {
 fn memory() -> Arc<Memory> {
     let memory = Arc::new(Memory::default());
     conformance::seed(memory.as_ref()).unwrap();
+    memory.select_branch(PROPOSAL).unwrap();
+    memory
+        .commit(
+            &conformance::proposal_fixture(memory.as_ref()).unwrap(),
+            "Proposed fixture",
+            "reviewer",
+        )
+        .unwrap();
+    memory.select_branch("main").unwrap();
     memory
 }
 #[tokio::test]
@@ -333,6 +418,15 @@ impl Backend {
         store
             .sql(&format!("CALL DOLT_BRANCH('{}', 'main')", PROPOSAL))
             .unwrap();
+        store.select_branch(PROPOSAL).unwrap();
+        store
+            .commit(
+                &conformance::proposal_fixture(&store).unwrap(),
+                "Proposed fixture",
+                "reviewer",
+            )
+            .unwrap();
+        store.select_branch("main").unwrap();
         drop(store);
         backend
     }
@@ -421,5 +515,66 @@ async fn classified_failures_keep_stable_http_errors() {
             value,
             json!({"schema_version":3,"ok":false,"error":{"code":code,"message":message}})
         );
+    }
+}
+
+#[test]
+fn typed_row_changes_preserve_empty_values_and_deletions() {
+    let before = vec![
+        ("updated".into(), "{\"x\":1}".into()),
+        ("deleted".into(), "[]".into()),
+        ("same".into(), "{\"a\":0,\"b\":false}".into()),
+    ];
+    let after = vec![
+        ("same".into(), "{ \"b\": false, \"a\": 0 }".into()),
+        ("updated".into(), "{\"x\":0}".into()),
+        ("inserted".into(), "\"\"".into()),
+    ];
+    let changes = RowChange::between("metadata", before, after).unwrap();
+    assert_eq!(
+        serde_json::to_value(changes).unwrap(),
+        json!([
+            {"table":"metadata","id":"deleted","before":[],"after":null},
+            {"table":"metadata","id":"inserted","before":null,"after":""},
+            {"table":"metadata","id":"updated","before":{"x":1},"after":{"x":0}}
+        ])
+    );
+    assert!(
+        RowChange::between(
+            "metadata",
+            vec![],
+            vec![("bad".into(), "invalid JSON".into())]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn memory_history_pins_snapshots_and_review_renders_typed_changes() {
+    let store = memory();
+    let main = store.history(MEMORY_REVISION, conformance::RECORD).unwrap();
+    let proposed = store
+        .history(PROPOSAL_REVISION, conformance::RECORD)
+        .unwrap();
+    assert_eq!(main.len(), 1);
+    assert_eq!(proposed.len(), 2);
+    assert_eq!(main[0].actor, "reader");
+    assert_eq!(proposed[1].actor, "reviewer");
+    assert_eq!(proposed[1].record.body, "Proposed portable fixture");
+    assert_eq!(
+        store.log(PROPOSAL_REVISION).unwrap()[1].message,
+        "Proposed fixture"
+    );
+    let detail = scrolls::read::proposal_detail(store.as_ref(), PROPOSAL).unwrap();
+    let text = scrolls::presentation::human(&json!({"data":detail}));
+    for expected in [
+        "Configuration changes:",
+        "Graph changes:",
+        "metadata ontology",
+        "before:",
+        "after:",
+        "Proposed relationship",
+    ] {
+        assert!(text.contains(expected), "{text}");
     }
 }

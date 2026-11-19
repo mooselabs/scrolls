@@ -47,9 +47,22 @@ use `schema_version: 3`. The CLI keeps its version 2 envelope with `branch` and
 `revision`, including the `serve --json` listening startup record (which has
 no selection fields). Document results retain their integer record revisions.
 `--proposal` selects ordinary reads; main is the default. Proposal inspection includes the current main and proposal revisions,
-merge base, changed/deleted documents, relationship/configuration diffs and
-import summary. The returned review token is only usable through existing CLI
+`base_revision`, changed/deleted documents, typed relationship/configuration changes
+and import summary. `base_revision` is the common ancestor used for record inspection
+on Dolt and the recorded proposal base on a change-set backend. The proposal collection
+adds `store_revision`, the immutable revision of each proposal view.
+`graph_changes` and `configuration_changes` contain rows with `table`, `id`,
+`before` and `after`. Values are decoded JSON; a null side denotes insertion or deletion.
+Graph rows use table `edges`; configuration rows use `metadata` (including ontology).
+Rows are sorted by id. Both local and shared Dolt compare main with the proposal head;
+a change-set backend lists its proposal's own changes (ADR-0280 decision 5). The returned review token is only usable through existing CLI
 review; HTTP cannot accept a proposal.
+
+`/v0/history` without `id` returns typed log entries: `store_revision`, `actor`,
+`time` (UTC RFC3339) and `message`. With `id`, it returns typed record-history
+entries with `record` in place of `message`: the full record snapshot at that
+revision. Neither endpoint exposes backend system-table columns or serialized
+record payloads. The CLI `history [ID]` uses these same entries.
 
 `/v0/records` and `/v0/history` return `data.items` and `data.next_cursor`.
 The page size defaults to 50, with a maximum of 200 (minimum 1). Repeat the same

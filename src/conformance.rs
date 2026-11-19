@@ -66,6 +66,141 @@ pub fn seed(store: &dyn KnowledgeStore) -> Result<()> {
     store.commit(&fixture()?, "Read conformance fixture", "reader")
 }
 
+/// A proposal that changes a record, ontology, existing edge and a new edge.
+/// Hosts commit this on PROPOSAL after exposing the seeded main revision there.
+pub fn proposal_fixture(store: &dyn KnowledgeStore) -> Result<ChangeSet> {
+    let mut graph = crate::store::graph(store, Some(&store.head("main")?))?;
+    let record = graph.records.get_mut(RECORD).context("fixture record")?;
+    record.body = "Proposed portable fixture".into();
+    record.revision += 1;
+    graph.schema.instructions = "Proposed review instructions".into();
+    let mut changes = ChangeSet::default();
+    changes.push(Change::put("records", RECORD, record)?);
+    changes.push(Change::put("metadata", "ontology", &graph.schema)?);
+    let edge = graph.edges.values_mut().next().context("fixture edge")?;
+    edge.why = "Proposed relationship".into();
+    changes.push(Change::put("edges", &edge.key(), edge)?);
+    let mut added = edge.clone();
+    std::mem::swap(&mut added.from, &mut added.to);
+    changes.push(Change::put("edges", &added.key(), &added)?);
+    Ok(changes)
+}
+
+// Validate the OpenAPI JSON Schema vocabulary used by the inspection payloads.
+// Refuse unknown keywords so adding a constraint cannot silently weaken proof.
+fn validate_schema(spec: &Value, schema: &Value, value: &Value) -> Result<()> {
+    for key in schema.as_object().context("schema object")?.keys() {
+        ensure!(
+            [
+                "$ref",
+                "type",
+                "oneOf",
+                "required",
+                "properties",
+                "items",
+                "additionalProperties",
+                "const",
+                "enum",
+                "minLength",
+                "minimum",
+                "format",
+                "description"
+            ]
+            .contains(&key.as_str()),
+            "unsupported contract keyword {key}"
+        );
+    }
+    if let Some(reference) = schema["$ref"].as_str() {
+        let target = spec
+            .pointer(
+                reference
+                    .strip_prefix('#')
+                    .context("local schema reference")?,
+            )
+            .context("schema reference")?;
+        validate_schema(spec, target, value)?;
+    }
+    if let Some(choices) = schema["oneOf"].as_array() {
+        ensure!(
+            choices
+                .iter()
+                .filter(|s| validate_schema(spec, s, value).is_ok())
+                .count()
+                == 1,
+            "oneOf mismatch: {value}"
+        );
+    }
+    if let Some(expected) = schema.get("type") {
+        let matches = |kind: &str| match kind {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        };
+        ensure!(
+            expected.as_str().is_some_and(matches)
+                || expected
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|k| k.as_str().is_some_and(matches))),
+            "type mismatch: {value}"
+        );
+    }
+    if let Some(expected) = schema.get("const") {
+        ensure!(expected == value, "const mismatch");
+    }
+    if let Some(choices) = schema["enum"].as_array() {
+        ensure!(choices.contains(value), "enum mismatch");
+    }
+    if let Some(min) = schema["minimum"].as_f64() {
+        ensure!(value.as_f64().is_some_and(|n| n >= min), "minimum mismatch");
+    }
+    if let Some(min) = schema["minLength"].as_u64() {
+        ensure!(
+            value
+                .as_str()
+                .is_some_and(|s| s.chars().count() as u64 >= min),
+            "empty revision"
+        );
+    }
+    if let Some(format) = schema["format"].as_str() {
+        ensure!(
+            format == "date-time",
+            "unsupported contract format {format}"
+        );
+        chrono::DateTime::parse_from_rfc3339(value.as_str().context("timestamp string")?)?;
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema["required"].as_array() {
+            for key in required {
+                ensure!(
+                    object.contains_key(key.as_str().context("required key")?),
+                    "missing field {key}"
+                );
+            }
+        }
+        for (key, value) in object {
+            if let Some(property) = schema["properties"].get(key) {
+                validate_schema(spec, property, value).with_context(|| format!("field {key}"))?;
+            } else {
+                ensure!(
+                    schema["additionalProperties"] != false,
+                    "unexpected field {key}"
+                );
+            }
+        }
+    }
+    if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+        for value in values {
+            validate_schema(spec, items, value)?;
+        }
+    }
+    Ok(())
+}
+
 /// Row-read payloads normalized only for the backend-owned store identity.
 #[derive(Debug, PartialEq)]
 pub struct Report(pub BTreeMap<String, Value>);
@@ -173,6 +308,62 @@ pub async fn check(source: Arc<dyn SnapshotSource>) -> Result<Report> {
             if path == "/v0/context" {
                 ensure!(value["data"]["view"] == value["view"], "discovery view");
             }
+            if path.starts_with("/v0/history") || path == format!("/v0/proposals/{PROPOSAL}") {
+                let schema = &spec["paths"][&template][method]["responses"]["200"]["content"]["application/json"]
+                    ["schema"]["properties"]["data"];
+                validate_schema(&spec, schema, &value["data"]).with_context(|| path.clone())?;
+            }
+            if path.starts_with("/v0/history") {
+                let items = value["data"]["items"].as_array().context("history items")?;
+                ensure!(!items.is_empty(), "history proof needs populated entries");
+                let schema = if path.contains("?id=") {
+                    "HistoryEntry"
+                } else {
+                    "LogEntry"
+                };
+                for entry in items {
+                    validate_schema(&spec, &spec["components"]["schemas"][schema], entry)?;
+                }
+                ensure!(
+                    items
+                        .windows(2)
+                        .all(|pair| pair[0]["time"].as_str() <= pair[1]["time"].as_str()),
+                    "history chronology"
+                );
+            }
+            if path == format!("/v0/proposals/{PROPOSAL}") {
+                ensure!(
+                    value["data"]["records"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty()),
+                    "record changes fixture"
+                );
+                ensure!(
+                    value["data"]["graph_changes"]
+                        .as_array()
+                        .is_some_and(|v| v.len() == 2),
+                    "edge changes fixture"
+                );
+                ensure!(
+                    value["data"]["configuration_changes"]
+                        .as_array()
+                        .is_some_and(|v| v
+                            .iter()
+                            .any(|c| c["id"] == "ontology" && c["before"] != c["after"])),
+                    "ontology change fixture"
+                );
+            }
+            if path == "/v0/proposals" {
+                for proposal in value["data"].as_array().context("proposal collection")? {
+                    ensure!(
+                        proposal["store_revision"]
+                            .as_str()
+                            .is_some_and(|r| !r.is_empty())
+                            && proposal.get("revision").is_none(),
+                        "proposal collection revision"
+                    );
+                }
+            }
             if parity {
                 let mut data = value["data"].clone();
                 normalize(
@@ -222,4 +413,44 @@ pub async fn check(source: Arc<dyn SnapshotSource>) -> Result<Report> {
         );
     }
     Ok(Report(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schemas_reject_legacy_and_malformed_inspection_payloads() -> Result<()> {
+        let spec: Value = serde_json::from_str(OPENAPI)?;
+        let schemas = &spec["components"]["schemas"];
+        for (name, bad) in [
+            (
+                "HistoryEntry",
+                json!({"commit_hash":"abc","committer":"alice","commit_date":"today","payload":"{}"}),
+            ),
+            (
+                "LogEntry",
+                json!({"store_revision":"x","actor":"alice","time":"today","message":""}),
+            ),
+            (
+                "HistoryEntry",
+                json!({"store_revision":"x","actor":"alice","time":"2026-01-01T00:00:00Z","record":{}}),
+            ),
+            ("GraphChange", json!("backend diff text")),
+            (
+                "GraphChange",
+                json!({"table":"edges","id":"a","before":null,"after":{"from":"a"}}),
+            ),
+            (
+                "ConfigurationChange",
+                json!({"table":"metadata","id":"ontology","after":{}}),
+            ),
+        ] {
+            ensure!(
+                validate_schema(&spec, &schemas[name], &bad).is_err(),
+                "accepted malformed {name}"
+            );
+        }
+        Ok(())
+    }
 }

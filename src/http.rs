@@ -644,14 +644,7 @@ fn execute(
         }
         Route::Proposals => {
             p.allowed(&[])?;
-            let mut rows = vec![];
-            for proposal in s.store.proposals().map_err(backend)? {
-                let revision = s.store.head(&proposal.branch).map_err(backend)?;
-                let mut v = json!(proposal);
-                v["revision"] = json!(revision);
-                rows.push(v);
-            }
-            json!(rows)
+            json!(crate::read::proposals(s.store.as_ref()).map_err(backend)?)
         }
         Route::Proposal => {
             p.allowed(&[])?;

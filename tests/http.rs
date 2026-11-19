@@ -453,6 +453,8 @@ fn exercise(shared: bool) {
     let prime = f.ok(&["prime", "--budget", "1"]);
     let review = f.ok(&["review", branch]);
     let history = f.ok(&["history", &id]);
+    let log = f.ok(&["history"]);
+    let cli_proposals = f.ok(&["proposals"]);
     let before = f.state();
     let http = f.serve(&[]);
     let proposal_http = f.serve(&["--proposal", branch]);
@@ -505,6 +507,15 @@ fn exercise(shared: bool) {
     );
     assert_eq!(http.get("/v0/prime?budget=1")["data"], prime);
     let proposals = http.get("/v0/proposals");
+    assert_eq!(proposals["data"], cli_proposals);
+    for proposal in proposals["data"].as_array().unwrap() {
+        assert!(
+            proposal["store_revision"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty())
+        );
+        assert!(proposal.get("revision").is_none());
+    }
     assert!(
         proposals["data"]
             .as_array()
@@ -530,6 +541,18 @@ fn exercise(shared: bool) {
         http.get(&format!("/v0/history?id={id}"))["data"]["items"],
         history
     );
+    assert_eq!(http.get("/v0/history?limit=200")["data"]["items"], log);
+    for entry in history.as_array().unwrap() {
+        assert_eq!(entry["record"]["id"], id);
+        assert_eq!(entry["actor"], "alice");
+        assert!(
+            entry["store_revision"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty())
+        );
+        chrono::DateTime::parse_from_rfc3339(entry["time"].as_str().unwrap()).unwrap();
+        assert_eq!(entry.as_object().unwrap().len(), 4);
+    }
     assert!(
         http.get("/v0/history")["data"]["items"]
             .as_array()

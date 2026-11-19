@@ -128,7 +128,7 @@ pub fn proposal_detail(store: &dyn KnowledgeStore, name: &str) -> Result<Value> 
         .context("unknown proposal")?;
     let main = store.head("main")?;
     let revision = store.head(name)?;
-    let ancestor = store.merge_base(&main, &revision)?;
+    let ancestor = store.base_revision(&main, &revision)?;
     let proposed = store::graph(store, Some(&revision))?;
     crate::markdown_import::health(store, &store::graph(store, Some(&main))?, Some(&main))?;
     crate::markdown_import::health(store, &proposed, Some(&revision))?;
@@ -140,15 +140,38 @@ pub fn proposal_detail(store: &dyn KnowledgeStore, name: &str) -> Result<Value> 
         .map(|id| json!({"id":id,"before":old.records.get(id),"after":proposed.records.get(id)}))
         .collect();
     Ok(
-        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":crate::review_token::ReviewToken::new(name,&main,&revision).encode()?,"merge_base":ancestor,"records":changes,"graph_diff":store.diff(&main,&revision,"edges")?,"configuration_diff":store.diff(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store::import_files(store, Some(&revision))?)}),
+        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":crate::review_token::ReviewToken::new(name,&main,&revision).encode()?,"base_revision":ancestor,"records":changes,"graph_changes":store.diff(&main,&revision,"edges")?,"configuration_changes":store.diff(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store::import_files(store, Some(&revision))?)}),
     )
+}
+
+/// Collection rows include their immutable proposal-head revision without
+/// changing the persisted proposal metadata.
+pub fn proposals(store: &dyn KnowledgeStore) -> Result<Vec<Value>> {
+    store
+        .proposals()?
+        .into_iter()
+        .map(|proposal| {
+            let revision = store.head(&proposal.branch)?;
+            let mut value = json!(proposal);
+            value["store_revision"] = json!(revision);
+            Ok(value)
+        })
+        .collect()
 }
 
 pub fn history(store: &dyn KnowledgeStore, revision: &str, id: Option<&str>) -> Result<Vec<Value>> {
     if let Some(id) = id {
-        store.history(revision, id)
+        store
+            .history(revision, id)?
+            .into_iter()
+            .map(|entry| Ok(serde_json::to_value(entry)?))
+            .collect()
     } else {
-        store.log(revision)
+        store
+            .log(revision)?
+            .into_iter()
+            .map(|entry| Ok(serde_json::to_value(entry)?))
+            .collect()
     }
 }
 
