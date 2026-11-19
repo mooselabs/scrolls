@@ -295,6 +295,37 @@ pub fn validate_change(
         }
     }
     for (id, old) in &before.records {
+        for sequence in before
+            .schema
+            .kinds
+            .values()
+            .filter_map(|k| k.alias_sequence.as_ref())
+        {
+            let held: Vec<_> = old
+                .aliases
+                .iter()
+                .filter(|a| sequence.number(a).is_some())
+                .collect();
+            if !held.is_empty() {
+                if !after.schema.kinds.values().any(|k| {
+                    k.alias_sequence
+                        .as_ref()
+                        .is_some_and(|s| s.prefix == sequence.prefix)
+                }) {
+                    violations.insert(format!(
+                        "ontology:immutable alias sequence {}",
+                        sequence.prefix
+                    ));
+                }
+                if after
+                    .records
+                    .get(id)
+                    .is_none_or(|r| held.iter().any(|a| !r.aliases.contains(a)))
+                {
+                    violations.insert(format!("{id}:immutable sequence alias"));
+                }
+            }
+        }
         if old.frozen && after.records.get(id) != Some(old) {
             violations.insert(format!("{id}:immutable imported compatibility history"));
         }

@@ -455,3 +455,78 @@ fn documented_invariant_accepts_a_published_public_page_with_a_staff_chapter() {
     graph.add_edge(&public.id, "chapter", &staff.id, "", "alice");
     assert!(policy::lint(&graph, &work).is_empty());
 }
+
+#[test]
+fn alias_sequence_declaration_is_validated() {
+    let mut value: serde_json::Value =
+        serde_yaml::from_str(include_str!("../examples/handbook.yaml")).unwrap();
+    value["kinds"]["page"]["alias_sequence"] = json!({"prefix":"ADR-", "width":4});
+    let schema = Schema::parse(&value.to_string()).unwrap();
+    let stored = serde_json::to_string(&schema).unwrap();
+    let restored: Schema = serde_json::from_str(&stored).unwrap();
+    assert_eq!(schema, restored);
+    for bad in [
+        json!({"prefix":"", "width":4}),
+        json!({"prefix":"ADR-", "width":0}),
+        serde_json::Value::Null,
+    ] {
+        let mut invalid = value.clone();
+        invalid["kinds"]["page"]["alias_sequence"] = bad;
+        assert!(Schema::parse(&invalid.to_string()).is_err());
+    }
+    let mut duplicate = value.clone();
+    duplicate["kinds"]["other"] = duplicate["kinds"]["page"].clone();
+    assert!(
+        Schema::parse(&duplicate.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate alias sequence prefix")
+    );
+    value["format"] = json!(1);
+    assert!(
+        Schema::parse(&value.to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field alias_sequence")
+    );
+}
+
+#[test]
+fn sequence_alias_is_immutable_once_on_main() {
+    let mut value: serde_json::Value =
+        serde_yaml::from_str(include_str!("../examples/handbook.yaml")).unwrap();
+    value["kinds"]["page"]["alias_sequence"] = json!({"prefix":"ADR-", "width":4});
+    let mut before = Graph {
+        schema: Schema::parse(&value.to_string()).unwrap(),
+        ..Default::default()
+    };
+    let mut r = before
+        .schema
+        .new_record("page", "Held", "", "alice")
+        .unwrap();
+    r.aliases = vec!["ADR-0001".into()];
+    let id = r.id.clone();
+    before.records.insert(id.clone(), r);
+    let work = scrolls::beads::Local::default();
+    for aliases in [vec![], vec!["ADR-0002".into()]] {
+        let mut after = before.clone();
+        after.records.get_mut(&id).unwrap().aliases = aliases;
+        assert!(
+            policy::validate_change(&before, &after, &Default::default(), &work)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable sequence alias")
+        );
+    }
+    let mut after = before.clone();
+    after.schema.kinds.get_mut("page").unwrap().alias_sequence = None;
+    assert!(
+        policy::validate_change(&before, &after, &Default::default(), &work)
+            .unwrap_err()
+            .to_string()
+            .contains("immutable alias sequence")
+    );
+    let mut after = before.clone();
+    after.records.get_mut(&id).unwrap().title = "Edited".into();
+    policy::validate_change(&before, &after, &Default::default(), &work).unwrap();
+}

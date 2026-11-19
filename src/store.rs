@@ -4,6 +4,82 @@ use crate::{model::*, source_import};
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Newly allocated alias by record id, in deterministic record-id order.
+pub type AliasAllocations = BTreeMap<String, String>;
+
+pub(crate) fn alias_result(mut result: Value, allocated: &AliasAllocations) -> Value {
+    if !allocated.is_empty() {
+        result["allocated_aliases"] = serde_json::json!(allocated);
+    }
+    result
+}
+
+fn allocate_aliases(main: &Graph, candidate: &mut Graph) -> Result<AliasAllocations> {
+    candidate.schema.validate()?;
+    let mut allocated = AliasAllocations::new();
+    for id in candidate.records.keys().cloned().collect::<Vec<_>>() {
+        let record = &candidate.records[&id];
+        if main.records.contains_key(&id)
+            || record.original.is_some()
+            || record.path.is_some()
+            || candidate.import_members.contains_key(&id)
+        {
+            continue;
+        }
+        let Some(sequence) = candidate
+            .schema
+            .kinds
+            .get(&record.kind)
+            .and_then(|k| k.alias_sequence.as_ref())
+        else {
+            continue;
+        };
+        if record.aliases.iter().any(|a| sequence.number(a).is_some()) {
+            continue;
+        }
+        // Decimal strings avoid an artificial upper bound on imported numbers.
+        let highest = main
+            .records
+            .values()
+            .chain(candidate.records.values())
+            .flat_map(|r| &r.aliases)
+            .filter_map(|a| sequence.number(a))
+            .map(|n| n.trim_start_matches('0'))
+            .max_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)))
+            .unwrap_or("");
+        let mut digits = highest.as_bytes().to_vec();
+        let mut carry = true;
+        for digit in digits.iter_mut().rev() {
+            if *digit == b'9' {
+                *digit = b'0';
+            } else {
+                *digit += 1;
+                carry = false;
+                break;
+            }
+        }
+        if carry {
+            digits.insert(0, b'1');
+        }
+        let number = String::from_utf8(digits)?;
+        let alias = format!(
+            "{}{:0>width$}",
+            sequence.prefix,
+            number,
+            width = sequence.width
+        );
+        candidate
+            .records
+            .get_mut(&id)
+            .expect("candidate record")
+            .aliases
+            .push(alias.clone());
+        allocated.insert(id, alias);
+    }
+    Ok(allocated)
+}
 
 /// A row after-image or edge deletion. Payloads are serialized once, preserving
 /// struct field order for existing stores and proposal protocols.
@@ -175,6 +251,16 @@ pub struct ProposalWrite<'a> {
 /// import health checks remain additional caller obligations. Receipt-only writes
 /// may skip validation. Only `bootstrap` may establish new import lint debt.
 pub trait KnowledgeStore {
+    /// Prepare aliases for NEW native records when landing on main. The caller
+    /// MUST retain the same exclusive lock/transaction from reading `main`
+    /// through committing `candidate`, proposal status and the receipt together.
+    /// Accept implementations allocate after merging, before full validation;
+    /// recovery persists and replays these exact rows, never reallocating.
+    /// Preview may use this operation without persisting its candidate. Imports
+    /// and proposal writes must not allocate. Existing main records are untouched.
+    fn allocate_aliases(&self, main: &Graph, candidate: &mut Graph) -> Result<AliasAllocations> {
+        allocate_aliases(main, candidate)
+    }
     /// Select main or a public proposal as the session's current view.
     fn select_branch(&self, branch: &str) -> Result<()>;
     /// Preserve the shared receipt/recovery envelope for an importer response.
@@ -519,6 +605,79 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("source_ownership: invalid membership")
+        );
+        Ok(())
+    }
+    #[test]
+    fn alias_allocation_follows_highest_existing_number() -> Result<()> {
+        let fixture = Fixture {
+            at: None,
+            format: None,
+            tables: BTreeMap::new(),
+        };
+        let mut main = Graph::default();
+        main.schema
+            .kinds
+            .get_mut("decision")
+            .unwrap()
+            .alias_sequence = Some(crate::schema::AliasSequence {
+            prefix: "ADR-".into(),
+            width: 4,
+        });
+        let add = |graph: &mut Graph, id: &str, aliases: &[&str]| {
+            let mut r = Record::blank("decision", id, "", "alice");
+            r.id = id.into();
+            r.aliases = aliases.iter().map(|s| (*s).into()).collect();
+            graph.records.insert(id.into(), r);
+        };
+        let mut candidate = main.clone();
+        add(&mut candidate, "sc-first", &[]);
+        assert_eq!(
+            fixture.allocate_aliases(&main, &mut candidate)?["sc-first"],
+            "ADR-0001"
+        );
+        add(
+            &mut main,
+            "sc-held",
+            &["ADR-0007", "ADR-0280", "src:ADR-0999", "ADR-12a"],
+        );
+        add(&mut main, "sc-duplicate", &["ADR-0280"]);
+        add(&mut main, "sc-old-unnumbered", &[]);
+        let mut candidate = main.clone();
+        add(&mut candidate, "sc-b", &[]);
+        add(&mut candidate, "sc-a", &[]);
+        add(&mut candidate, "sc-already", &["ADR-0003"]);
+        add(&mut candidate, "sc-imported", &[]);
+        candidate.records.get_mut("sc-imported").unwrap().original = Some(serde_json::json!({}));
+        let allocated = fixture.allocate_aliases(&main, &mut candidate)?;
+        assert_eq!(
+            allocated,
+            BTreeMap::from([
+                ("sc-a".into(), "ADR-0281".into()),
+                ("sc-b".into(), "ADR-0282".into())
+            ])
+        );
+        assert!(candidate.records["sc-old-unnumbered"].aliases.is_empty());
+        assert!(candidate.records["sc-imported"].aliases.is_empty());
+        assert_eq!(candidate.records["sc-already"].aliases, ["ADR-0003"]);
+        assert!(main.resolve("ADR-0280").is_err());
+        add(&mut main, "sc-high", &["ADR-9999"]);
+        let mut candidate = main.clone();
+        add(&mut candidate, "sc-new", &[]);
+        assert_eq!(
+            fixture.allocate_aliases(&main, &mut candidate)?["sc-new"],
+            "ADR-10000"
+        );
+        add(
+            &mut main,
+            "sc-huge",
+            &["ADR-999999999999999999999999999999"],
+        );
+        let mut candidate = main.clone();
+        add(&mut candidate, "sc-new", &[]);
+        assert_eq!(
+            fixture.allocate_aliases(&main, &mut candidate)?["sc-new"],
+            "ADR-1000000000000000000000000000000"
         );
         Ok(())
     }

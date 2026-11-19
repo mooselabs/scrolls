@@ -35,6 +35,24 @@ merges into a temporary branch, validates the resulting configuration and graph
 against current main, then advances main atomically. No transformation migrations
 or silent kind/field renames are provided.
 
+A format-2 kind can declare `alias_sequence: {prefix: ADR-, width: 4}`. Prefixes
+are nonempty and unique; widths are positive. `KnowledgeStore::allocate_aliases`
+prepares aliases for new native records relative to main. Its caller holds the
+same exclusive lock or transaction from reading main through committing records,
+proposal status and receipt. The rule is shared by direct landing, CLI review
+preview and both accept implementations. Allocation scans held aliases rather
+than storing a counter, so existing stores need no migration. It leaves imports
+and existing main records untouched. Alias-bearing sequences and their held
+aliases remain protected by full-graph change validation.
+
+Local accept allocates on the merged temporary review branch before validation,
+then commits aliases, proposal metadata and receipt together. Shared accept adds
+the allocated record after-images to its durable intent delta and fingerprint.
+Candidate validation and recovery replay that exact delta. A review preview is
+not persisted; the existing token's main-revision binding makes it stale if
+another landing changes the next number. No token or shared intent format changes
+are needed.
+
 Format 2 names the generic external work target `work`; standalone Scrolls resolves
 it to the same canonical `beads://` references as format 1's `beads` target. The
 format-specific name is selected in `Schema`, shared by relation validation,
