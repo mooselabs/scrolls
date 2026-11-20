@@ -20,7 +20,7 @@ fs2 = "0.4"
 globset = "0.4"
 hex = "0.4"
 libc = "0.2"
-mysql = { version = "26.0.1", default-features = false, features = ["minimal-rust"] }
+mysql = { version = "28.0.4", default-features = false, features = ["minimal-rust"] }
 regex = "1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 serde = { version = "1", features = ["derive"] }
