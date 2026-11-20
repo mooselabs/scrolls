@@ -4,10 +4,18 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, io::Write, path::Path};
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+use std::{collections::BTreeMap, path::Path};
+
+mod export;
+mod parity;
+
+use export::{Export, Identity, Inputs, MANIFEST, MARKER};
+pub use export::{ExportSnapshot, Options, render};
+pub use parity::{Verification, verify_export};
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub enum Format {
     Native,
     Liskov,
@@ -71,72 +79,41 @@ fn legacy_status(r: &Record, old: &Record) -> Result<String> {
     }
     .into())
 }
-pub struct Options<'a> {
-    pub import_files: &'a [crate::source_import::File],
-    pub out: &'a Path,
-    pub format: Format,
-    pub dry_run: bool,
-    pub beads: &'a crate::beads::Local,
-    pub markdown_import: Option<&'a crate::markdown_import::Plan>,
-}
-pub fn render(
-    g: &Graph,
-    files: &[SourceFile],
-    info: Option<&ImportInfo>,
-    baseline: &[Edge],
-    revision: &str,
-    options: Options<'_>,
-) -> Result<Value> {
-    crate::source_import::health(g, options.import_files)?;
-    let Options {
-        out,
-        format,
-        dry_run,
-        beads,
+fn build(
+    inputs: &Inputs<'_>,
+    identity: &Identity<'_>,
+    format: Format,
+    beads: &crate::beads::Local,
+) -> Result<Export> {
+    let Inputs {
+        graph: g,
+        files,
+        info,
+        baseline,
         import_files,
         markdown_import,
-    } = options;
-
+        routing,
+    } = *inputs;
+    crate::source_import::health(g, import_files)?;
     if format == Format::Liskov && !g.import_sources.is_empty() {
         bail!("generic sources require native export; Liskov format is unsupported");
-    }
-    if out.exists() || out.symlink_metadata().is_ok() {
-        bail!("render destination must be fresh: {}", out.display());
-    }
-    let absolute = if out.is_absolute() {
-        out.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(out)
-    };
-    for ancestor in absolute.ancestors().skip(1) {
-        if ancestor
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            bail!("render parent contains a symlink: {}", ancestor.display());
-        }
-    }
-    let parent = out
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let parent = parent
-        .canonicalize()
-        .context("render destination parent must exist")?;
-    let name = out
-        .file_name()
-        .context("render destination needs a directory name")?;
-    let destination = parent.join(name);
-    if let Some(i) = info {
-        let source = Path::new(&i.repository).join(&i.prefix);
-        if destination.starts_with(&source) {
-            bail!("render must not write inside the source documentation tree");
-        }
     }
     let mut output = BTreeMap::new();
     for f in files {
         safe_path(&f.path)?;
         insert_new(&mut output, f.path.clone(), STANDARD.decode(&f.bytes)?)?;
+    }
+    for record in g.records.values() {
+        if let Some(path) = &record.path {
+            anyhow::ensure!(
+                output.contains_key(path),
+                "record {} has no stored original at {path}",
+                record.id
+            );
+        }
+    }
+    if let Some(routing) = routing {
+        crate::markdown_import::health_content(g, files, info, routing, baseline, markdown_import)?;
     }
     for f in import_files {
         crate::source_import::path(&f.file.path)?;
@@ -293,9 +270,11 @@ pub fn render(
             supplemental(r, g, path, &locations)?.into_bytes(),
         )?;
     }
-    if format == Format::Native {
-        render_work_navigation(g, beads, &locations, &mut output)?;
-    }
+    let outside_store = if format == Format::Native {
+        render_work_navigation(g, beads, &locations, &mut output)?
+    } else {
+        Vec::new()
+    };
     let normalized: BTreeMap<_, _> = g
         .records
         .iter()
@@ -305,12 +284,16 @@ pub fn render(
             (id, r)
         })
         .collect();
+    let graph = json!({
+        "records": normalized,
+        "edges": g.edges,
+        "schema": g.schema,
+        "schema_revision": g.schema.revision(),
+    });
     insert_new(
         &mut output,
-        "scrolls/graph.json".into(),
-        serde_json::to_vec_pretty(
-            &json!({"records":normalized,"edges":g.edges,"schema":g.schema,"schema_revision":g.schema.revision()}),
-        )?,
+        export::GRAPH.into(),
+        serde_json::to_vec_pretty(&graph)?,
     )?;
     insert_new(
         &mut output,
@@ -366,8 +349,6 @@ pub fn render(
             }
         }
     }
-    let hashes: BTreeMap<_, _> = output.iter().map(|(p, b)| (p.clone(), digest(b))).collect();
-    let manifest = json!({"schema_version":1,"revision":revision,"format":format,"source":info,"files":hashes,"records":locations,"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"git_references":references,"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()});
     for path in output.keys() {
         safe_path(path)?;
         for ancestor in Path::new(path).ancestors().skip(1) {
@@ -375,74 +356,34 @@ pub fn render(
                 bail!("render file/directory collision: {path}");
             }
         }
-        if path == "RENDERED" || path == "SCROLLS-MANIFEST.json" {
+        if matches!(path.split('/').next(), Some(MARKER | MANIFEST)) {
             bail!("reserved render path {path}");
         }
     }
-    if dry_run {
-        return Ok(json!({"dry_run":true,"out":destination,"manifest":manifest}));
-    }
-    let stage = tempfile::Builder::new()
-        .prefix(".scrolls-render-")
-        .tempdir_in(&parent)?;
-    for (path, bytes) in &output {
-        let target = stage.path().join(path);
-        fs::create_dir_all(target.parent().unwrap())?;
-        let mut f = fs::File::create(&target)?;
-        f.write_all(bytes)?;
-        #[cfg(unix)]
-        if let Some(source) = files.iter().find(|source| source.path == *path) {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                &target,
-                fs::Permissions::from_mode(if source.mode & 0o111 != 0 {
-                    0o755
-                } else {
-                    0o644
-                }),
-            )?;
-        }
-        #[cfg(unix)]
-        if let Some(source) = import_files
-            .iter()
-            .find(|s| format!("sources/{}/{}", s.source_id, s.file.path) == *path)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                &target,
-                fs::Permissions::from_mode(if source.file.mode == 0o100755 {
-                    0o755
-                } else {
-                    0o644
-                }),
-            )?;
-        }
-        f.sync_all()?;
-    }
-    fs::write(
-        stage.path().join("RENDERED"),
-        format!("Scrolls 0.3.0\nDolt revision: {revision}\n"),
-    )?;
-    fs::write(
-        stage.path().join("SCROLLS-MANIFEST.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    // Reserve the final name atomically; this refuses a racing symlink/directory.
-    fs::create_dir(&destination).context("render destination appeared during export")?;
-    if let Err(e) = fs::rename(stage.path(), &destination) {
-        let _ = fs::remove_dir(&destination);
-        return Err(e.into());
-    }
-    Ok(
-        json!({"out":destination,"files":output.len(),"graph_only_imported_entities":graph_only,"imports":crate::source_import::summary(g,import_files),"git_references":references,"originals":g.import_members.iter().map(|(id,m)|(id,format!("sources/{}/{}",m.source_id,m.path))).collect::<BTreeMap<_,_>>()}),
-    )
+    let mut manifest = json!({
+        "format": format,
+        "source": info,
+        "files": output.iter().map(|(path, bytes)| (path, digest(bytes))).collect::<BTreeMap<_, _>>(),
+        "records": locations,
+        "graph_only_imported_entities": graph_only,
+        "imports": crate::source_import::summary(g, import_files),
+        "git_references": references,
+        "originals": g.import_members.iter().map(|(id, m)| (id, format!("sources/{}/{}", m.source_id, m.path))).collect::<BTreeMap<_, _>>(),
+    });
+    parity::describe(&mut manifest, identity, &graph, &outside_store)?;
+    Ok(Export {
+        files: output,
+        manifest,
+        marker: identity.marker(),
+        graph,
+    })
 }
 fn render_work_navigation(
     g: &Graph,
     beads: &crate::beads::Local,
     locations: &BTreeMap<String, String>,
     output: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // Derived navigation is emitted only for qualified work references.
     // Untouched imported documents remain byte-for-byte identical.
     let mut work = std::collections::BTreeSet::new();
@@ -475,6 +416,7 @@ fn render_work_navigation(
             }
         }
     }
+    let mut pages = Vec::new();
     for uri in work {
         let reference = crate::beads::BeadRef::parse(&uri)?;
         let path = format!(
@@ -498,9 +440,10 @@ fn render_work_navigation(
                 doc["relations"]
             ));
         }
-        insert_new(output, path, body.into_bytes())?;
+        insert_new(output, path.clone(), body.into_bytes())?;
+        pages.push(path);
     }
-    Ok(())
+    Ok(pages)
 }
 fn insert_new(output: &mut BTreeMap<String, Vec<u8>>, path: String, bytes: Vec<u8>) -> Result<()> {
     if output.contains_key(&path) {

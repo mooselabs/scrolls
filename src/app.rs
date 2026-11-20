@@ -395,6 +395,25 @@ pub fn run_with_verifier(
             json!({"schema_version":2,"ok":true,"data":{"dry_run":true,"store":cli.store,"dolt_version":storage::DOLT_VERSION}}),
         );
     }
+    if let Cmd::VerifyExport { dir } = &cli.command {
+        ensure!(
+            cli.proposal.is_none(),
+            "verify-export reads the ref from the manifest"
+        );
+        let store = if let Some(connection) = &cli.connection {
+            Store::open_shared(connection, &cli.store)?
+        } else {
+            Store::open_readonly(&cli.store, &cli.dolt)?
+        };
+        let report = crate::render::verify_export(&store, tenant, dir)?;
+        let mut response = wrap_at(json!(report), &report.reference, &report.revision);
+        if !report.mismatches.is_empty() {
+            response["ok"] = json!(false);
+            response["error"] =
+                json!({"message":"export verification failed; inspect data.mismatches"});
+        }
+        return Ok(response);
+    }
     let store = if let Some(connection) = &cli.connection {
         let recovery = match &cli.command {
             Cmd::Recover { operation, .. } => Some(operation.as_str()),
@@ -419,6 +438,26 @@ pub fn run_with_verifier(
         .context("missing store format")?;
     if selected_format > if store.is_shared() { 5 } else { 4 } {
         bail!("unsupported store format {selected_format}; use a newer Scrolls writer");
+    }
+    if let Cmd::Render { out, format } = &cli.command {
+        let revision = store.revision()?;
+        let snapshot = crate::render::ExportSnapshot::read(&store, tenant, branch, &revision)?;
+        let local = if store.is_shared() {
+            crate::beads::Local::default()
+        } else {
+            crate::beads::Local::load(&store.root)?
+        };
+        let data = snapshot.write(out, *format, cli.dry_run, &local)?;
+        let mut response = wrap_at(data, branch, &revision);
+        if store.is_shared() {
+            response["consumed"] = json!({
+                "store_id": snapshot.store_id,
+                "revision": revision,
+                "schema_revision": snapshot.graph.schema.revision(),
+                "records": snapshot.graph.records.iter().map(|(id, record)| (id, record.revision)).collect::<std::collections::BTreeMap<_,_>>(),
+            });
+        }
+        return Ok(response);
     }
     if let Some(context) = init_context {
         if branch != "main" {
@@ -1120,38 +1159,12 @@ pub fn run_with_verifier(
             }
             json!(rows)
         }
-        Cmd::Render { out, format } => {
-            crate::markdown_import::health(&store, graph, None)?;
-            crate::render::render(
-                graph,
-                &store.rows("source_files")?,
-                info.as_ref(),
-                &store
-                    .one::<Vec<Edge>>("metadata", "import_edges")?
-                    .unwrap_or_default(),
-                revision,
-                crate::render::Options {
-                    out,
-                    format: *format,
-                    dry_run: cli.dry_run,
-                    beads: &local,
-                    markdown_import: store
-                        .one::<crate::markdown_import::Plan>("metadata", "markdown_import")?
-                        .as_ref(),
-                    import_files: &if schema >= 4 {
-                        store.import_files()?
-                    } else {
-                        vec![]
-                    },
-                },
-            )?
-        }
         _ => bail!("unsupported command"),
     };
     if store.is_shared()
         && matches!(
             cli.command,
-            Cmd::Walk { .. } | Cmd::Query { .. } | Cmd::Render { .. } | Cmd::Lint
+            Cmd::Walk { .. } | Cmd::Query { .. } | Cmd::Lint
         )
     {
         // These operations evaluate the complete graph. Report that conservative

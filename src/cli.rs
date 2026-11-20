@@ -364,11 +364,17 @@ pub enum Cmd {
         #[command(subcommand)]
         command: ImportCommand,
     },
+    /// Export a Markdown snapshot and its parity manifest.
     Render {
         #[arg(long)]
         out: PathBuf,
         #[arg(long, value_enum, default_value = "native")]
         format: Format,
+    },
+    /// Verify a Markdown export against the store revision named in its manifest.
+    VerifyExport {
+        #[arg(long)]
+        dir: PathBuf,
     },
     List {
         #[command(flatten)]

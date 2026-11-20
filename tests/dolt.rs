@@ -6,6 +6,8 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
 };
+#[path = "dolt/export_parity.rs"]
+mod export_parity;
 #[path = "dolt/read_revisions.rs"]
 mod read_revisions;
 #[path = "dolt/review_tokens.rs"]
@@ -776,133 +778,6 @@ fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
         ],
         "glob",
     );
-}
-
-#[test]
-fn work_references_obey_review_retry_and_render_contracts() {
-    let f = Fixture::new();
-    let target = "beads://00000000-0000-4000-8000-000000000001/bd-a";
-    let e = f.ok(&["new", "evidence", "--title", "Readback", "--body", "facts"]);
-    let id = e["id"].as_str().unwrap();
-    let args = [
-        "--op-id",
-        "work-link",
-        "link",
-        id,
-        "produced_by",
-        target,
-        "--expect",
-        "1",
-    ];
-    let linked = f.ok(&args);
-    assert_eq!(f.ok(&args), linked);
-    f.fail(
-        &["link", id, "related_work", target, "--expect", "1"],
-        "stale edit",
-    );
-    assert_eq!(f.ok(&["beads", "refs", target])["documents"][0]["id"], id);
-    assert_eq!(
-        f.ok(&["show", id])["related_work"][0]["bead"]["resolution"],
-        "unresolved"
-    );
-    let knowledge = f.supported(id, "Conclusion");
-    let kid = knowledge["id"].as_str().unwrap();
-    let proposal = knowledge["branch"].as_str().unwrap();
-    f.ok(&[
-        "--proposal",
-        proposal,
-        "link",
-        kid,
-        "implemented_by",
-        target,
-        "--expect",
-        "1",
-    ]);
-    assert_eq!(
-        f.ok(&["beads", "refs", target])["documents"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    f.fail(
-        &["--proposal", proposal, "beads", "publish", target],
-        "main",
-    );
-    f.ok(&[
-        "review",
-        "accept",
-        proposal,
-        "--review-token",
-        &f.review_token(proposal),
-    ]);
-    assert_eq!(
-        f.ok(&["beads", "refs", target])["documents"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let packet = f.ok(&["context", "--bead", target]);
-    assert!(
-        packet["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["id"] == kid && v["summary_only"] == true)
-    );
-    let out = f.dir.path().join("native");
-    f.ok(&["render", "--out", out.to_str().unwrap()]);
-    let manifest: Value =
-        serde_json::from_slice(&std::fs::read(out.join("SCROLLS-MANIFEST.json")).unwrap()).unwrap();
-    let rendered_path = manifest["records"][id].as_str().unwrap();
-    assert!(
-        std::fs::read_to_string(out.join(rendered_path))
-            .unwrap()
-            .contains("## Related work")
-    );
-    let bead_page = std::fs::read_to_string(
-        out.join("scrolls/beads/00000000-0000-4000-8000-000000000001/bd-a.md"),
-    )
-    .unwrap();
-    assert!(bead_page.contains(rendered_path));
-    assert!(
-        out.join("scrolls/beads/00000000-0000-4000-8000-000000000001/bd-a.md")
-            .exists()
-    );
-    let legacy = f.dir.path().join("legacy");
-    f.ok(&[
-        "render",
-        "--format",
-        "liskov",
-        "--out",
-        legacy.to_str().unwrap(),
-    ]);
-    let normalized: Value =
-        serde_json::from_slice(&std::fs::read(legacy.join("scrolls/graph.json")).unwrap()).unwrap();
-    assert!(
-        normalized["edges"]
-            .as_object()
-            .unwrap()
-            .values()
-            .any(|edge| edge["to"] == target)
-    );
-    assert!(
-        std::fs::read_to_string(legacy.join(rendered_path))
-            .unwrap()
-            .contains(target)
-    );
-    let before = f.ok(&["show", id]);
-    f.ok(&[
-        "--dry-run",
-        "unlink",
-        id,
-        "produced_by",
-        target,
-        "--expect",
-        "3",
-    ]);
-    assert_eq!(before, f.ok(&["show", id]));
 }
 
 #[test]

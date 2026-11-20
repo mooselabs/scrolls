@@ -176,13 +176,8 @@ fn contexts_include_only_document_and_immediate_references() {
     );
 }
 
-#[test]
-fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
-    use scrolls::{
-        cli::Format,
-        render::{Options, render},
-    };
-    use serde_json::{Value, json};
+fn export_graph() -> Graph {
+    use serde_json::json;
     let mut g = Graph::default();
     for kind in KINDS {
         for status in lifecycle(kind).unwrap() {
@@ -195,7 +190,24 @@ fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
     }
     let ids: Vec<_> = g.records.keys().cloned().collect();
     g.records.get_mut(&ids[0]).unwrap().body = format!("[other]({}#anchor)", ids[1]);
+    g.records
+        .get_mut(&ids[0])
+        .unwrap()
+        .aliases
+        .push("export-alias".into());
     g.add_edge(&ids[0], "related", &ids[1], "preserved", "bob");
+    g
+}
+
+#[test]
+fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
+    use scrolls::{
+        cli::Format,
+        render::{Options, render},
+    };
+    use serde_json::{Value, json};
+    let g = export_graph();
+    let ids: Vec<_> = g.records.keys().cloned().collect();
     let dir = tempfile::tempdir().unwrap();
     for format in [Format::Native, Format::Liskov] {
         let out = dir.path().join(format!("{format:?}"));
@@ -253,6 +265,110 @@ fn every_native_lifecycle_exports_losslessly_with_stable_paths() {
 }
 
 #[test]
+fn export_manifest_v2_accounts_for_every_record_edge_and_file() {
+    use scrolls::render::{Format, Options, render};
+    use serde_json::{Value, json};
+    let graph = export_graph();
+    let dir = tempfile::tempdir().unwrap();
+    for format in [Format::Native, Format::Liskov] {
+        let out = dir.path().join(format!("{format:?}"));
+        render(
+            &graph,
+            &[],
+            None,
+            &[],
+            "rev",
+            Options {
+                import_files: &[],
+                out: &out,
+                format,
+                dry_run: false,
+                beads: &scrolls::beads::Local::default(),
+                markdown_import: None,
+            },
+        )
+        .unwrap();
+        let read_json = |path: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(out.join(path)).unwrap()).unwrap()
+        };
+        let manifest = read_json("SCROLLS-MANIFEST.json");
+        let exported = read_json("scrolls/graph.json");
+        assert_eq!(manifest["schema_version"], 2);
+        assert_eq!(manifest["schema_revision"], exported["schema_revision"]);
+        assert_eq!(manifest["ref"], "main");
+        assert_eq!(manifest["scrolls_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["generated"], true);
+        assert_eq!(manifest["read_only"], true);
+        assert_eq!(manifest["counts"]["edges"], graph.edges.len());
+        assert_eq!(
+            manifest["counts"]["files"],
+            manifest["files"].as_object().unwrap().len()
+        );
+        assert_eq!(
+            manifest["records"].as_object().unwrap().len(),
+            graph.records.len()
+        );
+        assert_eq!(
+            manifest["record_details"].as_object().unwrap().len(),
+            graph.records.len()
+        );
+        let mut counts = std::collections::BTreeMap::new();
+        for (id, record) in &graph.records {
+            let path = manifest["records"][id].as_str().unwrap();
+            assert!(out.join(path).is_file());
+            let mut canonical = exported["records"][id].clone();
+            canonical.sort_all_objects();
+            assert_eq!(
+                manifest["record_details"][id],
+                json!({
+                    "kind": record.kind,
+                    "revision": record.revision,
+                    "aliases": record.aliases,
+                    "digest": digest(serde_json::to_vec(&canonical).unwrap()),
+                })
+            );
+            *counts.entry(&record.kind).or_insert(0usize) += 1;
+        }
+        assert_eq!(manifest["counts"]["records_by_kind"], json!(counts));
+        for (path, hash) in manifest["files"].as_object().unwrap() {
+            assert_eq!(hash, &digest(std::fs::read(out.join(path)).unwrap()));
+        }
+    }
+}
+
+#[test]
+fn render_refuses_a_record_without_a_file() {
+    use scrolls::render::{Format, Options, render};
+    let mut record = Record::new("note", "Missing", "body", "alice").unwrap();
+    record.path = Some("missing.md".into());
+    let id = record.id.clone();
+    let graph = Graph {
+        records: [(id.clone(), record)].into(),
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export");
+    let error = render(
+        &graph,
+        &[],
+        None,
+        &[],
+        "rev",
+        Options {
+            import_files: &[],
+            out: &out,
+            format: Format::Native,
+            dry_run: false,
+            beads: &scrolls::beads::Local::default(),
+            markdown_import: None,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(&id), "{error}");
+    assert!(!out.exists());
+}
+
+#[test]
 fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use scrolls::{
@@ -303,12 +419,12 @@ fn legacy_number_derivation_is_read_only_and_export_collisions_fail() {
     assert_eq!(std::fs::read(out.join(r.path.unwrap())).unwrap(), bytes);
     let collision = SourceFile {
         path: "scrolls/graph.json".into(),
-        ..file
+        ..file.clone()
     };
     assert!(
         render(
             &g,
-            &[collision],
+            &[file, collision],
             None,
             &[],
             "rev",

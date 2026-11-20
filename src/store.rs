@@ -387,6 +387,7 @@ pub trait KnowledgeStore {
         hash: &str,
     ) -> Result<Option<Value>>;
     fn receipt(&self, op: &str, hash: &str) -> Result<Option<Value>>;
+    /// Resolve a ref or a full immutable revision to its canonical revision.
     fn head(&self, reference: &str) -> Result<String>;
     fn revision(&self) -> Result<String>;
     fn branches(&self) -> Result<Vec<String>>;
@@ -428,7 +429,7 @@ pub(crate) fn one<T: DeserializeOwned>(
         .transpose()
 }
 
-fn keyed_rows<T: DeserializeOwned>(
+pub(crate) fn keyed_rows<T: DeserializeOwned>(
     store: &dyn KnowledgeStore,
     table: &str,
     at: Option<&str>,

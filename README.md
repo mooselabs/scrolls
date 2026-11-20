@@ -154,7 +154,8 @@ record's numeric revision and write results to obtain proposal branch names.
 | `scrolls --role human review accept BRANCH --review-token TOKEN` | Accept a reviewed proposal. |
 | `scrolls history ID` | Inspect historical record snapshots. |
 | `scrolls lint` / `scrolls doctor` | Check review dates, graph integrity, and store health. |
-| `scrolls render --out NEW_DIR` | Export a fresh Markdown tree and graph. |
+| `scrolls render --out NEW_DIR` | Export a fresh Markdown snapshot with a parity manifest. |
+| `scrolls verify-export --dir DIR` | Verify the files against the store revision named in the export. |
 
 Bodies accept `--body`, `--body-file PATH`, `--body-file -`, or piped stdin.
 `edit` opens `$VISUAL` / `$EDITOR` on a terminal; `--editor` selects that behavior
@@ -367,8 +368,22 @@ assets. Repeating the same source commit is safe; importing a changed source
 requires a new store. Unchanged imported files render byte-for-byte. Imported
 backlog, epic, milestone, question, and untyped archive records remain immutable.
 
-Both native and Liskov exports include every native kind, `scrolls/graph.json`,
-and `SCROLLS-MANIFEST.json`. Native decisions use stable `sc-…` identities and
+Both export formats generate a read-only snapshot at one store revision.
+It includes a Markdown file for every record, the captured original files,
+and `scrolls/graph.json` with every record, field, alias, edge and the active
+schema. The store retains history, other proposals, operation receipts and
+store metadata outside the snapshot.
+
+`SCROLLS-MANIFEST.json` v2 records the store identity, ref, store and schema
+revisions, Scrolls version, record paths and details, file SHA-256 hashes,
+counts, a graph content digest and the cache-derived Beads page paths. Check
+the hashes, counts and record entries against the exported files for an
+offline integrity check. Use `scrolls verify-export --dir ./liskov-docs-export`
+with the original store to check snapshot parity. It reports a moved ref
+head as stale and still verifies the named revision. See the
+[export contract](docs/commands.md#markdown-export-and-verification).
+
+Native decisions use stable `sc-…` identities and
 separate views. A declared sequence gives native decisions ADR lookup aliases on
 landing; imported ADR numbers remain metadata and aliases. Native allocated
 numbers do not populate imported-number metadata. Local
