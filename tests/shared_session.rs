@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "shared_session/review_tokens.rs"]
+mod review_tokens;
+
 struct Server {
     dir: tempfile::TempDir,
     child: Option<Child>,
@@ -1456,48 +1459,6 @@ impl Server {
             .query_first("SELECT DOLT_HASHOF('HEAD')")
             .unwrap()
             .unwrap()
-    }
-}
-#[test]
-fn shared_review_recovers_each_acceptance_boundary_without_origin_files() {
-    for boundary in [
-        "CALL DOLT_BRANCH(",
-        "SELECT * FROM dolt_conflicts",
-        "accept-commit",
-        "CALL DOLT_MERGE('--ff-only'",
-    ] {
-        let mut s = Server::handbook();
-        let p = s.proposed_page("propose", "Recover me");
-        let branch = p["branch"].as_str().unwrap();
-        let token = s.token(branch);
-        let before = s.main_head();
-        let needle = if boundary == "accept-commit" {
-            literal(&format!("accept {branch} by alice"))
-        } else {
-            boundary.into()
-        };
-        s.interrupted(
-            &[
-                "--op-id",
-                "accept",
-                "review",
-                "accept",
-                branch,
-                "--review-token",
-                &token,
-            ],
-            needle,
-        );
-        let intent = s.intent("accept");
-        assert_eq!(intent["plan"]["base"], before);
-        let r = s.call("second-machine", &["recover", "accept", "--resume"], true);
-        assert_eq!(r["data"]["proposal"]["status"], "accepted");
-        assert_ne!(s.main_head(), before);
-        assert_eq!(
-            r["data"],
-            s.call("third-machine", &["recover", "accept", "--resume"], true)["data"]
-        );
-        s.call("reader", &["doctor"], true);
     }
 }
 #[test]

@@ -933,8 +933,12 @@ fn confirm_accept_request(s: &Store, context: &OperationContext, i: &Intent) -> 
             "recovery review token changed"
         );
     }
-    crate::review_token::ReviewToken::decode(original_token)?
-        .check(proposal, &current, &proposed)?;
+    crate::review_token::ReviewToken::require_current(
+        original_token,
+        proposal,
+        &current,
+        &proposed,
+    )?;
     ensure!(
         current == *base && proposed == *proposal_revision,
         "stale_review: original inspected revisions changed"

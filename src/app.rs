@@ -1026,9 +1026,12 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
             "review accept requires --review-token; run scrolls review {name} and pass its token"
         )
     })?;
-    crate::review_token::ReviewToken::decode(token)
-        .with_context(|| format!("run scrolls review {name} again and pass its review_token"))?
-        .check(&name, &base, &proposal_revision)?;
+    crate::review_token::ReviewToken::require_current(
+        token,
+        &proposal.branch,
+        &base,
+        &proposal_revision,
+    )?;
     let result = s.accept(
         &cli.operation_context(op, hash)?,
         main_graph,

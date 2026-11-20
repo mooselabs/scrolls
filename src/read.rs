@@ -139,8 +139,9 @@ pub fn proposal_detail(store: &dyn KnowledgeStore, name: &str) -> Result<Value> 
         .filter(|id| old.records.get(*id) != proposed.records.get(*id))
         .map(|id| json!({"id":id,"before":old.records.get(id),"after":proposed.records.get(id)}))
         .collect();
+    let review_token = crate::review_token::ReviewToken::issue(&proposal.branch, &main, &revision)?;
     Ok(
-        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":crate::review_token::ReviewToken::new(name,&main,&revision).encode()?,"base_revision":ancestor,"records":changes,"graph_changes":store.diff(&main,&revision,"edges")?,"configuration_changes":store.diff(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store::import_files(store, Some(&revision))?)}),
+        json!({"proposal":proposal,"main_revision":main,"proposal_revision":revision,"review_token":review_token,"base_revision":ancestor,"records":changes,"graph_changes":store.diff(&main,&revision,"edges")?,"configuration_changes":store.diff(&main,&revision,"metadata")?,"imports":crate::source_import::summary(&proposed,&store::import_files(store, Some(&revision))?)}),
     )
 }
 
