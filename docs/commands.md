@@ -264,9 +264,17 @@ ownership and proposal rules. See [the complete contract](import-profiles.md).
 
 `render` writes a fresh, generated read-only tree. Main is the default ref.
 Use `scrolls --proposal PROPOSAL render --out NEW_DIR` for a proposal ref.
+`render` writes executable originals with mode `0555` on Unix and every other
+file with `0444`, including the manifest and marker. To refresh an export, make
+changes through the store, render to a fresh directory, and replace the old
+export directory.
 `--dry-run` returns the manifest without creating the destination. Render
 requires a stored original for each record with an imported path and refuses
 the export with the record ID if its original is missing.
+
+Both `import markdown` and `import plan markdown` refuse a pinned Git tree
+containing `SCROLLS-MANIFEST.json` and `RENDERED` in the same directory at or
+beneath the selected source directory. The error names the export directory.
 
 Each export contains one Markdown view per record, captured originals and
 `scrolls/graph.json`, which carries the complete records, fields, aliases,

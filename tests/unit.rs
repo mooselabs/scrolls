@@ -336,6 +336,70 @@ fn export_manifest_v2_accounts_for_every_record_edge_and_file() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn export_files_are_written_without_write_permission() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use scrolls::render::{Format, Options, render};
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let graph = export_graph();
+    let originals = [("raw/run.sh", 0o100755), ("raw/plain.md", 0o100644)].map(|(path, mode)| {
+        let bytes = b"original\n";
+        SourceFile {
+            path: path.into(),
+            bytes: STANDARD.encode(bytes),
+            sha256: digest(bytes),
+            git_oid: String::new(),
+            mode,
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    for format in [Format::Native, Format::Liskov] {
+        let out = dir.path().join("export");
+        render(
+            &graph,
+            &originals,
+            None,
+            &[],
+            "rev",
+            Options {
+                import_files: &[],
+                out: &out,
+                format,
+                dry_run: false,
+                beads: &scrolls::beads::Local::default(),
+                markdown_import: None,
+            },
+        )
+        .unwrap();
+        let executable = out.join("raw/run.sh");
+        assert!(executable.is_file());
+        assert!(out.join("raw/plain.md").is_file());
+        let mut directories = vec![out.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                let path = entry.path();
+                if metadata.is_dir() {
+                    directories.push(path);
+                } else {
+                    assert!(metadata.is_file(), "{}", path.display());
+                    let expected = if path == executable { 0o555 } else { 0o444 };
+                    assert_eq!(
+                        metadata.permissions().mode() & 0o777,
+                        expected,
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(out).unwrap();
+    }
+}
+
 #[test]
 fn render_refuses_a_record_without_a_file() {
     use scrolls::render::{Format, Options, render};

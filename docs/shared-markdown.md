@@ -38,6 +38,10 @@ apply. A failed or timed-out write requires reconciliation with its original
 operation ID. Bulk connections can explicitly select the existing bounded
 `io_timeout_seconds` setting.
 
+Markdown import refuses a pinned Git tree with a Scrolls export at or beneath
+the selected directory. A `SCROLLS-MANIFEST.json` beside `RENDERED` identifies
+the export. A refusal leaves the store and plan destination untouched.
+
 The existing local mapping preserves original Markdown bytes and modes,
 metadata, stable IDs, ADR/work aliases, repository entities, relationships,
 routing and historical lint debt. Originals and the imported baseline are
@@ -69,6 +73,10 @@ existing journaled proposal/review operations. Preserve indeterminate state;
 never substitute a fresh operation ID to guess whether publication succeeded.
 
 ## Generated Markdown references
+
+Exports contain read-only files. On Unix, executable originals use mode `0555`
+and all other files use `0444`. Edit through the store, render to a fresh
+directory, and replace the previous export directory.
 
 Both export formats keep imported-document links relative. Verified references
 to other pinned Git files or directories become GitHub `blob`/`tree` URLs at the

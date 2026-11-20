@@ -462,10 +462,19 @@ fn read_files(
     markdown_only: bool,
 ) -> Result<Vec<SourceFile>> {
     let prefix = format!("{prefix}/");
-    let entries: Vec<_> = inventory(repo, commit)?
+    let mut entries: Vec<_> = inventory(repo, commit)?
         .into_iter()
-        .filter(|e| e.path.starts_with(&prefix) && (!markdown_only || e.path.ends_with(".md")))
+        .filter(|e| e.path.starts_with(&prefix))
         .collect();
+    if let Some(path) = crate::render::export_root(entries.iter().map(|e| e.path.as_str())) {
+        bail!(
+            "refusing Scrolls export at {}. Edit through the store.",
+            path.display()
+        );
+    }
+    if markdown_only {
+        entries.retain(|e| e.path.ends_with(".md"));
+    }
     anyhow::ensure!(
         entries.len() <= crate::source_import::FILE_COUNT,
         "input_limit: too many source files"

@@ -1,4 +1,4 @@
-use super::{Format, build};
+use super::{Format, build, profile_original_path};
 use crate::{
     beads, markdown_import,
     model::{Edge, Graph, ImportInfo, SourceFile, TenantId},
@@ -7,7 +7,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fs, io::Write, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::Path,
+};
 
 pub(super) const MANIFEST: &str = "SCROLLS-MANIFEST.json";
 pub(super) const MARKER: &str = "RENDERED";
@@ -121,7 +126,7 @@ impl<'a> ExportSnapshot<'a> {
         }
     }
 
-    /// Publish the export to a fresh directory or return its manifest in a dry run.
+    /// Publish read-only files in a fresh directory or return the manifest in a dry run.
     pub fn write(
         &self,
         out: &Path,
@@ -245,44 +250,27 @@ fn write(
     let stage = tempfile::Builder::new()
         .prefix(".scrolls-render-")
         .tempdir_in(&parent)?;
+    let executables: BTreeSet<_> = files
+        .iter()
+        .filter(|source| source.mode & 0o111 != 0)
+        .map(|source| source.path.clone())
+        .chain(
+            import_files
+                .iter()
+                .filter(|source| source.file.mode == 0o100755)
+                .map(|source| profile_original_path(&source.source_id, &source.file.path)),
+        )
+        .collect();
     for (path, bytes) in &export.files {
         let target = stage.path().join(path);
         fs::create_dir_all(target.parent().unwrap())?;
-        let mut f = fs::File::create(&target)?;
-        f.write_all(bytes)?;
-        #[cfg(unix)]
-        if let Some(source) = files.iter().find(|source| source.path == *path) {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                &target,
-                fs::Permissions::from_mode(if source.mode & 0o111 != 0 {
-                    0o755
-                } else {
-                    0o644
-                }),
-            )?;
-        }
-        #[cfg(unix)]
-        if let Some(source) = import_files
-            .iter()
-            .find(|s| format!("sources/{}/{}", s.source_id, s.file.path) == *path)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                &target,
-                fs::Permissions::from_mode(if source.file.mode == 0o100755 {
-                    0o755
-                } else {
-                    0o644
-                }),
-            )?;
-        }
-        f.sync_all()?;
+        write_read_only(&target, bytes, executables.contains(path))?;
     }
-    fs::write(stage.path().join(MARKER), &export.marker)?;
-    fs::write(
-        stage.path().join(MANIFEST),
-        serde_json::to_vec_pretty(&export.manifest)?,
+    write_read_only(&stage.path().join(MARKER), export.marker.as_bytes(), false)?;
+    write_read_only(
+        &stage.path().join(MANIFEST),
+        &serde_json::to_vec_pretty(&export.manifest)?,
+        false,
     )?;
     // Reserve the final name atomically; this refuses a racing symlink/directory.
     fs::create_dir(&destination).context("render destination appeared during export")?;
@@ -298,4 +286,24 @@ fn write(
         "git_references": export.manifest["git_references"],
         "originals": export.manifest["originals"],
     }))
+}
+
+fn write_read_only(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if executable { 0o555 } else { 0o444 };
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = executable;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
+    }
+    file.sync_all()?;
+    Ok(())
 }
