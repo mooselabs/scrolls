@@ -59,9 +59,11 @@ pub(crate) fn receipt_changes(
     )?))
 }
 pub(crate) fn wrap(store: &dyn KnowledgeStore, data: Value, branch: &str) -> Result<Value> {
-    Ok(
-        json!({"schema_version":2,"ok":true,"revision":store.revision()?,"branch":branch,"data":data}),
-    )
+    Ok(wrap_at(data, branch, &store.revision()?))
+}
+
+pub(crate) fn wrap_at(data: Value, branch: &str, revision: &str) -> Value {
+    json!({"schema_version":2,"ok":true,"revision":revision,"branch":branch,"data":data})
 }
 pub(crate) fn validate_review_candidate(
     main_graph: &Graph,

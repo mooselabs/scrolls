@@ -32,6 +32,11 @@ pub fn human(envelope: &Value) -> String {
     let data = &envelope["data"];
     let mut text = if data["record"].is_object() {
         let mut out = record(&data["record"]);
+        if let (Some(label), Some(revision)) =
+            (data["label"].as_str(), data["resolved_revision"].as_str())
+        {
+            out.push_str(&format!("\nLabel {label} resolved to {revision}\n"));
+        }
         if let Some(uri) = data["uri"].as_str() {
             out.push_str(&format!("\nReference: {uri}\n"));
         }
