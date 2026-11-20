@@ -1,6 +1,6 @@
 //! Engine review validation and operation input, independent of CLI parsing.
 use crate::{
-    model::{Graph, Role, now},
+    model::{Graph, Role, TenantId, now},
     policy,
     store::{Change, ChangeSet, KnowledgeStore},
 };
@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 pub struct OperationContext {
+    pub tenant: TenantId,
     pub op_id: String,
     pub args_hash: String,
     // Recovery distinguishes caller-supplied IDs from resolved IDs.
@@ -19,6 +20,13 @@ pub struct OperationContext {
     pub command: Value,
     pub review: Option<ReviewRequest>,
     pub recovery: Option<RecoveryRequest>,
+}
+
+impl OperationContext {
+    /// Refuse a request for another tenant before accessing any store data.
+    pub fn check_tenant(&self, store: &dyn KnowledgeStore) -> Result<()> {
+        self.tenant.check_served_by(store.tenant())
+    }
 }
 
 pub struct ReviewRequest {

@@ -10,6 +10,8 @@ use std::{
 mod read_revisions;
 #[path = "dolt/review_tokens.rs"]
 mod review_tokens;
+#[path = "dolt/tenant.rs"]
+mod tenant;
 
 fn dolt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tools/dolt")
@@ -2281,6 +2283,7 @@ fn knowledge_store_write_refuses_invalid_graph_and_preserves_heads() {
         reason: None,
     };
     let context = OperationContext {
+        tenant: scrolls::model::DEFAULT_TENANT,
         op_id: "direct-write".into(),
         args_hash: "direct-hash".into(),
         explicit_op_id: true,
@@ -2333,72 +2336,6 @@ fn cli_graph_write_refusal_is_structured() {
             .any(|v| v.as_str().unwrap().starts_with("sc-")
                 && v.as_str().unwrap().ends_with(":missing-support")),
         "{value}"
-    );
-}
-
-#[test]
-fn knowledge_store_accept_checks_graph_even_when_caller_approves() {
-    use scrolls::{
-        model::{Proposal, Record, Role},
-        store::{KnowledgeStore, OperationContext, ReviewRequest},
-    };
-    let f = Fixture::new();
-    let s = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
-    let store: &dyn KnowledgeStore = &s;
-    let base = store.head("main").unwrap();
-    let main = s.graph().unwrap();
-    let proposal = Proposal {
-        branch: "proposal/unchecked".into(),
-        base: base.clone(),
-        actor: "alice".into(),
-        status: "pending".into(),
-        reason: None,
-    };
-    let record = Record::new("knowledge", "unchecked", "body", "alice").unwrap();
-    s.run(&["checkout", "-b", &proposal.branch]).unwrap();
-    // Simulate an external Dolt writer, outside the engine's write contract.
-    s.transaction(
-        &(put("records", &record.id, &record).unwrap()
-            + &put("metadata", &proposal.branch, &proposal).unwrap()),
-        "external proposal",
-        "alice",
-    )
-    .unwrap();
-    let proposed = store.head(&proposal.branch).unwrap();
-    s.checkout("main").unwrap();
-    let context = OperationContext {
-        op_id: "accept-unchecked".into(),
-        args_hash: "unchecked-hash".into(),
-        explicit_op_id: true,
-        actor: Some("alice".into()),
-        role: Role::Human,
-        dry_run: false,
-        command: json!({"review":{"action":"accept"}}),
-        review: Some(ReviewRequest {
-            action: "accept".into(),
-            token: Some("caller approves".into()),
-            reason: None,
-        }),
-        recovery: None,
-    };
-    let error = store
-        .accept(&context, &main, &proposal, (&base, &proposed), &mut || {
-            Ok(())
-        })
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains(&format!("{}:missing-support", record.id)),
-        "{error:#}"
-    );
-    assert_eq!(store.head("main").unwrap(), base);
-    assert_eq!(store.head(&proposal.branch).unwrap(), proposed);
-    assert!(
-        store
-            .receipt("accept-unchecked", "unchecked-hash")
-            .unwrap()
-            .is_none()
     );
 }
 

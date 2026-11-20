@@ -13,10 +13,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/pinned_scrolls.rs"]
+mod pinned_scrolls;
 #[path = "shared_session/read_revisions.rs"]
 mod read_revisions;
 #[path = "shared_session/review_tokens.rs"]
 mod review_tokens;
+use pinned_scrolls::{build_0_3_0, build_pinned};
 
 struct Server {
     dir: tempfile::TempDir,
@@ -1046,9 +1049,7 @@ fn shared_input_files_replay_from_different_client_paths() {
 
 #[test]
 fn pinned_030_executable_refuses_shared_format_without_database_changes() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join(".verification/scrolls-0.3.0");
-    let build_dir = build_pinned(&source, "3ae0a38dcc4da0a508e82ce4737d226e06d6f2b4");
+    let build_dir = build_0_3_0();
     let target = build_dir.path();
     let mut s = Server::empty();
     let initialized = s.init(None);
@@ -1551,41 +1552,6 @@ fn shared_review_resumes_interrupted_abandonment_control() {
     let result = s.call("second", &["recover", "cancel", "--resume"], true);
     assert_eq!(result["data"]["abandoned"], "accept");
     s.call("reader", &["doctor"], true);
-}
-
-fn build_pinned(source: &Path, revision: &str) -> tempfile::TempDir {
-    let pin = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("pinned baseline checkout required, see docs/shared-authoring.md");
-    assert!(pin.status.success(), "pinned baseline checkout required");
-    assert_eq!(String::from_utf8_lossy(&pin.stdout).trim(), revision);
-    let clean = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["status", "--porcelain"])
-        .output()
-        .unwrap();
-    assert!(
-        clean.status.success() && clean.stdout.is_empty(),
-        "baseline source must be clean"
-    );
-    let build_dir = tempfile::tempdir().unwrap();
-    let target = build_dir.path();
-    let build = Command::new("cargo")
-        .args(["build", "--locked", "--bin", "scrolls"])
-        .current_dir(source)
-        .env("CARGO_TARGET_DIR", target)
-        .output()
-        .unwrap();
-    assert!(
-        build.status.success(),
-        "{}",
-        String::from_utf8_lossy(&build.stderr)
-    );
-    build_dir
 }
 
 #[test]
@@ -4855,6 +4821,7 @@ fn shared_accept_uses_store_main_instead_of_caller_baseline() {
     let false_baseline = s.graph().unwrap();
     store.select_branch("main").unwrap();
     let context = OperationContext {
+        tenant: scrolls::model::DEFAULT_TENANT,
         op_id: "accept-external".into(),
         args_hash: "external-hash".into(),
         explicit_op_id: true,

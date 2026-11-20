@@ -81,7 +81,7 @@ impl View<'_> {
     ) -> Result<LabelledDocument> {
         let id = self.resolve(record)?;
         let revision = crate::label::resolve(store, &id, name, at)?;
-        let graph = store::graph(store, Some(&revision))?;
+        let graph = store::graph(store, store.tenant(), Some(&revision))?;
         ensure!(
             graph.records.contains_key(&id),
             "label_target: record {id} label {name:?} has no record at revision {revision}"
@@ -157,10 +157,14 @@ pub fn proposal_detail(store: &dyn KnowledgeStore, name: &str) -> Result<Value> 
     let main = store.head("main")?;
     let revision = store.head(name)?;
     let ancestor = store.base_revision(&main, &revision)?;
-    let proposed = store::graph(store, Some(&revision))?;
-    crate::markdown_import::health(store, &store::graph(store, Some(&main))?, Some(&main))?;
+    let proposed = store::graph(store, store.tenant(), Some(&revision))?;
+    crate::markdown_import::health(
+        store,
+        &store::graph(store, store.tenant(), Some(&main))?,
+        Some(&main),
+    )?;
     crate::markdown_import::health(store, &proposed, Some(&revision))?;
-    let old = store::graph(store, Some(&ancestor))?;
+    let old = store::graph(store, store.tenant(), Some(&ancestor))?;
     let ids: BTreeSet<_> = old.records.keys().chain(proposed.records.keys()).collect();
     let changes: Vec<_> = ids
         .into_iter()
