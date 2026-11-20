@@ -1081,8 +1081,6 @@ impl KnowledgeStore for Store {
     ) -> Result<Value> {
         let s = self;
         let name = &proposal.branch;
-        let op = context.op_id.as_str();
-        let hash = context.args_hash.as_str();
         let who = context.actor.as_deref().context("actor")?;
         let reason = proposal
             .reason
@@ -1100,13 +1098,7 @@ impl KnowledgeStore for Store {
         if !context.dry_run {
             s.checkout(name)?;
             let mut changes = ChangeSet::from(Change::put("metadata", name, proposal)?);
-            changes.extend(crate::review::receipt_changes(
-                op,
-                hash,
-                who,
-                &context.command,
-                &result,
-            )?);
+            changes.extend(crate::review::receipt_changes(context, &result)?);
             s.commit(&changes, &format!("reject {name}: {reason}"), who)?;
         }
         Ok(if context.dry_run {
@@ -1133,7 +1125,6 @@ impl KnowledgeStore for Store {
         let (base, proposal_revision) = revisions;
         let who = context.actor.as_deref().context("actor")?;
         let op = context.op_id.as_str();
-        let hash = context.args_hash.as_str();
         let review = context.review.as_ref().context("not a review decision")?;
         let token = review
             .token
@@ -1172,13 +1163,7 @@ impl KnowledgeStore for Store {
                 &allocated,
             );
             let mut changes = ChangeSet::from(Change::put("metadata", &name, &proposal)?);
-            changes.extend(crate::review::receipt_changes(
-                op,
-                hash,
-                who,
-                &context.command,
-                &result,
-            )?);
+            changes.extend(crate::review::receipt_changes(context, &result)?);
             s.commit(&changes, &format!("accept {name} by {who}"), who)?;
             if s.head("main")? != base {
                 bail!("main changed after validation; validated merge retained on {temp}")

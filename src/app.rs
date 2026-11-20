@@ -1,5 +1,6 @@
 use crate::{
     cli::*,
+    credential::{self, Authorization, CredentialVerifier, LabelMove},
     model::*,
     policy, query,
     review::{receipt_changes, wrap, wrap_at},
@@ -67,6 +68,7 @@ impl Cli {
         &self,
         op: &str,
         hash: &str,
+        role: Role,
     ) -> Result<crate::review::OperationContext> {
         use crate::review::{OperationContext, RecoveryRequest, ReviewRequest};
         let review = match &self.command {
@@ -101,13 +103,132 @@ impl Cli {
             args_hash: hash.into(),
             explicit_op_id: self.op_id.is_some(),
             actor: self.actor.clone(),
-            role: self.role,
+            role,
             dry_run: self.dry_run,
             command: serde_json::to_value(&self.command)?,
             review,
             recovery,
         })
     }
+}
+
+struct OperationInputs {
+    body_value: Option<String>,
+    imported: Option<crate::import::Imported>,
+    file_content: Option<String>,
+    hash: String,
+    resolved_record: Option<String>,
+    publication_revision: Option<String>,
+}
+
+fn operation_inputs(cli: &Cli, graph: Option<&Graph>) -> Result<OperationInputs> {
+    let mut body_value = None;
+    let mut body_supplied = true;
+    match &cli.command {
+        Cmd::New(n) => body_value = Some(body(&n.body, "", false)?.0),
+        Cmd::Edit { id, body: b, .. } => {
+            let graph = graph.context("edit requires a graph snapshot")?;
+            let id = graph.resolve(id)?;
+            let (value, supplied) = body(b, &graph.records[&id].body, true)?;
+            body_value = Some(value);
+            body_supplied = supplied;
+        }
+        _ => {}
+    }
+    let imported = if let Cmd::Import {
+        command: ImportCommand::Markdown { dir, rev },
+    } = &cli.command
+    {
+        Some(crate::import::import(dir, rev, actor(cli)?)?)
+    } else {
+        None
+    };
+    let file_content = match &cli.command {
+        Cmd::Batch { file }
+        | Cmd::Schema {
+            command: SchemaCommand::Apply { file, .. },
+        } => Some(fs::read_to_string(file)?),
+        _ => None,
+    };
+    // Fingerprint effective bodies, not only stdin/file paths. Output flags and op-id are not arguments.
+    let mut fingerprint = json!({"command":cli.command,"body":if cli.connection.is_some() && !body_supplied {None} else {body_value.as_ref()},"actor":cli.actor,"role":cli.role,"proposal":cli.proposal,"source_commit":imported.as_ref().map(|i|&i.info.commit)});
+    if let Some(content) = &file_content {
+        fingerprint["file_content"] = json!(content);
+    }
+    if cli.connection.is_some() {
+        // Machine-local input locations are not operation identity. Their exact
+        // bytes are already included above; a second client can supply its copy.
+        fn normalize_paths(value: &mut Value) {
+            if let Some(object) = value.as_object_mut() {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "body_file" | "file") && !value.is_null() {
+                        *value = json!("<input-content>");
+                    } else {
+                        normalize_paths(value);
+                    }
+                }
+            }
+        }
+        normalize_paths(&mut fingerprint["command"]);
+    }
+    Ok(OperationInputs {
+        body_value,
+        imported,
+        file_content,
+        hash: digest(serde_json::to_vec(&fingerprint)?),
+        resolved_record: None,
+        publication_revision: None,
+    })
+}
+
+fn authorization_inputs(cli: &Cli) -> Result<OperationInputs> {
+    let (record, publication) = match &cli.command {
+        Cmd::Edit { id, .. }
+        | Cmd::Label {
+            command: LabelCommand::Move { id, .. },
+        } => (Some(id), None),
+        Cmd::Beads {
+            command: command @ BeadsCommand::Publish(_),
+        } => (None, Some(command)),
+        _ => return operation_inputs(cli, None),
+    };
+
+    // These commands need a snapshot for authorization input. Opening for
+    // writes can run recovery, so inspect the committed revision read-only.
+    let store = if let Some(connection) = &cli.connection {
+        Store::open_shared(connection, &cli.store)?
+    } else {
+        Store::open_readonly(&cli.store, &cli.dolt)?
+    };
+    let revision = store.head(cli.proposal.as_deref().unwrap_or("main"))?;
+    if let Some(command) = publication {
+        let mut inputs = operation_inputs(cli, None)?;
+        inputs.hash = crate::beads::publication_fingerprint(command, actor(cli)?, &revision)?;
+        inputs.publication_revision = Some(revision);
+        return Ok(inputs);
+    }
+
+    let graph = store.graph_at(&revision)?;
+    drop(store);
+    let mut inputs = operation_inputs(cli, Some(&graph))?;
+    inputs.resolved_record = record.map(|id| graph.resolve(id)).transpose()?;
+    Ok(inputs)
+}
+
+fn authorize_command(cli: &Cli, authorization: &Authorization<'_>, op: &str) -> Result<Role> {
+    if !authorization.requires_verification() {
+        return Ok(cli.role);
+    }
+    let inputs = operation_inputs(cli, None)?;
+    authorization.role(op, &inputs.hash, cli.dry_run, None)
+}
+
+fn authorize_import(
+    context: &mut crate::review::OperationContext,
+    authorization: &Authorization<'_>,
+) -> Result<()> {
+    context.role = authorization.role(&context.op_id, &context.args_hash, context.dry_run, None)?;
+    Ok(())
 }
 
 fn proposal_name(s: &Store, input: &str) -> Result<String> {
@@ -118,7 +239,34 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
     }
 }
 pub fn run(cli: &Cli) -> Result<Value> {
+    run_with_verifier(cli, None, None)
+}
+
+/// Run a command with an optional embedding-host verifier and opaque credential.
+/// Human and controller claims require verification when a verifier is present.
+/// Scrolls receives the credential only through this entry point.
+pub fn run_with_verifier(
+    cli: &Cli,
+    verifier: Option<&dyn CredentialVerifier>,
+    credential: Option<&[u8]>,
+) -> Result<Value> {
+    credential::check_controller(cli.role, verifier, cli.command.moves_label())?;
+    let authorization = match verifier {
+        Some(verifier) if cli.role != Role::Agent => Authorization::Credentialed {
+            actor: actor(cli)?,
+            role: cli.role,
+            verifier,
+            credential: credential
+                .context("credential_required: claimed role requires a credential")?,
+        },
+        _ => Authorization::Cooperative(cli.role),
+    };
+    let op = cli
+        .op_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if let Cmd::Backup { command } = &cli.command {
+        authorize_command(cli, &authorization, &op)?;
         return storage::backup::run(cli, command);
     }
     if cli.connection.is_some() {
@@ -127,7 +275,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
         bail!("recover is a shared-store command; use --connection");
     }
     if cli.command.moves_label() {
-        ensure!(cli.role == Role::Human, "label moves require --role human");
+        ensure!(
+            cli.role != Role::Agent,
+            "label moves require --role human or a verified controller"
+        );
         ensure!(
             cli.proposal.is_none(),
             "label moves operate on main; omit --proposal"
@@ -135,10 +286,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
     }
     if let Cmd::Import { command } = &cli.command {
         if handles_markdown_import(command)? {
-            return run_markdown_import(cli, command);
+            return run_markdown_import(cli, command, &authorization, &op);
         }
         if !matches!(command, ImportCommand::Markdown { .. }) {
-            return run_source_import(cli, command);
+            return run_source_import(cli, command, &authorization, &op);
         }
     }
     if matches!(
@@ -170,15 +321,58 @@ pub fn run(cli: &Cli) -> Result<Value> {
     } else {
         None
     };
-    let init = matches!(cli.command, Cmd::Init { .. });
+    let init = initial_schema.is_some();
     if cli.command.mutation() {
         actor(cli)?;
     }
-    if let Some(connection) = &cli.connection {
-        if init {
-            return storage::shared::initialize(cli, connection, initial_schema.as_ref().unwrap());
+    let mut prepared = None;
+    let init_context = if let Some(schema) = &initial_schema {
+        if let Some(connection) = &cli.connection {
+            let (op, hash) = storage::shared::initialization_identity(cli, schema)?;
+            let role = authorization.role(op, &hash, cli.dry_run, None)?;
+            let context = cli.operation_context(op, &hash, role)?;
+            return storage::shared::initialize_with_context(cli, connection, schema, &context);
         }
-    }
+        let hash = digest(serde_json::to_vec(
+            &json!({"command":"init","schema":initial_schema,"actor":cli.actor,"role":cli.role}),
+        )?);
+        let role = authorization.role(&op, &hash, cli.dry_run, None)?;
+        Some(cli.operation_context(&op, &hash, role)?)
+    } else {
+        None
+    };
+    let migration_context = if matches!(cli.command, Cmd::Migrate) {
+        let hash = digest(serde_json::to_vec(
+            &json!({"command":"migrate","actor":cli.actor,"role":cli.role}),
+        )?);
+        let role = authorization.role(&op, &hash, cli.dry_run, None)?;
+        Some(cli.operation_context(&op, &hash, role)?)
+    } else {
+        None
+    };
+    let role = if let Some(context) = init_context.as_ref().or(migration_context.as_ref()) {
+        context.role
+    } else if authorization.requires_verification() {
+        let inputs = authorization_inputs(cli)?;
+        let label_move = match &cli.command {
+            Cmd::Label {
+                command: LabelCommand::Move { name, to, .. },
+            } => Some(LabelMove {
+                record_id: inputs
+                    .resolved_record
+                    .as_deref()
+                    .context("missing label record")?,
+                label: name,
+                target_revision: to,
+            }),
+            _ => None,
+        };
+        let role = authorization.role(&op, &inputs.hash, cli.dry_run, label_move)?;
+        prepared = Some(inputs);
+        role
+    } else {
+        cli.role
+    };
     if let Cmd::Init {
         expect_base,
         expect_schema,
@@ -220,18 +414,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
     if selected_format > if store.is_shared() { 5 } else { 4 } {
         bail!("unsupported store format {selected_format}; use a newer Scrolls writer");
     }
-    if init {
+    if let Some(context) = init_context {
         if branch != "main" {
             bail!("init operates on main")
         }
-        let op = cli
-            .op_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let hash = digest(serde_json::to_vec(
-            &json!({"command":"init","schema":initial_schema,"actor":cli.actor,"role":cli.role}),
-        )?);
-        if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
+        if let Some(result) = KnowledgeStore::receipt(&store, &op, &context.args_hash)? {
             return wrap(&store, result, branch);
         }
         let result = json!({"store":store.root,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"op_id":op});
@@ -244,20 +431,14 @@ pub fn run(cli: &Cli) -> Result<Value> {
             bail!("existing store configuration differs; use schema apply FILE --expect REV");
         }
         let mut changes = ChangeSet::from(Change::put("metadata", "ontology", requested)?);
-        changes.extend(receipt_changes(
-            &op,
-            &hash,
-            actor(cli)?,
-            &serde_json::to_value(&cli.command)?,
-            &result,
-        )?);
+        changes.extend(receipt_changes(&context, &result)?);
         store.commit(&changes, "initialize store receipt", actor(cli)?)?;
         return wrap(&store, result, branch);
     }
     if matches!(cli.command, Cmd::Doctor) {
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"markdown_health":crate::markdown_import::health(&store,&store.graph()?,None)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":"cooperative client roles; not authenticated identity"}),
+            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"markdown_health":crate::markdown_import::health(&store,&store.graph()?,None)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":if verifier.is_some() {"host credential verification for human and controller roles"} else {"cooperative client roles; not authenticated identity"}}),
             branch,
         );
     }
@@ -265,18 +446,11 @@ pub fn run(cli: &Cli) -> Result<Value> {
     let schema = store
         .one::<u32>("metadata", "schema")?
         .context("missing store schema")?;
-    if matches!(cli.command, Cmd::Migrate) {
+    if let Some(context) = migration_context {
         if branch != "main" {
             bail!("migrate operates on main");
         }
-        let op = cli
-            .op_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let hash = digest(serde_json::to_vec(
-            &json!({"command":"migrate","actor":cli.actor,"role":cli.role}),
-        )?);
-        if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
+        if let Some(result) = KnowledgeStore::receipt(&store, &op, &context.args_hash)? {
             return wrap(&store, result, branch);
         }
         if schema == 4 {
@@ -338,13 +512,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 &json!({"relation":rel,"requires_why":false}),
             )?);
         }
-        changes.extend(receipt_changes(
-            &op,
-            &hash,
-            actor(cli)?,
-            &serde_json::to_value(&cli.command)?,
-            &result,
-        )?);
+        changes.extend(receipt_changes(&context, &result)?);
         store.migrate_format4(&changes.to_sql(), actor(cli)?)?;
         return wrap(&store, result, branch);
     }
@@ -365,11 +533,20 @@ pub fn run(cli: &Cli) -> Result<Value> {
         }
         if matches!(command, BeadsCommand::Publish(_)) {
             actor(cli)?;
+            if let Some(revision) = prepared
+                .as_ref()
+                .and_then(|inputs| inputs.publication_revision.as_deref())
+            {
+                ensure!(
+                    store.revision()? == revision,
+                    "store revision changed after credential verification"
+                );
+            }
         }
         let request = crate::beads::Request {
             dry_run: cli.dry_run,
             actor: cli.actor.as_deref(),
-            op_id: cli.op_id.as_deref(),
+            op_id: Some(&op),
             proposal: cli.proposal.as_deref(),
             command,
         };
@@ -388,65 +565,39 @@ pub fn run(cli: &Cli) -> Result<Value> {
     let routing = store
         .one::<Value>("metadata", "routing")?
         .unwrap_or(json!({}));
-    let mut body_value = None;
-    let mut body_supplied = true;
-    match &cli.command {
-        Cmd::New(n) => body_value = Some(body(&n.body, "", false)?.0),
-        Cmd::Edit { id, body: b, .. } => {
-            let id = graph.resolve(id)?;
-            let (value, supplied) = body(b, &graph.records[&id].body, true)?;
-            body_value = Some(value);
-            body_supplied = supplied;
-        }
-        _ => {}
-    }
-    let imported = if let Cmd::Import {
-        command: ImportCommand::Markdown { dir, rev },
-    } = &cli.command
-    {
-        Some(crate::import::import(dir, rev, actor(cli)?)?)
-    } else {
-        None
+    let inputs = match prepared {
+        Some(inputs) => inputs,
+        None => operation_inputs(cli, Some(&before))?,
     };
-    let file_content = match &cli.command {
-        Cmd::Batch { file }
-        | Cmd::Schema {
-            command: SchemaCommand::Apply { file, .. },
-        } => Some(fs::read_to_string(file)?),
-        _ => None,
-    };
-    // Fingerprint effective bodies, not only stdin/file paths. Output flags and op-id are not arguments.
-    let mut fingerprint = json!({"command":cli.command,"body":if store.is_shared() && !body_supplied {None} else {body_value.as_ref()},"actor":cli.actor,"role":cli.role,"proposal":cli.proposal,"source_commit":imported.as_ref().map(|i|&i.info.commit)});
-    if let Some(content) = &file_content {
-        fingerprint["file_content"] = json!(content);
+    let OperationInputs {
+        body_value,
+        imported,
+        file_content,
+        hash,
+        resolved_record,
+        ..
+    } = inputs;
+    if let (Cmd::Edit { id, .. }, Some(record)) = (&cli.command, &resolved_record) {
+        ensure!(
+            before.resolve(id)? == *record,
+            "edit target changed after credential verification"
+        );
     }
-    if store.is_shared() {
-        // Machine-local input locations are not operation identity. Their exact
-        // bytes are already included above; a second client can supply its copy.
-        fn normalize_paths(value: &mut Value) {
-            if let Some(object) = value.as_object_mut() {
-                for (key, value) in object {
-                    if matches!(key.as_str(), "body_file" | "file") && !value.is_null() {
-                        *value = json!("<input-content>");
-                    } else {
-                        normalize_paths(value);
-                    }
-                }
-            }
-        }
-        normalize_paths(&mut fingerprint["command"]);
-    }
-    let hash = digest(serde_json::to_vec(&fingerprint)?);
-    let op = cli
-        .op_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let context = cli.operation_context(&op, &hash)?;
+    let context = cli.operation_context(&op, &hash, role)?;
     if matches!(cli.command, Cmd::Recover { resume: true, .. }) {
         return store.recover(&context);
     }
     if cli.command.mutation() {
         if let Some(result) = KnowledgeStore::receipt(&store, &op, &hash)? {
+            if let Some(record) = resolved_record
+                .as_ref()
+                .filter(|_| cli.command.moves_label())
+            {
+                ensure!(
+                    result["id"] == *record,
+                    "operation receipt is for a different label record"
+                );
+            }
             return if store.is_shared() {
                 storage::shared_review::receipt_response(&store, result, branch)
             } else {
@@ -474,7 +625,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
             expect.is_some() != *expect_absent,
             "label moves require exactly one of --expect or --expect-absent"
         );
-        let id = before.resolve(id)?;
+        let id = match resolved_record {
+            Some(record) => record,
+            None => before.resolve(id)?,
+        };
         let data = crate::label::move_to(&store, &id, name, to, expect.as_deref(), &context)?;
         return wrap(&store, data, branch);
     }
@@ -482,7 +636,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         return store.recover(&context);
     }
     if matches!(cli.command, Cmd::Review { .. }) {
-        return review(cli, &store, &before, &op, &hash);
+        return review(cli, &store, &before, &context);
     }
     if let Cmd::Import { .. } = &cli.command {
         if branch != "main" {
@@ -509,13 +663,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 return wrap(&store, json!({"dry_run":true,"result":result}), branch);
             }
             store.commit(
-                &receipt_changes(
-                    &op,
-                    &hash,
-                    actor(cli)?,
-                    &serde_json::to_value(&cli.command)?,
-                    &result,
-                )?,
+                &receipt_changes(&context, &result)?,
                 "record identical import replay",
                 actor(cli)?,
             )?;
@@ -539,13 +687,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
             "import_edges",
             &imported.graph.edges.values().collect::<Vec<_>>(),
         )?);
-        changes.extend(receipt_changes(
-            &op,
-            &hash,
-            actor(cli)?,
-            &serde_json::to_value(&cli.command)?,
-            &result,
-        )?);
+        changes.extend(receipt_changes(&context, &result)?);
         store.bootstrap(
             &changes,
             &format!("import {} by {}", imported.info.commit, actor(cli)?),
@@ -677,16 +819,31 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
         }
         policy::validate_change(&before, &graph, &BTreeSet::new(), &local)?;
-        let guarded =
-            crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())
-                .is_err();
+        let guarded = crate::mutation::guards(
+            &before.schema,
+            &before,
+            &graph,
+            &ops,
+            who,
+            context.role.name(),
+        )
+        .is_err();
         let protected = config_change
-            || affected
-                .iter()
-                .any(|id| graph.schema.protected(&graph.records[id], cli.role.name()))
-            || (guarded && cli.role == Role::Agent);
+            || affected.iter().any(|id| {
+                graph
+                    .schema
+                    .protected(&graph.records[id], context.role.name())
+            })
+            || (guarded && context.role == Role::Agent);
         if !protected && cli.proposal.is_none() {
-            crate::mutation::guards(&before.schema, &before, &graph, &ops, who, cli.role.name())?;
+            crate::mutation::guards(
+                &before.schema,
+                &before,
+                &graph,
+                &ops,
+                who,
+                context.role.name(),
+            )?;
         }
         let mut target = branch.to_string();
         let mut proposal = None;
@@ -741,13 +898,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         if let Some(p) = &proposal {
             changes.push(Change::put("metadata", &target, p)?);
         }
-        changes.extend(receipt_changes(
-            &op,
-            &hash,
-            who,
-            &serde_json::to_value(&cli.command)?,
-            &result,
-        )?);
+        changes.extend(receipt_changes(&context, &result)?);
         let message = format!("{} by {who}", serde_json::to_string(&cli.command)?);
         if let Some(p) = &proposal {
             let result = store.propose(
@@ -997,7 +1148,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
     }
     Ok(response)
 }
-fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Result<Value> {
+fn review(
+    cli: &Cli,
+    s: &Store,
+    main_graph: &Graph,
+    context: &crate::review::OperationContext,
+) -> Result<Value> {
+    let op = &context.op_id;
     let Cmd::Review {
         action,
         branch: arg,
@@ -1056,7 +1213,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
     if cli.proposal.is_some() {
         bail!("review decisions run from main; omit --proposal")
     }
-    if cli.role != Role::Human {
+    if context.role != Role::Human {
         bail!("proposal review decisions require --role human; agent actors cannot accept")
     }
     if proposal.status != "pending" {
@@ -1070,7 +1227,7 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         proposal.status = "rejected".into();
         proposal.reason = Some(reason.into());
         let result = json!({"proposal":proposal,"op_id":op});
-        let result = s.reject(&cli.operation_context(op, hash)?, &proposal, &result)?;
+        let result = s.reject(context, &proposal, &result)?;
         return if s.is_shared() && !cli.dry_run {
             storage::shared_review::receipt_response(s, result, &name)
         } else {
@@ -1091,11 +1248,11 @@ fn review(cli: &Cli, s: &Store, main_graph: &Graph, op: &str, hash: &str) -> Res
         &proposal_revision,
     )?;
     let result = s.accept(
-        &cli.operation_context(op, hash)?,
+        context,
         main_graph,
         &proposal,
         (&base, &proposal_revision),
-        &mut || validate_merged_review(s, main_graph, who, cli.role),
+        &mut || validate_merged_review(s, main_graph, who, context.role),
     )?;
     wrap(s, result, "main")
 }
@@ -1174,22 +1331,28 @@ fn handles_markdown_import(command: &ImportCommand) -> Result<bool> {
         _ => false,
     })
 }
-fn import_invocation(cli: &Cli) -> Result<crate::source_import::Invocation<'_>> {
+fn import_invocation(cli: &Cli, role: Role) -> Result<crate::source_import::Invocation<'_>> {
     Ok(crate::source_import::Invocation {
         actor: cli
             .actor
             .as_deref()
             .context("planning/apply requires --actor")?,
-        role: cli.role,
+        role,
         op_id: cli.op_id.as_deref(),
         dry_run: cli.dry_run,
         command: serde_json::to_value(&cli.command)?,
     })
 }
-fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
+fn run_source_import(
+    cli: &Cli,
+    command: &ImportCommand,
+    authorization: &Authorization<'_>,
+    op: &str,
+) -> Result<Value> {
     use crate::source_import::{self, ApplyPreparation, ApplyRequest, PlanRequest};
     let envelope = |data: Value| json!({"schema_version":2,"ok":true,"data":data});
     if let ImportCommand::Profiles { command } = command {
+        authorize_command(cli, authorization, op)?;
         return match command {
             ProfileCommand::List => Ok(envelope(
                 json!({"profiles":[{"name":"pep","description":"Python Enhancement Proposals"},{"name":"handbook","description":"Markdown handbook"}]}),
@@ -1216,7 +1379,6 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
         !actor.trim().is_empty() && !actor.contains(['\n', '\r', '<', '>']),
         "invalid actor"
     );
-    let shared = shared_import_store(cli)?;
     match command {
         ImportCommand::Plan {
             command:
@@ -1230,6 +1392,8 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     out,
                 },
         } => {
+            let role = authorize_command(cli, authorization, op)?;
+            let shared = shared_import_store(cli)?;
             let text = if let Some(name) = profile {
                 crate::profile::bundled(name)?.to_string()
             } else {
@@ -1253,14 +1417,23 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     profile: &text,
                     out,
                     actor,
-                    role: cli.role,
+                    role,
                     store_directory: cli.connection.is_none().then_some(cli.store.as_path()),
                 },
                 &crate::beads::Local::default(),
             )
         }
         ImportCommand::Apply { plan } => {
-            let request = ApplyRequest::read(plan, import_invocation(cli)?)?;
+            // Preserve the standalone adapter's connection/plan error ordering.
+            let (shared, request) = if authorization.requires_verification() {
+                let mut request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+                authorize_import(&mut request.context, authorization)?;
+                (shared_import_store(cli)?, request)
+            } else {
+                let shared = shared_import_store(cli)?;
+                let request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+                (shared, request)
+            };
             let prepared = {
                 let s = import_store(cli, shared.as_ref(), true)?;
                 source_import::prepare_apply(&*s, &request)?
@@ -1275,7 +1448,12 @@ fn run_source_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
         _ => bail!("unsupported import command"),
     }
 }
-fn run_markdown_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
+fn run_markdown_import(
+    cli: &Cli,
+    command: &ImportCommand,
+    authorization: &Authorization<'_>,
+    op: &str,
+) -> Result<Value> {
     use crate::markdown_import::{self, ApplyRequest, PlanRequest};
     let connection = cli
         .connection
@@ -1285,6 +1463,7 @@ fn run_markdown_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
         cli.proposal.is_none(),
         "Markdown bootstrap operates on main; omit --proposal"
     );
+    // This preliminary check can deny a claim but cannot grant authority.
     ensure!(
         cli.role == Role::Human,
         "Markdown bootstrap requires --role human"
@@ -1307,6 +1486,7 @@ fn run_markdown_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     out,
                 },
         } => {
+            let role = authorize_command(cli, authorization, op)?;
             markdown_import::web_url(git_web_url)?;
             let s = Store::open_shared(connection, &cli.store)?;
             markdown_import::plan(
@@ -1317,12 +1497,13 @@ fn run_markdown_import(cli: &Cli, command: &ImportCommand) -> Result<Value> {
                     git_web_url,
                     out,
                     actor,
-                    role: cli.role,
+                    role,
                 },
             )
         }
         ImportCommand::Apply { plan } => {
-            let request = ApplyRequest::read(plan, import_invocation(cli)?)?;
+            let mut request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+            authorize_import(&mut request.context, authorization)?;
             let s = if cli.dry_run {
                 Store::open_shared(connection, &cli.store)?
             } else {

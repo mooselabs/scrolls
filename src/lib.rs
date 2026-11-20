@@ -1,6 +1,7 @@
 pub mod app;
 pub mod beads;
 pub mod cli;
+pub mod credential;
 pub mod import;
 mod label;
 pub mod model;

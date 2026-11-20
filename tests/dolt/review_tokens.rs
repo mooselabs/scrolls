@@ -544,3 +544,39 @@ fn completed_v1_review_receipts_replay_unchanged() {
     );
     assert_eq!(before, review_state(&f));
 }
+
+#[test]
+fn standalone_controller_requires_a_verifier_and_human_review_stays_cooperative() {
+    let f = Fixture::new();
+    let proposal = f.ok(&["new", "entity", "--title", "Review", "--body", "draft"]);
+    let branch = proposal["branch"].as_str().unwrap();
+    let token = f.review_token(branch);
+    f.fail(
+        &[
+            "--role",
+            "controller",
+            "review",
+            "accept",
+            branch,
+            "--review-token",
+            &token,
+        ],
+        "controller_verifier_required: controller role requires a host credential verifier",
+    );
+    let accepted = f.ok(&[
+        "--op-id",
+        "standalone-accept",
+        "review",
+        "accept",
+        branch,
+        "--review-token",
+        &token,
+    ]);
+    assert_eq!(accepted["proposal"]["status"], "accepted");
+    let store = Store::open_readonly(&f.dir.path().join("store"), &dolt()).unwrap();
+    let receipt = store
+        .one::<Value>("operations", "standalone-accept")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt["role"], "Human");
+}

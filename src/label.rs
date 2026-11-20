@@ -60,7 +60,7 @@ pub(crate) fn list(
 }
 
 /// The caller holds the store's exclusive lock with main selected and has
-/// checked role, destination and operation identity before invoking this write.
+/// authorized the role and checked for an existing operation receipt.
 pub(crate) fn move_to(
     store: &dyn KnowledgeStore,
     id: &str,
@@ -104,13 +104,7 @@ pub(crate) fn move_to(
         return Ok(json!({"dry_run":true,"result":result}));
     }
     let mut changes = ChangeSet::from(Change::put(TABLE, &key, &new_target)?);
-    changes.extend(receipt_changes(
-        &context.op_id,
-        &context.args_hash,
-        actor,
-        &context.command,
-        &result,
-    )?);
+    changes.extend(receipt_changes(context, &result)?);
     store.commit(&changes, &format!("move label {name} on {id}"), actor)?;
     Ok(result)
 }

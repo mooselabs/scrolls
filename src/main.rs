@@ -18,11 +18,13 @@ fn main() {
             e.exit()
         }
     };
-    match if let scrolls::cli::Cmd::Serve { bind } = cli.command {
-        scrolls::storage::http::serve(&cli, bind).map(|()| serde_json::Value::Null)
-    } else {
-        scrolls::app::run(&cli)
-    } {
+    let result = match &cli.command {
+        scrolls::cli::Cmd::Serve { bind } if cli.role != scrolls::model::Role::Controller => {
+            scrolls::storage::http::serve(&cli, *bind).map(|()| serde_json::Value::Null)
+        }
+        _ => scrolls::app::run(&cli),
+    };
+    match result {
         Ok(mut v) => {
             if v.is_null() {
                 return;

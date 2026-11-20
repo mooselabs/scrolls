@@ -14,10 +14,13 @@ Keep connection JSON outside repositories, with restrictive file permissions:
 
 `--connection /absolute/machine-local.json` selects shared mode. Numeric IP
 addresses are required. Connect timeout is five seconds, lock acquisition ten
-seconds, and socket IO thirty seconds. SQL accounts authenticate; `--actor` and
-`--role` remain cooperative attribution and policy, not authenticated identity.
-Raw SQL access can bypass client rules. Credentials are not printed or stored
-in document bindings. No local Dolt executable is needed by shared clients.
+seconds, and socket IO thirty seconds. SQL accounts authenticate to Dolt.
+Standalone Scrolls uses cooperative human and agent roles for attribution and
+policy. An embedding host can supply a verifier for human and controller
+claims. A verified controller may only move labels, which shared stores
+currently expose for reading. Raw SQL access can bypass client rules.
+Scrolls keeps credentials out of output and document bindings. Shared
+clients use the SQL connection directly.
 
 ## Fresh initialization
 

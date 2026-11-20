@@ -7,12 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Role {
     Human,
     Agent,
+    Controller,
 }
 impl Role {
     pub fn name(self) -> &'static str {
         match self {
             Self::Human => "human",
             Self::Agent => "agent",
+            Self::Controller => "controller",
         }
     }
 }

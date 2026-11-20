@@ -1,7 +1,7 @@
 # Scrolls 0.3 command reference
 
 Global flags: `--connection FILE`, `--store DIR`, `--dolt FILE`, `--json`, `--actor NAME`,
-`--role human|agent`, `--proposal BRANCH`, `--op-id ID`, `--dry-run`, `--session ID`.
+`--role human|agent|controller`, `--proposal BRANCH`, `--op-id ID`, `--dry-run`, `--session ID`.
 Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 `revision`, `branch`, and `data` (or `error`). Beads backlink payloads remain v1.
 
@@ -26,7 +26,7 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 | `prime [--budget N]` | Complete schema guide/instructions/pins under a soft byte budget. |
 | `show ID [--label NAME]` | Full record and immediate references, optionally at a label's target revision. |
 | `label list ID` | Record ID and a map of label names to their targets. |
-| `label move ID NAME --to STORE_REV (--expect STORE_REV \| --expect-absent)` | Human-only compare-and-set on local main. |
+| `label move ID NAME --to STORE_REV (--expect STORE_REV \| --expect-absent)` | Compare-and-set on local main for humans and verified controllers. |
 | `context ID [--budget N]` | Document first, immediate references, hard byte budget. |
 | `context --bead REF [--budget N]` | Cached Beads metadata and direct document references. |
 | `list [--kind K] [--status S] [--owner NAME] [--field KEY=JSON]` | Deterministic filtered records; `--owner me` binds the actor. |
@@ -47,21 +47,28 @@ Optional domain metadata uses `--confidence`, `--review-every`, and on edit,
 Graph mutation expectations use numeric record revisions. Label moves use store revisions.
 Retries use the same `--op-id`, actor, role, arguments and file contents.
 
+Standalone Scrolls uses cooperative human and agent roles. An embedding host
+can supply a verifier that checks human and controller claims against a
+credential. The host supplies the bytes through the library. Standalone
+`--role controller` returns `controller_verifier_required`. A verified
+controller may only move labels.
+
 ## Record labels
 
 Label names are unique per record and contain 1–32 ASCII characters. A name
 starts with a lowercase letter and may continue with lowercase letters,
 digits, and hyphens. Stores without label rows list an empty `labels` map.
 
-`label move` requires `--role human` and an actor. It runs on local main and
-refuses `--proposal` and `--connection`. Pass a full store revision from
-main history where the record exists. Use `--expect-absent` to create a label
+`label move` requires an actor and either the human role or a verified
+controller. It runs on local main and refuses `--proposal` and `--connection`.
+Pass a full store revision from main history where the record exists. Use `--expect-absent` to create a label
 or `--expect STORE_REV` to move it from that exact target. A stale expectation
 leaves the label and main unchanged. The move and its receipt commit together.
 Moving a label leaves the record and its numeric revision unchanged.
 The receipt includes `actor`, `role`, `id`, `label`, `previous_target`, and
 `new_target`. A retry with the same `--op-id` returns the stored receipt.
-`--dry-run` validates the move and previews the receipt without committing.
+When a verifier is configured, the caller presents an accepted credential on
+every privileged retry. `--dry-run` validates the move and previews its receipt.
 
 `label list` and `show --label` find the record and label in the selected
 branch snapshot, which defaults to main. `show --label` reads the record and

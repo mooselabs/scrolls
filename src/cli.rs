@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(
     version,
     about = "Local, versioned knowledge graphs",
-    long_about = "Local, versioned knowledge graphs backed by private Dolt 2.2.0. Actor roles are cooperative attribution, not authentication."
+    long_about = "Local, versioned knowledge graphs backed by private Dolt 2.2.0. Standalone human and agent roles provide cooperative attribution. The controller role requires an embedding host credential verifier."
 )]
 pub struct Cli {
     #[arg(long, global = true, default_value = ".scrolls")]
@@ -41,7 +41,7 @@ pub struct Cli {
 }
 impl ValueEnum for Role {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Human, Self::Agent]
+        &[Self::Human, Self::Agent, Self::Controller]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -603,7 +603,7 @@ impl Cmd {
 pub enum LabelCommand {
     /// List a record's labels and their target revisions.
     List { id: String },
-    /// Move a label on main as a human, checking the previous target.
+    /// Move a label on main as a human or verified controller, checking the previous target.
     Move {
         id: String,
         name: String,
