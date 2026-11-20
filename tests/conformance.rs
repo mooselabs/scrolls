@@ -5,7 +5,7 @@ use clap::Parser;
 use mysql::{Conn, OptsBuilder};
 use scrolls::{
     conformance::{self, PROPOSAL},
-    model::{Graph, Proposal},
+    model::{DEFAULT_TENANT, Graph, Proposal, TenantId},
     read::{BackendFailure, Snapshot, SnapshotSource},
     storage::{
         Store,
@@ -41,6 +41,9 @@ struct Memory(Mutex<MemoryState>);
 const MEMORY_REVISION: &str = "memory:fixture:1";
 const PROPOSAL_REVISION: &str = "memory:proposal:2";
 impl KnowledgeStore for Memory {
+    fn tenant(&self) -> &TenantId {
+        &DEFAULT_TENANT
+    }
     fn select_branch(&self, view: &str) -> Result<()> {
         anyhow::ensure!(["main", PROPOSAL].contains(&view), "unknown view");
         self.0.lock().unwrap().selected = view.into();
@@ -259,7 +262,8 @@ impl KnowledgeStore for Memory {
 impl SnapshotSource for Memory {
     fn open(&self) -> std::result::Result<Snapshot, BackendFailure> {
         let store = Memory(Mutex::new(self.0.lock().unwrap().clone()));
-        let graph = store::graph(&store, Some(MEMORY_REVISION)).map_err(|e| self.classify(e))?;
+        let graph = store::graph(&store, &DEFAULT_TENANT, Some(MEMORY_REVISION))
+            .map_err(|e| self.classify(e))?;
         Ok(Snapshot {
             store: Box::new(store),
             graph,

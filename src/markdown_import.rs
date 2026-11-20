@@ -161,7 +161,7 @@ pub fn plan(s: &dyn KnowledgeStore, request: PlanRequest<'_>) -> Result<Value> {
         actor,
         ..
     } = request;
-    let before = store::graph(s, None)?;
+    let before = store::graph(s, s.tenant(), None)?;
     empty(s, &before)?;
     let mut i = crate::import::import_selected(dir, rev, actor, true)?;
     let timestamp = now();
@@ -228,6 +228,7 @@ impl ApplyRequest {
 pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
     let plan = &request.plan;
     let context = &request.context;
+    context.check_tenant(s)?;
     let actor = plan.actor.as_str();
     let op = context.op_id.as_str();
     let hash = context.args_hash.as_str();
@@ -239,7 +240,7 @@ pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
         return response(s, result);
     }
     s.check_identity(op, hash)?;
-    let before = store::graph(s, None)?;
+    let before = store::graph(s, &context.tenant, None)?;
     if let Some(existing) = store::one::<Plan>(s, "metadata", "markdown_import", None)? {
         ensure!(
             existing.candidate_digest == plan.candidate_digest
@@ -308,7 +309,7 @@ pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
         );
     }
     s.bootstrap(&changes, "bootstrap editable Markdown", actor, &mut || {
-        let actual = store::graph(s, None)?;
+        let actual = store::graph(s, &context.tenant, None)?;
         health(s, &actual, None)?;
         ensure!(
             actual.records == i.graph.records && actual.edges == i.graph.edges,

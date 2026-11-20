@@ -423,6 +423,12 @@ The README's onboarding structure is inspired by the
 [Beads README](https://github.com/steveyegge/beads/blob/main/README.md); the commands
 and support boundaries above describe Scrolls.
 
+## Store tenant
+
+A standalone Scrolls store, whether local or shared Dolt, serves one tenant
+with the fixed ID `default`. Run `scrolls doctor` to see the served tenant.
+Existing Dolt stores use the same ID without a migration.
+
 ## Shared authoring development preview
 
 The unreleased shared backend can initialize a fresh externally provisioned Dolt

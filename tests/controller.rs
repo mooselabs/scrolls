@@ -4,7 +4,7 @@ use scrolls::{
     app,
     cli::Cli,
     credential::{CredentialRefusal, CredentialVerifier, VerificationRequest},
-    model::Role,
+    model::{DEFAULT_TENANT, Role, TenantId},
     storage::Store,
 };
 use serde_json::{Value, json};
@@ -100,7 +100,7 @@ impl CredentialVerifier for TestVerifier<'_> {
 }
 
 fn refusal(cli: &Cli, verifier: &TestVerifier<'_>, credential: Option<&[u8]>, error: &str) {
-    let message = app::run_with_verifier(cli, Some(verifier), credential)
+    let message = app::run_with_verifier(cli, &DEFAULT_TENANT, Some(verifier), credential)
         .unwrap_err()
         .to_string();
     assert!(message.starts_with(error), "{message}");
@@ -172,7 +172,8 @@ fn verified_controller_moves_an_exact_label_and_reauthenticates_receipt_retries(
     refusal(&cli, &verifier, Some(REFUSED), "credential_refused:");
     assert_eq!(f.state(), before);
 
-    let moved = app::run_with_verifier(&cli, Some(&verifier), Some(ACCEPTED)).unwrap();
+    let moved =
+        app::run_with_verifier(&cli, &DEFAULT_TENANT, Some(&verifier), Some(ACCEPTED)).unwrap();
     assert_eq!(
         moved["data"],
         json!({
@@ -183,7 +184,8 @@ fn verified_controller_moves_an_exact_label_and_reauthenticates_receipt_retries(
     assert_ne!(moved["revision"], b);
     let after = f.state();
     refusal(&cli, &verifier, Some(REFUSED), "credential_refused:");
-    let replay = app::run_with_verifier(&cli, Some(&verifier), Some(RETRY)).unwrap();
+    let replay =
+        app::run_with_verifier(&cli, &DEFAULT_TENANT, Some(&verifier), Some(RETRY)).unwrap();
     assert_eq!(replay, moved);
     assert_eq!(f.state(), after);
     assert_eq!(verifier.calls.get(), 4);
@@ -283,7 +285,8 @@ fn verifier_checks_human_review_before_opening_for_writes_and_agent_needs_no_cre
             assert!(request.label_move.is_none());
         },
     };
-    let proposal = app::run_with_verifier(&proposal_cli, Some(&verifier), None).unwrap();
+    let proposal =
+        app::run_with_verifier(&proposal_cli, &DEFAULT_TENANT, Some(&verifier), None).unwrap();
     let branch = proposal["data"]["branch"].as_str().unwrap();
     assert!(branch.starts_with("proposal/"));
     assert_eq!(
@@ -312,7 +315,8 @@ fn verifier_checks_human_review_before_opening_for_writes_and_agent_needs_no_cre
     refusal(&accept, &verifier, Some(REFUSED), "credential_refused:");
     assert_eq!(f.state(), before);
 
-    let reviewed = app::run_with_verifier(&accept, Some(&verifier), Some(ACCEPTED)).unwrap();
+    let reviewed =
+        app::run_with_verifier(&accept, &DEFAULT_TENANT, Some(&verifier), Some(ACCEPTED)).unwrap();
     assert_eq!(reviewed["data"]["proposal"]["status"], "accepted");
     let receipt = f
         .store()
@@ -336,10 +340,51 @@ fn a_refused_human_init_never_creates_a_store() {
     let verifier = TestVerifier {
         calls: Cell::new(0),
         check: &|request| {
+            assert_eq!(request.tenant, &DEFAULT_TENANT);
             assert_eq!(request.claimed_role, Role::Human);
             assert_eq!(request.op_id, "fresh-init");
         },
     };
     refusal(&cli, &verifier, Some(REFUSED), "credential_refused:");
     assert!(!cli.store.exists());
+}
+
+#[test]
+fn embedded_dolt_rejects_another_tenant_before_opening_the_store() {
+    let f = Fixture::new();
+    let mut cli = f.cli(&["--role", "human", "--op-id", "wrong-tenant", "init"]);
+    cli.store = f.dir.path().join("uninitialized");
+    let tenant: TenantId = "other-tenant".parse().unwrap();
+    let verifier = TestVerifier {
+        calls: Cell::new(0),
+        check: &|_| panic!("tenant mismatch must precede credential verification"),
+    };
+
+    let error = app::run_with_verifier(&cli, &tenant, Some(&verifier), Some(ACCEPTED))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "tenant_mismatch: operation tenant other-tenant cannot open a Dolt store, which serves only the default tenant (default)"
+    );
+    assert!(!cli.store.exists());
+    assert_eq!(verifier.calls.get(), 0);
+}
+
+#[test]
+fn embedded_verifier_receives_the_operation_tenant() {
+    let f = Fixture::new();
+    let cli = f.cli(&["--role", "human", "--op-id", "verify-read", "doctor"]);
+    let tenant: TenantId = "default".parse().unwrap();
+    let verifier = TestVerifier {
+        calls: Cell::new(0),
+        check: &|request| {
+            assert_eq!(request.tenant, &tenant);
+            assert_eq!(request.op_id, "verify-read");
+        },
+    };
+
+    let result = app::run_with_verifier(&cli, &tenant, Some(&verifier), Some(ACCEPTED)).unwrap();
+    assert_eq!(result["data"]["tenant"], tenant.as_str());
+    assert_eq!(verifier.calls.get(), 1);
 }

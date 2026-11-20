@@ -716,7 +716,7 @@ fn response(s: &dyn KnowledgeStore, data: Value) -> Result<Value> {
 }
 pub fn validate_profile(s: &dyn KnowledgeStore, file: &Path) -> Result<Value> {
     let rev = s.head("main")?;
-    let g = store::graph(s, Some(&rev))?;
+    let g = store::graph(s, s.tenant(), Some(&rev))?;
     let text = read_profile(file)?;
     let p = Profile::parse(&text, &g.schema)?;
     Ok(envelope(
@@ -752,7 +752,7 @@ pub fn plan_base(s: &dyn KnowledgeStore) -> Result<PlanBase> {
         store_id: store::one(s, "metadata", "store_id", Some(&rev))?
             .context("missing store UUID")?,
         main_revision: rev.clone(),
-        graph: store::graph(s, Some(&rev))?,
+        graph: store::graph(s, s.tenant(), Some(&rev))?,
     })
 }
 
@@ -826,6 +826,7 @@ pub fn plan(
 }
 /// Attribution and the original command JSON supplied by an adapter.
 pub struct Invocation<'a> {
+    pub tenant: &'a TenantId,
     pub actor: &'a str,
     pub role: Role,
     pub op_id: Option<&'a str>,
@@ -835,6 +836,7 @@ pub struct Invocation<'a> {
 impl Invocation<'_> {
     pub fn context(self, op: &str, hash: String) -> OperationContext {
         OperationContext {
+            tenant: self.tenant.clone(),
             op_id: op.into(),
             args_hash: hash,
             explicit_op_id: self.op_id.is_some(),
@@ -892,6 +894,7 @@ fn retry_preparation(context: &OperationContext, result: Value) -> ApplyPreparat
 pub fn prepare_apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<ApplyPreparation> {
     let plan = &request.plan;
     let context = &request.context;
+    context.check_tenant(s)?;
     let op = context.op_id.as_str();
     let hash = context.args_hash.as_str();
     let rev = s.head("main")?;
@@ -904,7 +907,7 @@ pub fn prepare_apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<A
     if let Some(result) = KnowledgeStore::receipt(s, op, hash)? {
         return Ok(ApplyPreparation::Response(response(s, replay(s, result)?)?));
     }
-    let g = store::graph(s, Some(&rev))?;
+    let g = store::graph(s, &context.tenant, Some(&rev))?;
     if s.shared() && !context.dry_run {
         if let Some(result) = KnowledgeStore::resume(s, context, &g, op, hash)? {
             return Ok(ApplyPreparation::Response(response(s, result)?));
@@ -920,7 +923,7 @@ pub fn prepare_apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<A
         return Ok(retry_preparation(context, result));
     }
     for proposal in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
-        let pending = store::graph(s, Some(&proposal.branch))?;
+        let pending = store::graph(s, &context.tenant, Some(&proposal.branch))?;
         if let Some(existing) = pending.import_sources.get(&plan.source.source_id) {
             ensure!(
                 same(existing, &plan.source)
@@ -982,6 +985,7 @@ pub fn apply(
 ) -> Result<Value> {
     let plan = &request.plan;
     let context = &request.context;
+    context.check_tenant(s)?;
     let actor = plan.actor.as_str();
     let op = context.op_id.as_str();
     let hash = context.args_hash.as_str();
@@ -1002,7 +1006,7 @@ pub fn apply(
     // Pending proposals do not advance main, so repeat namespace checks under the write lock.
     for p in s.proposals()?.into_iter().filter(|p| p.status == "pending") {
         ensure!(
-            !store::graph(s, Some(&p.branch))?
+            !store::graph(s, &context.tenant, Some(&p.branch))?
                 .import_sources
                 .contains_key(&plan.source.source_id),
             "source_update_unsupported: namespace reserved by {}; retry to inspect the pending import",
@@ -1062,7 +1066,7 @@ pub fn apply(
     }
     if s.shared() {
         s.commit_checked(&changes, &message, actor, false, &mut || {
-            let actual = store::graph(s, None)?;
+            let actual = store::graph(s, &context.tenant, None)?;
             crate::source_import::health(&actual, &store::import_files(s, None)?)?;
             actual
                 .schema
@@ -1222,7 +1226,7 @@ fn noop_receipt(s: &dyn KnowledgeStore, request: &ApplyRequest, result: Value) -
             "stale_plan: proposal changed; retry with a fresh plan"
         );
     }
-    let g = store::graph(s, Some(branch))?;
+    let g = store::graph(s, s.tenant(), Some(branch))?;
     let source = g
         .import_sources
         .get(&plan.source.source_id)

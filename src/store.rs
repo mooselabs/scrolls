@@ -319,6 +319,10 @@ pub struct ProposalWrite<'a> {
 /// import health checks remain additional caller obligations. Receipt-only writes
 /// may skip validation. Only `bootstrap` may establish new import lint debt.
 pub trait KnowledgeStore {
+    /// The one tenant served by this opened handle. Calls without a separate
+    /// tenant argument use this scope. Implementations must check any supplied
+    /// operation context against it before accessing store data.
+    fn tenant(&self) -> &TenantId;
     /// Prepare aliases for NEW native records when landing on main. The caller
     /// MUST retain the same exclusive lock/transaction from reading `main`
     /// through committing `candidate`, proposal status and the receipt together.
@@ -459,7 +463,9 @@ pub fn import_files(
     keyed_rows(store, "import_files", at, source_import::File::key)
 }
 
-pub fn graph(store: &dyn KnowledgeStore, at: Option<&str>) -> Result<Graph> {
+/// Read a graph for the requested tenant, at the selected view or an exact revision.
+pub fn graph(store: &dyn KnowledgeStore, tenant: &TenantId, at: Option<&str>) -> Result<Graph> {
+    tenant.check_served_by(store.tenant())?;
     let format = one::<u32>(store, "metadata", "schema", at)?.unwrap_or(1);
     let mut g = Graph {
         schema: one(store, "metadata", "ontology", at)?.unwrap_or_default(),
@@ -500,14 +506,20 @@ pub fn graph(store: &dyn KnowledgeStore, at: Option<&str>) -> Result<Graph> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{cell::Cell, collections::BTreeMap};
 
     struct Fixture {
+        tenant: TenantId,
+        reads: Cell<u32>,
+        writes: Cell<u32>,
         at: Option<&'static str>,
         format: Option<u32>,
         tables: BTreeMap<String, Vec<(String, String)>>,
     }
     impl KnowledgeStore for Fixture {
+        fn tenant(&self) -> &TenantId {
+            &self.tenant
+        }
         fn select_branch(&self, _: &str) -> Result<()> {
             anyhow::bail!("unexpected branch selection")
         }
@@ -527,6 +539,7 @@ mod tests {
             panic!("unexpected request encoding")
         }
         fn commit(&self, _: &ChangeSet, _: &str, _: &str) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
             anyhow::bail!("unexpected commit")
         }
         fn commit_checked(
@@ -580,10 +593,12 @@ mod tests {
             anyhow::bail!("unexpected receipt read")
         }
         fn rows(&self, table: &str, at: Option<&str>) -> Result<Vec<(String, String)>> {
+            self.reads.set(self.reads.get() + 1);
             assert_eq!(at, self.at);
             Ok(self.tables.get(table).cloned().unwrap_or_default())
         }
         fn one(&self, table: &str, id: &str, at: Option<&str>) -> Result<Option<String>> {
+            self.reads.set(self.reads.get() + 1);
             assert_eq!(at, self.at);
             assert_eq!(table, "metadata");
             Ok(match id {
@@ -625,12 +640,53 @@ mod tests {
     }
 
     #[test]
+    fn tenant_id_uses_the_documented_ascii_grammar() -> Result<()> {
+        assert_eq!("default".parse::<TenantId>()?, DEFAULT_TENANT);
+        for valid in ["t", "1", "t1-tenant", &"a".repeat(63)] {
+            assert_eq!(valid.parse::<TenantId>()?.as_str(), valid);
+        }
+        for invalid in ["", "-t1", "T1", "t.1", "t_1", "t 1", "é", &"a".repeat(64)] {
+            assert!(invalid.parse::<TenantId>().is_err(), "{invalid:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graph_checks_operation_tenant_before_accessing_the_store() -> Result<()> {
+        let tenant: TenantId = "t1".parse()?;
+        let fixture = Fixture {
+            tenant: tenant.clone(),
+            reads: Cell::default(),
+            writes: Cell::default(),
+            at: None,
+            format: Some(4),
+            tables: BTreeMap::new(),
+        };
+
+        assert!(graph(&fixture, &tenant, None)?.records.is_empty());
+        assert!(fixture.reads.get() > 0);
+        let reads = fixture.reads.get();
+        assert_eq!(
+            graph(&fixture, &DEFAULT_TENANT, None)
+                .unwrap_err()
+                .to_string(),
+            "tenant_mismatch: operation tenant default differs from store tenant t1"
+        );
+        assert_eq!(fixture.reads.get(), reads);
+        assert_eq!(fixture.writes.get(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn graph_preserves_selected_view_and_normalizes_legacy_metadata() -> Result<()> {
         let mut record = Record::blank("decision", "Read view", "", "reader");
         record.original = Some(serde_json::json!({}));
         record.aliases.push("ADR-0280".into());
         for at in [None, Some("pinned-revision")] {
             let fixture = Fixture {
+                tenant: DEFAULT_TENANT,
+                reads: Cell::default(),
+                writes: Cell::default(),
                 at,
                 format: None,
                 tables: BTreeMap::from([(
@@ -638,7 +694,7 @@ mod tests {
                     vec![(record.id.clone(), serde_json::to_string(&record)?)],
                 )]),
             };
-            let g = graph(&fixture, at)?;
+            let g = graph(&fixture, &DEFAULT_TENANT, at)?;
             let loaded = &g.records[&record.id];
             assert_eq!(loaded.metadata.as_ref().unwrap().number, "0280");
             assert_eq!(loaded.revision, record.revision);
@@ -652,6 +708,9 @@ mod tests {
     fn graph_rejects_miskeyed_rows_and_invalid_import_ownership() -> Result<()> {
         let record = Record::blank("note", "Read integrity", "", "reader");
         let mut fixture = Fixture {
+            tenant: DEFAULT_TENANT,
+            reads: Cell::default(),
+            writes: Cell::default(),
             at: None,
             format: Some(4),
             tables: BTreeMap::from([(
@@ -660,7 +719,7 @@ mod tests {
             )]),
         };
         assert!(
-            graph(&fixture, None)
+            graph(&fixture, &DEFAULT_TENANT, None)
                 .unwrap_err()
                 .to_string()
                 .contains("stored_row_identity: invalid keyed row in records")
@@ -684,7 +743,7 @@ mod tests {
             vec![(member.row_key(), serde_json::to_string(&member)?)],
         );
         assert!(
-            graph(&fixture, None)
+            graph(&fixture, &DEFAULT_TENANT, None)
                 .unwrap_err()
                 .to_string()
                 .contains("source_ownership: invalid membership")
@@ -694,6 +753,9 @@ mod tests {
     #[test]
     fn alias_allocation_follows_highest_existing_number() -> Result<()> {
         let fixture = Fixture {
+            tenant: DEFAULT_TENANT,
+            reads: Cell::default(),
+            writes: Cell::default(),
             at: None,
             format: None,
             tables: BTreeMap::new(),

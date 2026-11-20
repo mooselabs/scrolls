@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     cli::{Cli, Cmd, ImportCommand, Role},
-    model::digest,
+    model::{DEFAULT_TENANT, digest},
     review::receipt_payload,
     schema::Schema,
 };
@@ -265,7 +265,7 @@ pub(crate) fn initialization_identity<'a>(
 
 pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     let (op, hash) = initialization_identity(cli, schema)?;
-    let context = cli.operation_context(op, &hash, cli.role)?;
+    let context = cli.operation_context(&DEFAULT_TENANT, op, &hash, cli.role)?;
     initialize_with_context(cli, path, schema, &context)
 }
 
@@ -283,6 +283,7 @@ pub(crate) fn initialize_with_context(
     else {
         unreachable!()
     };
+    Store::require_tenant(&context.tenant)?;
     let s = Store::shared_session(path, &cli.store)?;
     let ontology_digest = schema.revision();
     let op = &context.op_id;

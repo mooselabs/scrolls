@@ -66,6 +66,7 @@ fn actor(cli: &Cli) -> Result<&str> {
 impl Cli {
     pub(crate) fn operation_context(
         &self,
+        tenant: &TenantId,
         op: &str,
         hash: &str,
         role: Role,
@@ -99,6 +100,7 @@ impl Cli {
             _ => None,
         };
         Ok(OperationContext {
+            tenant: tenant.clone(),
             op_id: op.into(),
             args_hash: hash.into(),
             explicit_op_id: self.op_id.is_some(),
@@ -239,20 +241,24 @@ fn proposal_name(s: &Store, input: &str) -> Result<String> {
     }
 }
 pub fn run(cli: &Cli) -> Result<Value> {
-    run_with_verifier(cli, None, None)
+    run_with_verifier(cli, &DEFAULT_TENANT, None, None)
 }
 
-/// Run a command with an optional embedding-host verifier and opaque credential.
+/// Run a command for the embedding host's tenant, with an optional verifier
+/// and opaque credential. Local and shared Dolt serve only `DEFAULT_TENANT`.
 /// Human and controller claims require verification when a verifier is present.
 /// Scrolls receives the credential only through this entry point.
 pub fn run_with_verifier(
     cli: &Cli,
+    tenant: &TenantId,
     verifier: Option<&dyn CredentialVerifier>,
     credential: Option<&[u8]>,
 ) -> Result<Value> {
+    Store::require_tenant(tenant)?;
     credential::check_controller(cli.role, verifier, cli.command.moves_label())?;
     let authorization = match verifier {
         Some(verifier) if cli.role != Role::Agent => Authorization::Credentialed {
+            tenant,
             actor: actor(cli)?,
             role: cli.role,
             verifier,
@@ -286,10 +292,10 @@ pub fn run_with_verifier(
     }
     if let Cmd::Import { command } = &cli.command {
         if handles_markdown_import(command)? {
-            return run_markdown_import(cli, command, &authorization, &op);
+            return run_markdown_import(cli, command, &authorization, tenant, &op);
         }
         if !matches!(command, ImportCommand::Markdown { .. }) {
-            return run_source_import(cli, command, &authorization, &op);
+            return run_source_import(cli, command, &authorization, tenant, &op);
         }
     }
     if matches!(
@@ -330,14 +336,14 @@ pub fn run_with_verifier(
         if let Some(connection) = &cli.connection {
             let (op, hash) = storage::shared::initialization_identity(cli, schema)?;
             let role = authorization.role(op, &hash, cli.dry_run, None)?;
-            let context = cli.operation_context(op, &hash, role)?;
+            let context = cli.operation_context(tenant, op, &hash, role)?;
             return storage::shared::initialize_with_context(cli, connection, schema, &context);
         }
         let hash = digest(serde_json::to_vec(
             &json!({"command":"init","schema":initial_schema,"actor":cli.actor,"role":cli.role}),
         )?);
         let role = authorization.role(&op, &hash, cli.dry_run, None)?;
-        Some(cli.operation_context(&op, &hash, role)?)
+        Some(cli.operation_context(tenant, &op, &hash, role)?)
     } else {
         None
     };
@@ -346,7 +352,7 @@ pub fn run_with_verifier(
             &json!({"command":"migrate","actor":cli.actor,"role":cli.role}),
         )?);
         let role = authorization.role(&op, &hash, cli.dry_run, None)?;
-        Some(cli.operation_context(&op, &hash, role)?)
+        Some(cli.operation_context(tenant, &op, &hash, role)?)
     } else {
         None
     };
@@ -436,9 +442,28 @@ pub fn run_with_verifier(
         return wrap(&store, result, branch);
     }
     if matches!(cli.command, Cmd::Doctor) {
+        let graph = store.graph()?;
+        let policy = if verifier.is_some() {
+            "host credential verification for human and controller roles"
+        } else {
+            "cooperative client roles; not authenticated identity"
+        };
         return wrap(
             &store,
-            json!({"schema_version":store.one::<u32>("metadata","schema")?,"store_id":store.one::<String>("metadata","store_id")?,"dolt_version":storage::DOLT_VERSION,"shared_query_bytes":store.shared_query_limit(),"clean":true,"import_sources":store.graph()?.import_sources,"import_health":crate::source_import::health(&store.graph()?,&store.import_files()?)?,"markdown_health":crate::markdown_import::health(&store,&store.graph()?,None)?,"branches":store.branches()?,"import":store.one::<ImportInfo>("metadata","import")?,"policy":if verifier.is_some() {"host credential verification for human and controller roles"} else {"cooperative client roles; not authenticated identity"}}),
+            json!({
+                "schema_version": selected_format,
+                "store_id": store.one::<String>("metadata", "store_id")?,
+                "tenant": store.tenant().as_str(),
+                "dolt_version": storage::DOLT_VERSION,
+                "shared_query_bytes": store.shared_query_limit(),
+                "clean": true,
+                "import_sources": graph.import_sources,
+                "import_health": crate::source_import::health(&graph, &store.import_files()?)?,
+                "markdown_health": crate::markdown_import::health(&store, &graph, None)?,
+                "branches": store.branches()?,
+                "import": store.one::<ImportInfo>("metadata", "import")?,
+                "policy": policy,
+            }),
             branch,
         );
     }
@@ -583,7 +608,7 @@ pub fn run_with_verifier(
             "edit target changed after credential verification"
         );
     }
-    let context = cli.operation_context(&op, &hash, role)?;
+    let context = cli.operation_context(tenant, &op, &hash, role)?;
     if matches!(cli.command, Cmd::Recover { resume: true, .. }) {
         return store.recover(&context);
     }
@@ -1331,8 +1356,13 @@ fn handles_markdown_import(command: &ImportCommand) -> Result<bool> {
         _ => false,
     })
 }
-fn import_invocation(cli: &Cli, role: Role) -> Result<crate::source_import::Invocation<'_>> {
+fn import_invocation<'a>(
+    cli: &'a Cli,
+    tenant: &'a TenantId,
+    role: Role,
+) -> Result<crate::source_import::Invocation<'a>> {
     Ok(crate::source_import::Invocation {
+        tenant,
         actor: cli
             .actor
             .as_deref()
@@ -1347,6 +1377,7 @@ fn run_source_import(
     cli: &Cli,
     command: &ImportCommand,
     authorization: &Authorization<'_>,
+    tenant: &TenantId,
     op: &str,
 ) -> Result<Value> {
     use crate::source_import::{self, ApplyPreparation, ApplyRequest, PlanRequest};
@@ -1426,12 +1457,13 @@ fn run_source_import(
         ImportCommand::Apply { plan } => {
             // Preserve the standalone adapter's connection/plan error ordering.
             let (shared, request) = if authorization.requires_verification() {
-                let mut request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+                let mut request =
+                    ApplyRequest::read(plan, import_invocation(cli, tenant, cli.role)?)?;
                 authorize_import(&mut request.context, authorization)?;
                 (shared_import_store(cli)?, request)
             } else {
                 let shared = shared_import_store(cli)?;
-                let request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+                let request = ApplyRequest::read(plan, import_invocation(cli, tenant, cli.role)?)?;
                 (shared, request)
             };
             let prepared = {
@@ -1452,6 +1484,7 @@ fn run_markdown_import(
     cli: &Cli,
     command: &ImportCommand,
     authorization: &Authorization<'_>,
+    tenant: &TenantId,
     op: &str,
 ) -> Result<Value> {
     use crate::markdown_import::{self, ApplyRequest, PlanRequest};
@@ -1502,7 +1535,7 @@ fn run_markdown_import(
             )
         }
         ImportCommand::Apply { plan } => {
-            let mut request = ApplyRequest::read(plan, import_invocation(cli, cli.role)?)?;
+            let mut request = ApplyRequest::read(plan, import_invocation(cli, tenant, cli.role)?)?;
             authorize_import(&mut request.context, authorization)?;
             let s = if cli.dry_run {
                 Store::open_shared(connection, &cli.store)?

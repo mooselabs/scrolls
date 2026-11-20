@@ -1,7 +1,61 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
+
+/// Tenant identifiers contain 1–63 ASCII bytes. The first is a lowercase
+/// letter or digit. The rest may also be hyphens. Identifiers are case-sensitive.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TenantId(Cow<'static, str>);
+
+/// The tenant served by every standalone Dolt store, including shared Dolt.
+pub const DEFAULT_TENANT: TenantId = TenantId(Cow::Borrowed("default"));
+
+impl TenantId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn check_served_by(&self, served: &Self) -> Result<()> {
+        anyhow::ensure!(
+            self == served,
+            "tenant_mismatch: operation tenant {self} differs from store tenant {served}"
+        );
+        Ok(())
+    }
+}
+
+impl FromStr for TenantId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        fn alphanumeric(byte: u8) -> bool {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit()
+        }
+        let bytes = value.as_bytes();
+        anyhow::ensure!(
+            bytes.len() <= 63
+                && bytes.first().is_some_and(|&byte| alphanumeric(byte))
+                && bytes
+                    .iter()
+                    .copied()
+                    .all(|byte| alphanumeric(byte) || byte == b'-'),
+            "invalid tenant ID: expected 1–63 lowercase ASCII letters, digits or hyphens, starting with a letter or digit"
+        );
+        Ok(Self(Cow::Owned(value.to_owned())))
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Role {

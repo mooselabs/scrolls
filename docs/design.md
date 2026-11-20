@@ -155,6 +155,20 @@ The engine modules are `model`, `schema`, `store`, `policy`, `mutation`, `query`
 `KnowledgeStore` in `src/store.rs`. Its branch selection chooses main or a named
 proposal as the session view for subsequent unpinned reads and commits.
 
+Each opened `KnowledgeStore` serves a single `model::TenantId`, exposed by
+`KnowledgeStore::tenant()`. Tenant IDs are 1–63 ASCII bytes, starting with a
+lowercase letter or digit, followed by lowercase letters, digits or hyphens.
+`model::DEFAULT_TENANT` has the stable spelling `default`. Local and shared
+Dolt derive it from the backend, including for stores created by previous
+versions. `doctor` reports it without a persisted tenant field.
+
+The standalone command adapter uses `DEFAULT_TENANT`. Embedding hosts supply
+their tenant to `app::run_with_verifier`, which checks the Dolt scope before
+opening the store. The credential verifier receives that tenant with the
+operation. Engine operations with an explicit tenant check it against the
+opened store before reading or writing. Calls on a store handle without a
+separate tenant argument use the handle's scope.
+
 The Dolt backend lives in `src/storage.rs` and `src/storage/`. It owns SQL
 encoding, request sizing, branch checkout, transactions and the shared recovery
 protocol. The CLI adapter (`src/cli.rs`, `src/main.rs`, `src/app.rs`) and HTTP

@@ -44,6 +44,15 @@ pub struct Store {
     inspection: Option<Box<std::cell::RefCell<inspection::Session>>>,
 }
 impl Store {
+    /// Check before opening, since even a read command can recover a local store.
+    pub(crate) fn require_tenant(tenant: &TenantId) -> Result<()> {
+        anyhow::ensure!(
+            tenant == &DEFAULT_TENANT,
+            "tenant_mismatch: operation tenant {tenant} cannot open a Dolt store, which serves only the default tenant ({DEFAULT_TENANT})"
+        );
+        Ok(())
+    }
+
     /// Open without recovery, branch checkout, configuration writes or initialization.
     pub fn open_readonly(root: &Path, binary: &Path) -> Result<Self> {
         Self::open_readonly_wait(root, binary, None)
@@ -174,7 +183,7 @@ impl Store {
         crate::store::import_files(self, Some(rev))
     }
     pub fn graph_at(&self, rev: &str) -> Result<Graph> {
-        crate::store::graph(self, Some(rev))
+        crate::store::graph(self, self.tenant(), Some(rev))
     }
     fn migration_journal(&self, value: &Value) -> Result<()> {
         let mut f = tempfile::NamedTempFile::new_in(&self.root)?;
@@ -813,7 +822,7 @@ impl Store {
         .transpose()
     }
     pub fn graph(&self) -> Result<Graph> {
-        crate::store::graph(self, None)
+        crate::store::graph(self, self.tenant(), None)
     }
     pub fn transaction(&self, changes: &str, message: &str, actor: &str) -> Result<()> {
         if let Some(session) = &self.shared {
@@ -994,6 +1003,9 @@ pub fn graph_changes(before: &Graph, after: &Graph) -> Result<String> {
 }
 
 impl KnowledgeStore for Store {
+    fn tenant(&self) -> &TenantId {
+        &DEFAULT_TENANT
+    }
     fn select_branch(&self, branch: &str) -> Result<()> {
         self.checkout(branch)
     }
@@ -1048,8 +1060,9 @@ impl KnowledgeStore for Store {
         self.write_changes(changes, message, actor, WriteMode::Bootstrap, validate)
     }
     fn propose(&self, context: &OperationContext, write: ProposalWrite<'_>) -> Result<Value> {
+        context.check_tenant(self)?;
         if write.changes.changes_graph() {
-            let before = crate::store::graph(self, write.start)?;
+            let before = crate::store::graph(self, &context.tenant, write.start)?;
             self.check_graph(&before, &write.changes.candidate(&before)?)?;
         }
         if self.is_shared() {
@@ -1079,6 +1092,7 @@ impl KnowledgeStore for Store {
         proposal: &Proposal,
         result: &Value,
     ) -> Result<Value> {
+        context.check_tenant(self)?;
         let s = self;
         let name = &proposal.branch;
         let who = context.actor.as_deref().context("actor")?;
@@ -1115,6 +1129,7 @@ impl KnowledgeStore for Store {
         revisions: (&str, &str),
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Value> {
+        context.check_tenant(self)?;
         if self.is_shared() {
             let current_main = self.graph_at("main")?;
             return shared_review::accept(self, context, &current_main, proposal, revisions);
@@ -1186,6 +1201,7 @@ impl KnowledgeStore for Store {
         outcome
     }
     fn recover(&self, context: &OperationContext) -> Result<Value> {
+        context.check_tenant(self)?;
         shared_review::recover(self, context)
     }
     fn resume(
@@ -1195,6 +1211,7 @@ impl KnowledgeStore for Store {
         op: &str,
         hash: &str,
     ) -> Result<Option<Value>> {
+        context.check_tenant(self)?;
         let current_main = self.graph_at("main")?;
         shared_review::resume(self, context, &current_main, op, hash)
     }
@@ -1364,6 +1381,7 @@ mod lifecycle_tests {
             reason: None,
         };
         let mut context = OperationContext {
+            tenant: DEFAULT_TENANT,
             op_id: "propose".into(),
             args_hash: "hash".into(),
             explicit_op_id: true,

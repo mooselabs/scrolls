@@ -8,7 +8,7 @@
     }
   ],
   "held": {
-    "tests/shared_session.rs": 4985,
-    "tests/dolt.rs": 2996
+    "tests/shared_session.rs": 4952,
+    "tests/dolt.rs": 2933
   }
 }

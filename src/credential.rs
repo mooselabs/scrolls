@@ -1,10 +1,11 @@
 //! Role-claim verification supplied by the embedding host.
-use crate::model::Role;
+use crate::model::{Role, TenantId};
 use anyhow::{Result, ensure};
 
 /// A host verifies an opaque credential against this exact request. A verifier
 /// should be scoped to the destination store and check all applicable fields.
 pub struct VerificationRequest<'a> {
+    pub tenant: &'a TenantId,
     pub actor: &'a str,
     pub claimed_role: Role,
     pub op_id: &'a str,
@@ -55,6 +56,7 @@ pub trait CredentialVerifier {
 pub(crate) enum Authorization<'a> {
     Cooperative(Role),
     Credentialed {
+        tenant: &'a TenantId,
         actor: &'a str,
         role: Role,
         verifier: &'a dyn CredentialVerifier,
@@ -77,6 +79,7 @@ impl Authorization<'_> {
         match *self {
             Self::Cooperative(role) => Ok(role),
             Self::Credentialed {
+                tenant,
                 actor,
                 role,
                 verifier,
@@ -84,6 +87,7 @@ impl Authorization<'_> {
             } => {
                 let decision = verifier.verify(
                     &VerificationRequest {
+                        tenant,
                         actor,
                         claimed_role: role,
                         op_id,

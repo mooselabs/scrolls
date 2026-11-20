@@ -69,7 +69,7 @@ pub fn seed(store: &dyn KnowledgeStore) -> Result<()> {
 /// A proposal that changes a record, ontology, existing edge and a new edge.
 /// Hosts commit this on PROPOSAL after exposing the seeded main revision there.
 pub fn proposal_fixture(store: &dyn KnowledgeStore) -> Result<ChangeSet> {
-    let mut graph = crate::store::graph(store, Some(&store.head("main")?))?;
+    let mut graph = crate::store::graph(store, store.tenant(), Some(&store.head("main")?))?;
     let record = graph.records.get_mut(RECORD).context("fixture record")?;
     record.body = "Proposed portable fixture".into();
     record.revision += 1;
