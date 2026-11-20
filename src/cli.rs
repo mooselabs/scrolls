@@ -378,6 +378,15 @@ pub enum Cmd {
         id: String,
         #[arg(long)]
         provenance: bool,
+        /// Read the record at the immutable revision selected by this label.
+        #[arg(long)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// List or move labels on a record.
+    Label {
+        #[command(subcommand)]
+        command: LabelCommand,
     },
     Search {
         terms: String,
@@ -572,12 +581,43 @@ impl Cmd {
                 | Self::Ask { .. }
                 | Self::Answer { .. }
                 | Self::Accept { .. }
-        ) || matches!(self,Self::Review{action,..} if action=="accept"||action=="reject")
+        ) || self.moves_label()
+            || matches!(self,Self::Review{action,..} if action=="accept"||action=="reject")
             || matches!(
                 self,
                 Self::Recover { abandon: true, .. } | Self::Recover { resume: true, .. }
             )
     }
+
+    pub(crate) fn moves_label(&self) -> bool {
+        matches!(
+            self,
+            Self::Label {
+                command: LabelCommand::Move { .. }
+            }
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Subcommand)]
+pub enum LabelCommand {
+    /// List a record's labels and their target revisions.
+    List { id: String },
+    /// Move a label on main as a human, checking the previous target.
+    Move {
+        id: String,
+        name: String,
+        #[arg(long, value_name = "REVISION")]
+        to: String,
+        #[arg(
+            long,
+            value_name = "REVISION",
+            required_unless_present = "expect_absent"
+        )]
+        expect: Option<String>,
+        #[arg(long, conflicts_with = "expect")]
+        expect_absent: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Subcommand)]
@@ -648,6 +688,49 @@ pub enum BackupCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_parse_for_reads_and_moves() {
+        let show = Cli::try_parse_from(["scrolls", "show", "sc-id", "--label", "stable"]).unwrap();
+        assert!(matches!(
+            show.command,
+            Cmd::Show { id, label: Some(name), .. } if id == "sc-id" && name == "stable"
+        ));
+        let list = Cli::try_parse_from(["scrolls", "label", "list", "sc-id"]).unwrap();
+        assert!(!list.command.mutation());
+        assert!(matches!(
+            list.command,
+            Cmd::Label { command: LabelCommand::List { id } } if id == "sc-id"
+        ));
+        let base = [
+            "scrolls",
+            "label",
+            "move",
+            "sc-id",
+            "stable",
+            "--to",
+            "revision-b",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--expect",
+                "revision-a",
+                "--expect-absent"
+            ]))
+            .is_err()
+        );
+        for flags in [vec!["--expect-absent"], vec!["--expect", "revision-a"]] {
+            let cli = Cli::try_parse_from(base.into_iter().chain(flags)).unwrap();
+            assert!(cli.command.mutation());
+            assert!(matches!(
+                cli.command,
+                Cmd::Label { command: LabelCommand::Move { id, name, to, expect, expect_absent } }
+                    if id == "sc-id" && name == "stable" && to == "revision-b"
+                        && (expect_absent && expect.is_none() || !expect_absent && expect.as_deref() == Some("revision-a"))
+            ));
+        }
+    }
 
     #[test]
     fn render_formats_and_default_keep_engine_serialization() {

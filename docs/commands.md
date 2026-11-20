@@ -24,7 +24,9 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 | `review accept BRANCH --review-token TOKEN` | Human review, merged-data revalidation and guarded acceptance. |
 | `review reject BRANCH --reason TEXT` | Human rejection with reason. |
 | `prime [--budget N]` | Complete schema guide/instructions/pins under a soft byte budget. |
-| `show ID` | Full record and immediate references. |
+| `show ID [--label NAME]` | Full record and immediate references, optionally at a label's target revision. |
+| `label list ID` | Record ID and a map of label names to their targets. |
+| `label move ID NAME --to STORE_REV (--expect STORE_REV \| --expect-absent)` | Human-only compare-and-set on local main. |
 | `context ID [--budget N]` | Document first, immediate references, hard byte budget. |
 | `context --bead REF [--budget N]` | Cached Beads metadata and direct document references. |
 | `list [--kind K] [--status S] [--owner NAME] [--field KEY=JSON]` | Deterministic filtered records; `--owner me` binds the actor. |
@@ -42,8 +44,33 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 Bodies accept `--body`, `--body-file FILE` (`-` for stdin), or `--editor`.
 Optional domain metadata uses `--confidence`, `--review-every`, and on edit,
 `--last-reviewed YYYY-MM-DD`. Custom schemas can omit its validation/defaults.
-Expected revisions always refer to records, not the enclosing Dolt revision.
+Graph mutation expectations use numeric record revisions. Label moves use store revisions.
 Retries use the same `--op-id`, actor, role, arguments and file contents.
+
+## Record labels
+
+Label names are unique per record and contain 1–32 ASCII characters. A name
+starts with a lowercase letter and may continue with lowercase letters,
+digits, and hyphens. Stores without label rows list an empty `labels` map.
+
+`label move` requires `--role human` and an actor. It runs on local main and
+refuses `--proposal` and `--connection`. Pass a full store revision from
+main history where the record exists. Use `--expect-absent` to create a label
+or `--expect STORE_REV` to move it from that exact target. A stale expectation
+leaves the label and main unchanged. The move and its receipt commit together.
+Moving a label leaves the record and its numeric revision unchanged.
+The receipt includes `actor`, `role`, `id`, `label`, `previous_target`, and
+`new_target`. A retry with the same `--op-id` returns the stored receipt.
+`--dry-run` validates the move and previews the receipt without committing.
+
+`label list` and `show --label` find the record and label in the selected
+branch snapshot, which defaults to main. `show --label` reads the record and
+its references at the resolved revision. The response includes the label
+in `data.label`, the immutable target in `revision` and
+`data.resolved_revision`, and the numeric record revision in
+`data.record.revision`. A missing label reports the record ID and label name.
+The local `consumed.jsonl` row and the shared `consumed` response each report
+the resolved store revision and the historical record revision.
 
 ## Batch format
 

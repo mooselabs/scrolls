@@ -51,6 +51,13 @@ pub struct View<'a> {
     pub store_id: Option<&'a str>,
     pub actor: &'a str,
 }
+
+pub(crate) struct LabelledDocument {
+    pub id: String,
+    pub revision: String,
+    pub graph: Graph,
+}
+
 impl View<'_> {
     pub fn resolve(&self, name: &str) -> Result<String> {
         let name = if let Some(uri) = name.strip_prefix("scrolls://") {
@@ -65,6 +72,27 @@ impl View<'_> {
         };
         self.graph.resolve(name)
     }
+    pub(crate) fn at_label(
+        &self,
+        store: &dyn KnowledgeStore,
+        at: &str,
+        record: &str,
+        name: &str,
+    ) -> Result<LabelledDocument> {
+        let id = self.resolve(record)?;
+        let revision = crate::label::resolve(store, &id, name, at)?;
+        let graph = store::graph(store, Some(&revision))?;
+        ensure!(
+            graph.records.contains_key(&id),
+            "label_target: record {id} label {name:?} has no record at revision {revision}"
+        );
+        Ok(LabelledDocument {
+            id,
+            revision,
+            graph,
+        })
+    }
+
     pub fn execute(&self, operation: Operation<'_>) -> Result<Value> {
         let g = self.graph;
         match operation {

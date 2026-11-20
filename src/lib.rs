@@ -2,6 +2,7 @@ pub mod app;
 pub mod beads;
 pub mod cli;
 pub mod import;
+mod label;
 pub mod model;
 pub mod policy;
 pub mod presentation;

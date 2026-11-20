@@ -2,7 +2,7 @@ use crate::{
     cli::*,
     model::*,
     policy, query,
-    review::{receipt_changes, wrap},
+    review::{receipt_changes, wrap, wrap_at},
     storage::{self, Store, validate_merged_review},
     store::{Change, ChangeSet, KnowledgeStore, ProposalWrite},
 };
@@ -125,6 +125,13 @@ pub fn run(cli: &Cli) -> Result<Value> {
         storage::shared::check_command(cli)?;
     } else if matches!(cli.command, Cmd::Recover { .. }) {
         bail!("recover is a shared-store command; use --connection");
+    }
+    if cli.command.moves_label() {
+        ensure!(cli.role == Role::Human, "label moves require --role human");
+        ensure!(
+            cli.proposal.is_none(),
+            "label moves operate on main; omit --proposal"
+        );
     }
     if let Cmd::Import { command } = &cli.command {
         if handles_markdown_import(command)? {
@@ -452,6 +459,25 @@ pub fn run(cli: &Cli) -> Result<Value> {
             }
         }
     }
+    if let Cmd::Label {
+        command:
+            LabelCommand::Move {
+                id,
+                name,
+                to,
+                expect,
+                expect_absent,
+            },
+    } = &cli.command
+    {
+        ensure!(
+            expect.is_some() != *expect_absent,
+            "label moves require exactly one of --expect or --expect-absent"
+        );
+        let id = before.resolve(id)?;
+        let data = crate::label::move_to(&store, &id, name, to, expect.as_deref(), &context)?;
+        return wrap(&store, data, branch);
+    }
     if matches!(cli.command, Cmd::Recover { .. }) {
         return store.recover(&context);
     }
@@ -754,6 +780,20 @@ pub fn run(cli: &Cli) -> Result<Value> {
         store_id: store_id.as_deref(),
         actor: who,
     };
+    let labelled = match &cli.command {
+        Cmd::Show {
+            id,
+            label: Some(name),
+            ..
+        } => Some(reads.at_label(&store, &revision, id, name)?),
+        _ => None,
+    };
+    let (revision, graph) = labelled
+        .as_ref()
+        .map_or((revision.as_str(), &graph), |target| {
+            (target.revision.as_str(), &target.graph)
+        });
+    let reads = crate::read::View { graph, ..reads };
     let data = match &cli.command {
         Cmd::List { filters } => {
             let rows = reads.execute(crate::read::Operation::Records {
@@ -776,10 +816,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
             SchemaCommand::Export => json!({"yaml":serde_yaml::to_string(&graph.schema)?}),
             SchemaCommand::Validate { file } => {
                 let mut configured = crate::schema::Schema::parse(&fs::read_to_string(file)?)?;
-                configured.resolve_pins(&graph)?;
+                configured.resolve_pins(graph)?;
                 let mut after = graph.clone();
                 after.schema = configured;
-                policy::validate_change(&graph, &after, &BTreeSet::new(), &local)?;
+                policy::validate_change(graph, &after, &BTreeSet::new(), &local)?;
                 json!({"valid":true,"schema_revision":after.schema.revision()})
             }
             SchemaCommand::Apply { .. } => unreachable!(),
@@ -793,13 +833,31 @@ pub fn run(cli: &Cli) -> Result<Value> {
                 at: at.as_deref(),
             })?
         }
-        Cmd::Show { id, provenance } => {
-            let id = reads.resolve(id)?;
-            consumed.push(id.clone());
-            reads.execute(crate::read::Operation::Document {
+        Cmd::Show {
+            id,
+            provenance,
+            label,
+        } => {
+            let id = match &labelled {
+                Some(target) => target.id.clone(),
+                None => reads.resolve(id)?,
+            };
+            let mut data = reads.execute(crate::read::Operation::Document {
                 id: &id,
                 provenance: *provenance,
-            })?
+            })?;
+            consumed.push(id);
+            if let Some(name) = label {
+                data["label"] = json!(name);
+                data["resolved_revision"] = json!(revision);
+            }
+            data
+        }
+        Cmd::Label {
+            command: LabelCommand::List { id },
+        } => {
+            let id = reads.resolve(id)?;
+            json!({"id":id,"labels":crate::label::list(&store, &id, revision)?})
         }
         Cmd::Search {
             terms,
@@ -835,7 +893,7 @@ pub fn run(cli: &Cli) -> Result<Value> {
         Cmd::Context { id, bead, budget } => {
             let packet = if let Some(reference) = bead {
                 let reference = local.resolve(reference)?.uri();
-                query::bead_packet(&graph, &reference, &local, *budget)?
+                query::bead_packet(graph, &reference, &local, *budget)?
             } else {
                 reads.execute(crate::read::Operation::Context {
                     id: id.as_deref().context("missing context ID")?,
@@ -858,10 +916,10 @@ pub fn run(cli: &Cli) -> Result<Value> {
         Cmd::Proposals => json!(crate::read::proposals(&store)?),
         Cmd::History { id } => {
             let id = id.as_deref().map(|id| graph.resolve(id)).transpose()?;
-            json!(crate::read::history(&store, &revision, id.as_deref())?)
+            json!(crate::read::history(&store, revision, id.as_deref())?)
         }
         Cmd::Lint => {
-            let mut lint = policy::lint(&graph, &local);
+            let mut lint = policy::lint(graph, &local);
             lint.extend(policy::lint_routing(&routing));
             let original_debt = info
                 .as_ref()
@@ -887,15 +945,15 @@ pub fn run(cli: &Cli) -> Result<Value> {
             json!(rows)
         }
         Cmd::Render { out, format } => {
-            crate::markdown_import::health(&store, &graph, None)?;
+            crate::markdown_import::health(&store, graph, None)?;
             crate::render::render(
-                &graph,
+                graph,
                 &store.rows("source_files")?,
                 info.as_ref(),
                 &store
                     .one::<Vec<Edge>>("metadata", "import_edges")?
                     .unwrap_or_default(),
-                &revision,
+                revision,
                 crate::render::Options {
                     out,
                     format: *format,
@@ -928,12 +986,12 @@ pub fn run(cli: &Cli) -> Result<Value> {
         store.audit(
             &cli.session,
             who,
-            &revision,
+            revision,
             &serde_json::to_string(&cli.command)?,
             &consumed,
         )?;
     }
-    let mut response = wrap(&store, data, branch)?;
+    let mut response = wrap_at(data, branch, revision);
     if store.is_shared() {
         response["consumed"] = json!({"store_id":store.one::<String>("metadata", "store_id")?, "revision":revision, "schema_revision":graph.schema.revision(), "records":consumed.iter().map(|id| (id, graph.records[id].revision)).collect::<std::collections::BTreeMap<_,_>>()});
     }

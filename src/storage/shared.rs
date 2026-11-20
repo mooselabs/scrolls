@@ -72,6 +72,10 @@ fn connect(path: &Path, recovery: bool) -> Result<SharedSession> {
 
 pub fn check_command(cli: &Cli) -> Result<()> {
     ensure!(
+        !cli.command.moves_label(),
+        "shared_unsupported: label moves are available on local stores"
+    );
+    ensure!(
         !(matches!(cli.command, Cmd::Recover { .. }) && cli.proposal.is_some()),
         "recovery operates on main; omit --proposal"
     );

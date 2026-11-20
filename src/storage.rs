@@ -937,6 +937,7 @@ impl Store {
         via: &str,
         ids: &[String],
     ) -> Result<()> {
+        let graph = self.graph_at(revision)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -944,7 +945,7 @@ impl Store {
         writeln!(
             f,
             "{}",
-            json!({"session":session,"actor":actor,"revision":revision,"via":via,"ids":ids,"record_revisions": self.graph()?.records.values().filter(|r|ids.contains(&r.id)).map(|r|(&r.id,r.revision)).collect::<std::collections::BTreeMap<_,_>>(),"read_at":now()})
+            json!({"session":session,"actor":actor,"revision":revision,"via":via,"ids":ids,"record_revisions": graph.records.values().filter(|r|ids.contains(&r.id)).map(|r|(&r.id,r.revision)).collect::<std::collections::BTreeMap<_,_>>(),"read_at":now()})
         )?;
         f.sync_data()?;
         Ok(())

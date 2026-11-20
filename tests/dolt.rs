@@ -6,6 +6,8 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
 };
+#[path = "dolt/read_revisions.rs"]
+mod read_revisions;
 #[path = "dolt/review_tokens.rs"]
 mod review_tokens;
 
@@ -772,44 +774,6 @@ fn triggers_validate_authoring_acceptance_and_existing_store_reads() {
         ],
         "glob",
     );
-}
-
-#[test]
-fn prime_pins_are_reviewed_and_audit_revisions() {
-    let f = Fixture::new();
-    let r = f.ok(&[
-        "new",
-        "note",
-        "--title",
-        "Startup",
-        "--body",
-        &"read this".repeat(3000),
-    ]);
-    let id = r["id"].as_str().unwrap();
-    let schema = f.ok(&["schema", "show"]);
-    let mut config = schema["schema"].clone();
-    config["pins"] = json!([id, id]);
-    let path = f.batch_file(config);
-    let p = f.ok(&[
-        "schema",
-        "apply",
-        path.to_str().unwrap(),
-        "--expect",
-        schema["schema_revision"].as_str().unwrap(),
-    ]);
-    assert_eq!(f.ok(&["prime"])["items"], json!([]));
-    f.ok(&[
-        "review",
-        "accept",
-        p["branch"].as_str().unwrap(),
-        "--review-token",
-        &f.review_token(p["branch"].as_str().unwrap()),
-    ]);
-    let p = f.ok(&["--session", "pinned", "prime", "--budget", "1"]);
-    assert_eq!(p["items"].as_array().unwrap().len(), 1);
-    assert!(p["over_budget_bytes"].as_u64().unwrap() > 0);
-    let audit = f.ok(&["consumed", "--for-session", "pinned"]);
-    assert_eq!(audit[0]["record_revisions"][id], 1);
 }
 
 #[test]

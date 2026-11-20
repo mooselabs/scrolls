@@ -90,6 +90,12 @@ is delivered, and overruns are explicit. Pins resolve to stable IDs when applied
 reads use their current versions on the selected branch. Consumption auditing
 includes delivered record IDs and revisions.
 
+Record labels add movable names for exact revisions of a record. A human
+moves a label on local main in the same commit as its receipt. Labels are
+versioned registry rows and require no store migration. A run that reads
+through a label records the immutable store revision it resolved and the
+record revision at that snapshot.
+
 `show` and `context` share immediate relationship references. References contain
 direction, relation, ID, title, kind, status and revision, without neighboring
 bodies. Context puts the document first, enforces a hard budget, and identifies

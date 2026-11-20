@@ -141,6 +141,8 @@ record's numeric revision and write results to obtain proposal branch names.
 | `scrolls new evidence --title 'Finding' --body 'Observed result'` | Capture an attributed source. |
 | `scrolls list --kind decision --status accepted` | List accepted decisions. |
 | `scrolls show ID` | Read a record, its revision, and relationships. |
+| `scrolls show ID --label NAME` | Read the record and relationships at the revision selected by a label. |
+| `scrolls label list ID` | List the record's labels and their target revisions. |
 | `scrolls search 'rollback'` | Search titles and bodies; notes are excluded. |
 | `scrolls walk ID --depth 2` | Explore incoming and outgoing graph edges. |
 | `scrolls context ID --budget 16000` | Retrieve context around a record or entity. |
@@ -158,6 +160,19 @@ Bodies accept `--body`, `--body-file PATH`, `--body-file -`, or piped stdin.
 `edit` opens `$VISUAL` / `$EDITOR` on a terminal; `--editor` selects that behavior
 explicitly. See the [full command reference](docs/commands.md) for flags,
 relationships, question answers, dry runs, and JSON response contracts.
+
+### Movable labels
+
+Use a label such as `stable` to point a record at an exact revision on main.
+Create it with `scrolls --role human label move ID stable --to STORE_REV --expect-absent`.
+For a later move, pass the current target as `--expect OLD_STORE_REV`.
+Moves require an actor, run on local main, and accept `--dry-run` and
+`--op-id`. Shared stores support label reads and listing. Their writers
+refuse label moves.
+
+Labelled reads report the resolved store revision and the record's numeric
+revision. The consumption audit records the same revisions. See the
+[label command reference](docs/commands.md#record-labels).
 
 ## Agent setup
 
