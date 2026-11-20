@@ -197,8 +197,11 @@ publication requires main and preserves unrelated metadata. The external backlin
 payload version is unchanged. Local aliases, caches and publication receipts
 remain separate from document authority. No live ledger is migrated by this release.
 
-Acceptance requires the `review_token` returned by `review BRANCH`. It binds both
-main and proposal revisions; any intervening write requires a fresh inspection.
+Acceptance requires the v2 `review_token` returned by `review BRANCH`. It binds
+the proposal to the main and proposal revisions reported by the store. Run
+`review BRANCH` again after either revision changes or when replacing a v1 token,
+which acceptance refuses. Completed acceptance receipts replay unchanged with
+the original operation ID and arguments.
 
 ## Configurable imports (0.3)
 

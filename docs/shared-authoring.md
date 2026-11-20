@@ -83,8 +83,9 @@ later units; these reads currently require connectivity and take the lock.
 
 ## Review and interrupted-operation recovery
 
-Inspect `scrolls proposals`, then `scrolls review proposal/ID --json`. Acceptance
-requires the returned revision-bound token:
+Inspect `scrolls proposals`, then `scrolls review proposal/ID --json`. The returned
+v2 review token binds the proposal to the main and proposal revisions reported by
+the store. Pass it when accepting:
 
 ```sh
 scrolls --connection /absolute/machine-local.json --actor alice --role human --op-id accept-1 review accept proposal/ID --review-token ORIGINAL_TOKEN --json
@@ -111,9 +112,12 @@ scrolls --connection /absolute/machine-local.json --actor alice --role human rec
 Resume uses the positional original operation ID; omit `--op-id`. Attribution
 must match the original actor and role. It reuses the original inspected main
 and proposal revisions and token. A stale token requires a new human inspection
-and a new decision operation; recovery never refreshes it automatically.
-Direct writes without a journaled intent still reconcile by repeating their
-original command and operation ID.
+and a new decision operation. Recovery never refreshes it automatically.
+Acceptance and resume refuse v1 tokens. For an interrupted acceptance that used
+v1, abandon the intent and run `scrolls review` again to get a v2 token.
+Completed acceptance receipts replay unchanged with the original operation ID
+and arguments. Direct writes without a journaled intent still reconcile by
+repeating their original command and operation ID.
 
 An owner can explicitly abandon an unpublished intent:
 
@@ -161,10 +165,11 @@ Direct imports commit records, relationships, source files, provenance and the
 receipt atomically. Protected imports use the durable proposal protocol above.
 Prepared intents reserve namespaces even before a proposal branch exists.
 Another client can resume creation without the originating checkout, plan or
-profile file using `recover ORIGINAL_OP --resume`; it then inspects the proposal
-to obtain a review token. Interrupted acceptance uses the already-issued token.
-Explicit abandonment releases an unpublished namespace reservation but never
-makes its original operation ID reusable with changed input.
+profile file using `recover ORIGINAL_OP --resume`. Then run `review BRANCH` to
+obtain a v2 token. Interrupted acceptance follows the
+[review and recovery procedure](#review-and-interrupted-operation-recovery).
+Abandonment releases an unpublished namespace reservation and keeps its original
+operation ID reserved.
 
 Completed receipt replay precedes stale-base and source-object checks: a copied
 plan can recover the original result after later main writes and deletion of

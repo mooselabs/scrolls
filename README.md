@@ -76,8 +76,11 @@ scrolls history $record
 scrolls render --out ./knowledge-export
 ```
 
-Acceptance is bound to the proposal and main revisions in the inspected output.
-Any change to either, including an unrelated main write, requires another review.
+The v2 review token binds the proposal to the main and proposal revisions
+reported by the store. Any change to either revision, including an unrelated
+main write, requires another review. Acceptance refuses v1 tokens. Run
+`scrolls review BRANCH` again to get a v2 token. Completed acceptance receipts
+replay unchanged with the original operation ID and arguments.
 Tokens check revisions within the cooperative role model; they do not authenticate
 a person or prove that someone read the output.
 
@@ -170,9 +173,10 @@ This project uses Scrolls for versioned knowledge.
 - Capture observations as evidence and link conclusions to their supporting evidence.
 - Use `--json` for automation, `--expect` for revisions, and stable `--op-id` values for retries.
 - Inspect completed proposals with `scrolls review <branch>` and leave acceptance to a human.
-- Preserve the returned review token. Acceptance requires that exact token; any
-  change to main or the proposal requires a fresh human review. Never automatically
-  refresh a stale token and retry acceptance.
+- Preserve the returned v2 review token for acceptance. If either revision changes
+  or the token is v1, a human must run `scrolls review <branch>` and inspect the
+  proposal again. Never refresh a token automatically. Retry a completed acceptance
+  with the original operation ID and arguments to replay its receipt.
 - Keep task status and execution dependencies in the project's work tracker.
 ```
 
