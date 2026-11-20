@@ -124,9 +124,10 @@ requires resolved proposals, preserves configured ontologies from format 3, and
 installs the bundled ontology for older stores. It preserves record revisions,
 store identity, receipts, legacy source files and history. Format-4 DDL is prepared
 and validated on a journaled temporary Dolt branch before main advances.
-Historical branches remain readable. Native export includes the complete graph,
-active schema and schema revision. The Liskov import/export adapter retains its
-explicit compatibility checks and independent corpus qualification.
+Historical branches remain readable. Both Markdown export formats capture one
+committed graph and active schema, with a v2 parity manifest. The verifier
+rebuilds that snapshot through `KnowledgeStore` at its recorded revision. The
+Liskov adapter retains its compatibility checks and corpus qualification.
 
 Retrieval profiles, execution stages, workflow languages, generated summaries,
 embeddings, automatic expansion, live ledger migration and documentation-authority

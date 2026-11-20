@@ -42,5 +42,6 @@ query=a.out/'query.json';query.write_text(json.dumps({'op':'all','args':[{'op':'
 assert call('query','--file',query)['items'][0]['id']==q
 call('walk',q,'--direction','incoming','--depth','1');call('history',q)
 call('render','--format','native','--out',a.out/'rendered')
+call('verify-export','--dir',a.out/'rendered')
 (a.out/'transcript.json').write_text(json.dumps(transcript,indent=2)+'\n')
 print(f'Demonstrated schema review, atomic batches, owner guards, references, queries, pins and export: {a.out}')

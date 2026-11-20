@@ -39,7 +39,8 @@ Writes need an actor. The JSON envelope has `schema_version: 2`, `ok`, Dolt
 | `doctor` / `migrate` | Inspect / explicitly upgrade a store. |
 | `import plan markdown DIR --rev COMMIT --git-web-url URL --out PLAN` | Human-only shared editable bootstrap planning; see [contract](shared-markdown.md). |
 | `import markdown DIR --rev COMMIT` | Pinned Git Liskov adapter; requires bundled knowledge ontology. |
-| `render --out DIR [--format native\|liskov]` | Fresh destination export with complete graph and configuration. |
+| `render --out DIR [--format native\|liskov]` | Fresh Markdown snapshot with a v2 parity manifest. |
+| `verify-export --dir DIR` | Verify the export against its recorded store revision. |
 
 Bodies accept `--body`, `--body-file FILE` (`-` for stdin), or `--editor`.
 Optional domain metadata uses `--confidence`, `--review-every`, and on edit,
@@ -258,6 +259,61 @@ views and manifest provenance. Review displays file paths, hashes and modes.
 Captured properties and imported edges cannot be changed by authoring, batches,
 schema changes or review. New local relationships still follow endpoint revision,
 ownership and proposal rules. See [the complete contract](import-profiles.md).
+
+## Markdown export and verification
+
+`render` writes a fresh, generated read-only tree. Main is the default ref.
+Use `scrolls --proposal PROPOSAL render --out NEW_DIR` for a proposal ref.
+`--dry-run` returns the manifest without creating the destination. Render
+requires a stored original for each record with an imported path and refuses
+the export with the record ID if its original is missing.
+
+Each export contains one Markdown view per record, captured originals and
+`scrolls/graph.json`, which carries the complete records, fields, aliases,
+edges, active schema and schema revision. The store retains history, other
+proposals, operation receipts and store metadata. `RENDERED` identifies
+the Scrolls package version and store revision.
+
+`SCROLLS-MANIFEST.json` has `schema_version: 2`. The following fields are part of
+its contract.
+
+| Field | Meaning |
+| --- | --- |
+| `revision`, `ref`, `store_id` | The authoritative store snapshot. `store_id` is absent for a pre-format-4 store without an ID. |
+| `format` | `Native` or `Liskov`. |
+| `schema_revision`, `scrolls_version` | Revisions of the active schema and package that generated the export. |
+| `generated`, `read_only` | Both are true. The store snapshot named in the manifest is authoritative. |
+| `files` | Relative path to lowercase hexadecimal SHA-256 of the file bytes. The manifest and `RENDERED` are excluded. |
+| `records` | Record ID to the path of its Markdown view. |
+| `record_details` | Record ID to `kind`, numeric `revision`, `aliases` and `digest` of its canonical graph record. |
+| `counts` | `records_by_kind` counts kinds present in the graph. `edges` counts graph edges. `files` counts entries in `files`. |
+| `content_digest` | Digest of the canonical JSON object with the graph's `records`, `edges` and `schema`. It is independent of store identity, ref, store revision and Scrolls version. |
+| `outside_store` | Paths of native `scrolls/beads/…` pages that embed the machine-local Beads cache. |
+| `source`, `graph_only_imported_entities`, `imports`, `git_references`, `originals` | Existing import provenance, graph-only imported IDs, source summaries, projected Git references and original paths. |
+
+For an offline integrity check, inventory the files other than the two
+control files, compare the path set and SHA-256 hashes with `files` and
+check that the file count agrees. Compare the record ID sets in `records`,
+`record_details` and `scrolls/graph.json`, and check that each record maps to
+a distinct listed file. Check the kind, revision, aliases and digest against
+each graph record. Tally the record kinds and edges from the graph and compare
+the totals and schema revision with the manifest. To compute the record and
+content digests, serialize the relevant JSON as compact UTF-8 with object keys
+sorted recursively, array order preserved and no trailing newline, then take
+its lowercase hexadecimal SHA-256. These checks establish integrity within the
+export. Store parity requires the named snapshot.
+
+Run `scrolls verify-export --dir DIR` against the store that supplied the
+export. Verification resolves the ref from the manifest and rebuilds the
+expected tree at its immutable revision. It compares the cache-derived pages
+with their recorded hashes. File, graph and manifest differences are reported
+in `data.mismatches` with a nonzero exit. If the named ref's current head is
+different, `data.stale` is true and `data.head_revision` gives that head. A
+matching historical snapshot still passes. The command leaves the store and
+export unchanged. The same check is available to library callers as
+`scrolls::render::verify_export(store, tenant, dir)` over `KnowledgeStore`.
+It returns a report with any mismatches, or an error if it cannot read or
+resolve the export.
 
 ## Graph write refusals
 
