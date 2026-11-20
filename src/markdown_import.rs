@@ -252,7 +252,7 @@ pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
         let result = json!({"identical_replay":true,"import":plan.summary["import"],"branch":"main","op_id":op});
         if !context.dry_run {
             s.commit_checked(
-                &crate::review::receipt_changes(op, hash, actor, &context.command, &result)?,
+                &crate::review::receipt_changes(context, &result)?,
                 "record identical Markdown replay",
                 actor,
                 false,
@@ -295,13 +295,7 @@ pub fn apply(s: &dyn KnowledgeStore, request: &ApplyRequest) -> Result<Value> {
     )?);
     changes.push(Change::put("metadata", "markdown_import", &plan)?);
     let result = json!({"import":i.info,"candidate_digest":plan.candidate_digest,"op_id":op,"branch":"main"});
-    changes.extend(crate::review::receipt_changes(
-        op,
-        hash,
-        actor,
-        &context.command,
-        &result,
-    )?);
+    changes.extend(crate::review::receipt_changes(context, &result)?);
     let sql_bytes = s.encoded_request_size(&changes);
     ensure!(
         sql_bytes <= s.request_limit().context("missing shared SQL budget")?,

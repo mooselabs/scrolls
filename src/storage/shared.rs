@@ -6,6 +6,7 @@ use super::{
 use crate::{
     cli::{Cli, Cmd, ImportCommand, Role},
     model::digest,
+    review::receipt_payload,
     schema::Schema,
 };
 use anyhow::{Context, Result, ensure};
@@ -243,7 +244,37 @@ impl Store {
     }
 }
 
+pub(crate) fn initialization_identity<'a>(
+    cli: &'a Cli,
+    schema: &Schema,
+) -> Result<(&'a str, String)> {
+    let Cmd::Init {
+        expect_base,
+        expect_schema,
+        ..
+    } = &cli.command
+    else {
+        unreachable!()
+    };
+    let hash = digest(serde_json::to_vec(
+        &json!({"command":"shared_init", "ontology":schema,
+        "base":expect_base, "schema":expect_schema, "actor":cli.actor, "role":cli.role}),
+    )?);
+    Ok((cli.op_id.as_deref().unwrap_or(""), hash))
+}
+
 pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
+    let (op, hash) = initialization_identity(cli, schema)?;
+    let context = cli.operation_context(op, &hash, cli.role)?;
+    initialize_with_context(cli, path, schema, &context)
+}
+
+pub(crate) fn initialize_with_context(
+    cli: &Cli,
+    path: &Path,
+    schema: &Schema,
+    context: &crate::store::OperationContext,
+) -> Result<Value> {
     let Cmd::Init {
         expect_base,
         expect_schema,
@@ -254,15 +285,12 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     };
     let s = Store::shared_session(path, &cli.store)?;
     let ontology_digest = schema.revision();
-    let op = cli.op_id.as_deref().unwrap_or("");
-    let hash = digest(serde_json::to_vec(
-        &json!({"command":"shared_init", "ontology":schema,
-        "base":expect_base, "schema":expect_schema, "actor":cli.actor, "role":cli.role}),
-    )?);
+    let op = &context.op_id;
+    let hash = &context.args_hash;
     if !s.table_names()?.is_empty() {
         s.check_shared_format()?;
         if !cli.dry_run {
-            if let Some(result) = s.receipt(op, &hash)? {
+            if let Some(result) = s.receipt(op, hash)? {
                 return Ok(
                     json!({"schema_version":2,"ok":true,"revision":s.revision()?,"branch":"main","data":result}),
                 );
@@ -279,7 +307,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
         );
     }
     ensure!(
-        cli.role == Role::Human,
+        context.role == Role::Human,
         "shared_init_review_required: initialization requires --role human"
     );
     ensure!(
@@ -309,7 +337,7 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
     sql.push_str(&put("metadata", "ontology", schema)?);
     let result =
         json!({"store_id":store_id,"op_id":op,"ontology_digest":ontology_digest,"format":5});
-    let actor = cli
+    let actor = context
         .actor
         .as_deref()
         .context("initialization requires actor")?;
@@ -333,7 +361,11 @@ pub fn initialize(cli: &Cli, path: &Path, schema: &Schema) -> Result<Value> {
         "shared_init_refused: initialization base changed"
     );
     let mut final_sql = put("metadata", "shared_ready", &true)?;
-    final_sql.push_str(&super::insert("operations", op, &json!({"op_id":op,"args_hash":hash,"actor":actor,"result":result,"committed_at":crate::model::now()}))?);
+    final_sql.push_str(&super::insert(
+        "operations",
+        op,
+        &receipt_payload(op, hash, actor, context.role, &result),
+    )?);
     s.transaction(&final_sql, "initialize shared Scrolls", actor)?;
     s.check_shared_format()?;
     Ok(json!({"schema_version":2,"ok":true,"revision":s.revision()?,"branch":"main","data":result}))

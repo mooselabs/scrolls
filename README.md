@@ -197,8 +197,10 @@ This project uses Scrolls for versioned knowledge.
 
 `init` creates the store; agent instructions are configured manually. Every write
 requires an actor, through `SCROLLS_ACTOR` or `--actor`. The default role is
-`agent`. Roles provide cooperative local policy and attribution, not authenticated
-identities; filesystem access can bypass them.
+`agent`. Standalone Scrolls uses cooperative human and agent roles for policy
+and attribution. Filesystem access can bypass that policy. An embedding host
+can supply a credential verifier to check human and controller claims. A
+verified controller may only move labels.
 
 `context` has a hard byte budget. `prime` delivers configured instructions and pins and reports any overrun.
 `context` includes one document and its immediate references. No model is called.

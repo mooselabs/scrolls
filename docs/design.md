@@ -81,7 +81,16 @@ and the complete graph is validated before one transaction writes graph changes
 and one operation receipt. Any review requirement routes the whole batch to a
 proposal. Ownership comes from pre-change records and relationships; review
 checks the current main graph and persisted original ownership requirements.
-Cooperative actor roles are attribution, not authenticated identities.
+Standalone Scrolls uses cooperative human and agent roles for attribution and
+policy. Hosts call `scrolls::app::run_with_verifier` with a
+`scrolls::credential::CredentialVerifier` and opaque credential bytes. The
+verifier receives the actor, role claim, operation ID, request fingerprint and
+dry-run flag. Label moves also supply the canonical record ID, label and target
+revision. The verifier is scoped to the destination store. It confirms the
+role claim for the request or returns a typed refusal. Scrolls uses the
+confirmed role in policy checks, recovery attribution, receipts and intents.
+Credential bytes stay outside operation identity, storage and output. Agent
+claims need no credential. The controller role only moves labels.
 
 `prime` delivers the schema guide, authored instructions, and explicit pins.
 It never selects documents automatically. Its soft budget measures the compact

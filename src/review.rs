@@ -4,7 +4,7 @@ use crate::{
     policy,
     store::{Change, ChangeSet, KnowledgeStore},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 pub struct OperationContext {
@@ -35,27 +35,44 @@ pub struct RecoveryRequest {
 }
 
 // BKLG-20261108-enit: storage's shared review protocol still uses the String API.
-pub(crate) fn receipt(
-    op: &str,
-    hash: &str,
-    actor: &str,
-    command: &Value,
-    result: &Value,
-) -> Result<String> {
-    Ok(receipt_changes(op, hash, actor, command, result)?.to_sql())
+pub(crate) fn receipt(context: &OperationContext, result: &Value) -> Result<String> {
+    Ok(receipt_changes(context, result)?.to_sql())
 }
 
-pub(crate) fn receipt_changes(
-    op: &str,
-    hash: &str,
+pub(crate) fn receipt_payload(
+    op_id: &str,
+    args_hash: &str,
     actor: &str,
-    command: &Value,
+    role: Role,
     result: &Value,
-) -> Result<ChangeSet> {
+) -> Value {
+    json!({
+        "op_id": op_id,
+        "args_hash": args_hash,
+        "actor": actor,
+        "role": role,
+        "result": result,
+        "committed_at": now(),
+    })
+}
+
+pub(crate) fn receipt_changes(context: &OperationContext, result: &Value) -> Result<ChangeSet> {
+    let actor = context
+        .actor
+        .as_deref()
+        .context("operation receipt requires an actor")?;
+    let mut payload = receipt_payload(
+        &context.op_id,
+        &context.args_hash,
+        actor,
+        context.role,
+        result,
+    );
+    payload["command"] = context.command.clone();
     Ok(ChangeSet::from(Change::put(
         "operations",
-        op,
-        &json!({"op_id":op,"args_hash":hash,"actor":actor,"command":command,"result":result,"committed_at":now()}),
+        &context.op_id,
+        &payload,
     )?))
 }
 pub(crate) fn wrap(store: &dyn KnowledgeStore, data: Value, branch: &str) -> Result<Value> {

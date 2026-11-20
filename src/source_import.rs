@@ -1044,13 +1044,7 @@ pub fn apply(
     if let Some(p) = &proposal {
         changes.push(Change::put("metadata", &target, p)?);
     }
-    changes.extend(crate::review::receipt_changes(
-        op,
-        hash,
-        actor,
-        &context.command,
-        &result,
-    )?);
+    changes.extend(crate::review::receipt_changes(context, &result)?);
     let message = format!("import source {} by {actor}", candidate.source.source_id);
     if let Some(p) = &proposal {
         let published = s.propose(
@@ -1237,7 +1231,7 @@ fn noop_receipt(s: &dyn KnowledgeStore, request: &ApplyRequest, result: Value) -
         same(source, &plan.source) && source.candidate_digest == plan.source.candidate_digest,
         "source_update_unsupported: source differs"
     );
-    let changes = crate::review::receipt_changes(op, hash, &plan.actor, &context.command, &result)?;
+    let changes = crate::review::receipt_changes(context, &result)?;
     // A receipt changes no captured data. Keeping it on the source branch preserves proposal isolation.
     s.select_branch(branch)?;
     s.commit(

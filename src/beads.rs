@@ -328,6 +328,16 @@ fn targets(g: &Graph, local: &Local, target: &Target) -> Result<BTreeSet<BeadRef
         .map(|e| BeadRef::parse(&e.to))
         .collect()
 }
+pub(crate) fn publication_fingerprint(
+    command: &Operation,
+    actor: &str,
+    revision: &str,
+) -> Result<String> {
+    Ok(digest(serde_json::to_vec(
+        &json!({"command":command,"actor":actor,"revision":revision}),
+    )?))
+}
+
 pub fn run(
     store: &dyn KnowledgeStore,
     root: &Path,
@@ -459,9 +469,7 @@ pub fn run(
                 .op_id
                 .map(str::to_owned)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let hash = digest(serde_json::to_vec(
-                &json!({"command":command,"actor":actor,"revision":revision}),
-            )?);
+            let hash = publication_fingerprint(command, actor, &revision)?;
             // Detect collisions with both graph-operation and publication receipts.
             let _ = store.receipt(&op, &hash)?;
             if let Some(old) = local.operations.get(&op) {

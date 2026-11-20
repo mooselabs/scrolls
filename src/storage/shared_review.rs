@@ -869,8 +869,7 @@ pub(crate) fn reject(
     let base = s.head(&p.branch)?;
     let before = Snapshot::read(s, Some(&base))?;
     let actor = context.actor.as_deref().context("actor")?;
-    let sql = super::put("metadata", &p.branch, p)?
-        + &crate::review::receipt(op, hash, actor, &context.command, result)?;
+    let sql = super::put("metadata", &p.branch, p)? + &crate::review::receipt(context, result)?;
     let delta = changes(&sql, op)?;
     let i = Intent {
         format: 1,
@@ -1179,7 +1178,7 @@ pub(crate) fn accept(
     );
     let sql = alias_changes.to_sql()
         + &super::put("metadata", &p.branch, &proposal)?
-        + &crate::review::receipt(op, hash, actor, &context.command, &result)?;
+        + &crate::review::receipt(context, &result)?;
     let delta = changes(&sql, op)?;
     ensure!(
         !merged.rows["operations"].contains_key(op),
@@ -1274,7 +1273,13 @@ fn finish_abandon(s: &Store, mut control: Intent) -> Result<Value> {
     let receipt = super::insert(
         "operations",
         &control.op_id,
-        &json!({"op_id":control.op_id,"args_hash":control.args_hash,"actor":control.actor,"result":control.result,"committed_at":crate::model::now()}),
+        &crate::review::receipt_payload(
+            &control.op_id,
+            &control.args_hash,
+            &control.actor,
+            control.role,
+            &control.result,
+        ),
     )?;
     save_many(s, &[&original, &control], &receipt, &control.actor)?;
     s.select_shared(JOURNAL)?;
