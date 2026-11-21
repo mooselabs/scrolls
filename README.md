@@ -367,8 +367,13 @@ Import reads committed Git objects, preserving original metadata, paths, and
 assets. Repeating the same source commit is safe; importing a changed source
 requires a new store. Unchanged imported files render byte-for-byte. Imported
 backlog, epic, milestone, question, and untyped archive records remain immutable.
+Both Markdown import commands refuse a committed tree containing a Scrolls
+export, including when the export is nested beneath the selected directory.
 
 Both export formats generate a read-only snapshot at one store revision.
+On Unix, executable originals are written with mode `0555` and all other files
+with `0444`. Make changes through the store, then render to a fresh directory
+and replace the old export directory.
 It includes a Markdown file for every record, the captured original files,
 and `scrolls/graph.json` with every record, field, alias, edge and the active
 schema. The store retains history, other proposals, operation receipts and

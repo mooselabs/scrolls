@@ -1423,7 +1423,7 @@ fn profile_plan_readonly_apply_ownership_multiple_sources_and_export() {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o755
+            0o555
         );
     }
     let manifest: Value =

@@ -176,7 +176,7 @@ fn shared_editable_markdown_fidelity_edit_review_render_and_source_free_replay()
                 .permissions()
                 .mode()
                 & 0o777,
-            0o755
+            0o555
         );
     }
     let copied = s.dir.path().join("copied.json");
@@ -220,4 +220,60 @@ fn shared_editable_markdown_fidelity_edit_review_render_and_source_free_replay()
         s.call("reader", &["show", id], true)["data"]["record"]["body"],
         "Reviewed replacement"
     );
+}
+
+#[test]
+fn shared_markdown_plan_refuses_a_committed_export() {
+    let s = Server::empty();
+    s.init(None);
+    let repo = editable_markdown_source(&s);
+    let docs = repo.join("docs");
+    let out = docs.join("export");
+    s.call(
+        "exporter",
+        &["render", "--out", out.to_str().unwrap()],
+        true,
+    );
+    for args in [
+        &["add", "docs/export"][..],
+        &["commit", "-qm", "committed export"],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let before = s.main_head();
+    let plan = s.dir.path().join("markdown.plan.json");
+    let error = s.call(
+        "planner",
+        &[
+            "import",
+            "plan",
+            "markdown",
+            docs.to_str().unwrap(),
+            "--rev",
+            "HEAD",
+            "--git-web-url",
+            "https://github.com/example/docs",
+            "--out",
+            plan.to_str().unwrap(),
+        ],
+        false,
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("refusing Scrolls export at docs/export. Edit through the store."),
+        "{error}"
+    );
+    assert_eq!(s.main_head(), before);
+    assert!(!plan.exists());
 }

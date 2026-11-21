@@ -99,6 +99,7 @@ fn work_references_obey_review_retry_and_render_contracts() {
     assert_eq!(manifest["outside_store"], json!([bead_path]));
     let verify = ["verify-export", "--dir", out.to_str().unwrap()];
     assert_eq!(f.ok(&verify)["mismatches"], json!([]));
+    std::fs::remove_file(out.join(bead_path)).unwrap();
     std::fs::write(out.join(bead_path), "changed cache view").unwrap();
     f.fail(&verify, &format!("altered file {bead_path}"));
     let legacy = f.dir.path().join("legacy");
@@ -168,4 +169,73 @@ fn local_export_verifies_against_its_revision_and_reports_a_moved_head() {
     let report = f.ok(&["verify-export", "--dir", dir]);
     assert_eq!(report["ref"], reference);
     assert_eq!(report["stale"], false);
+}
+
+#[test]
+fn markdown_import_refuses_a_committed_export() {
+    use std::fs;
+
+    let f = Fixture::new();
+    let repo = f.dir.path().join("repo");
+    let docs = repo.join("docs");
+    let out = docs.join("export");
+    fs::create_dir_all(docs.join("source")).unwrap();
+    fs::write(docs.join("source/note.md"), "# Source\n").unwrap();
+    f.ok(&["render", "--out", out.to_str().unwrap()]);
+    for args in [
+        &["init", "-q"][..],
+        &["add", "docs"],
+        &["commit", "-qm", "committed export"],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_file(out.join("RENDERED")).unwrap();
+
+    let store_path = f.dir.path().join("store");
+    let main_head = || {
+        Store::open_readonly(&store_path, &dolt())
+            .unwrap()
+            .head("main")
+            .unwrap()
+    };
+    let before = main_head();
+    for selection in [&docs, &out] {
+        f.fail(
+            &[
+                "import",
+                "markdown",
+                selection.to_str().unwrap(),
+                "--rev",
+                "HEAD",
+            ],
+            "refusing Scrolls export at docs/export. Edit through the store.",
+        );
+        assert_eq!(main_head(), before);
+    }
+    f.ok(&[
+        "import",
+        "markdown",
+        docs.join("source").to_str().unwrap(),
+        "--rev",
+        "HEAD",
+    ]);
 }

@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 mod export;
 mod parity;
@@ -14,6 +17,19 @@ mod parity;
 use export::{Export, Identity, Inputs, MANIFEST, MARKER};
 pub use export::{ExportSnapshot, Options, render};
 pub use parity::{Verification, verify_export};
+
+pub(crate) fn export_root<'a>(paths: impl Iterator<Item = &'a str>) -> Option<&'a Path> {
+    let paths: BTreeSet<_> = paths.map(Path::new).collect();
+    paths
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == MANIFEST))
+        .filter_map(|path| path.parent())
+        .find(|directory| paths.contains(directory.join(MARKER).as_path()))
+}
+
+fn profile_original_path(source: &str, path: &str) -> String {
+    format!("sources/{source}/{path}")
+}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub enum Format {
@@ -124,7 +140,7 @@ fn build(
         }
         insert_new(
             &mut output,
-            format!("sources/{}/{}", f.source_id, f.file.path),
+            profile_original_path(&f.source_id, &f.file.path),
             bytes,
         )?;
     }
@@ -368,7 +384,7 @@ fn build(
         "graph_only_imported_entities": graph_only,
         "imports": crate::source_import::summary(g, import_files),
         "git_references": references,
-        "originals": g.import_members.iter().map(|(id, m)| (id, format!("sources/{}/{}", m.source_id, m.path))).collect::<BTreeMap<_, _>>(),
+        "originals": g.import_members.iter().map(|(id, m)| (id, profile_original_path(&m.source_id, &m.path))).collect::<BTreeMap<_, _>>(),
     });
     parity::describe(&mut manifest, identity, &graph, &outside_store)?;
     Ok(Export {
@@ -566,7 +582,7 @@ fn supplemental(
         }
     );
     if let Some(m) = g.import_members.get(&r.id) {
-        let original = format!("sources/{}/{}", m.source_id, m.path);
+        let original = profile_original_path(&m.source_id, &m.path);
         text.push_str(&format!(
             "\n[Original source]({}) · Source `{}` · Codec `{}`\n",
             relative(path, &original),

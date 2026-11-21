@@ -665,9 +665,11 @@ fn export_verification_reports_every_missing_extra_or_altered_entry() -> Result<
         .unwrap()
         .to_owned();
     fs::remove_file(out.join(&removed))?;
-    let mut body = fs::read(out.join(&altered))?;
+    let altered_path = out.join(&altered);
+    let mut body = fs::read(&altered_path)?;
     body[0] ^= 1;
-    fs::write(out.join(&altered), body)?;
+    fs::remove_file(&altered_path)?;
+    fs::write(altered_path, body)?;
     fs::write(out.join("extra.md"), "extra")?;
 
     let graph_path = out.join("scrolls/graph.json");
@@ -676,10 +678,12 @@ fn export_verification_reports_every_missing_extra_or_altered_entry() -> Result<
         .as_object_mut()
         .unwrap()
         .remove(conformance::RECORD);
+    fs::remove_file(&graph_path)?;
     fs::write(graph_path, serde_json::to_vec(&graph)?)?;
     manifest["counts"]["edges"] = json!(0);
     manifest["record_details"]["sc-conformance-b"]["digest"] = json!("wrong");
     manifest["store_id"] = json!("another-store");
+    fs::remove_file(&manifest_path)?;
     fs::write(manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let tampered = verify()?;
