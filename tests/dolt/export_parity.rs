@@ -210,8 +210,14 @@ fn markdown_import_refuses_a_committed_export() {
     }
     fs::remove_file(out.join("RENDERED")).unwrap();
 
-    let store = Store::open(&f.dir.path().join("store"), &dolt(), false).unwrap();
-    let before = store.head("main").unwrap();
+    let store_path = f.dir.path().join("store");
+    let main_head = || {
+        Store::open_readonly(&store_path, &dolt())
+            .unwrap()
+            .head("main")
+            .unwrap()
+    };
+    let before = main_head();
     for selection in [&docs, &out] {
         f.fail(
             &[
@@ -223,7 +229,7 @@ fn markdown_import_refuses_a_committed_export() {
             ],
             "refusing Scrolls export at docs/export. Edit through the store.",
         );
-        assert_eq!(store.head("main").unwrap(), before);
+        assert_eq!(main_head(), before);
     }
     f.ok(&[
         "import",
